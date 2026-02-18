@@ -1,8 +1,16 @@
 [phases.setup]
+<<<<<<< HEAD
 nixPkgs = ["python311", "gcc"]
+=======
+nixPkgs = ["python311", "python311Packages.pip", "postgresql_16", "gcc"]
+>>>>>>> eeba02c07523d267852f7265b2d1c97072ab5847
 
 [phases.install]
 cmds = ["pip install --upgrade pip setuptools wheel", "pip install -r requirements.txt"]
 
 [start]
+<<<<<<< HEAD
 cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+=======
+cmd = "python3.11 -m uvicorn main:app --host 0.0.0.0 --port $PORT"
+>>>>>>> eeba02c07523d267852f7265b2d1c97072ab5847
