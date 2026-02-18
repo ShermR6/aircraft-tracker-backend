@@ -138,7 +138,7 @@ class AirportConfigResponse(BaseModel):
 
 class AlertSettingCreate(BaseModel):
     """Create alert setting"""
-    alert_type: str = Field(..., regex="^(10nm|5nm|2nm|landing)$")
+    alert_type: str = Field(..., pattern="^(10nm|5nm|2nm|landing)$")
     enabled: bool = True
     message_template: str
 
@@ -158,7 +158,7 @@ class AlertSettingResponse(BaseModel):
 
 class IntegrationCreate(BaseModel):
     """Create integration"""
-    type: str = Field(..., regex="^(discord|slack|teams|email)$")
+    type: str = Field(..., pattern="^(discord|slack|teams|email)$")
     config: Dict[str, Any]
     enabled: bool = True
 
