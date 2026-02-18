@@ -1,5 +1,4 @@
 [phases.setup]
-# Added python311Packages.pip to the list
 nixPkgs = ["python311", "python311Packages.pip", "postgresql", "gcc"]
 
 [phases.install]
