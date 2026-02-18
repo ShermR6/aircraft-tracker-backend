@@ -1,4 +1,5 @@
 [phases.setup]
+# We add python311Packages.pip so the -m pip command actually exists
 nixPkgs = ["python311", "python311Packages.pip", "postgresql", "gcc"]
 
 [phases.install]
@@ -8,4 +9,4 @@ cmds = [
 ]
 
 [start]
-cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+cmd = "python3.11 -m uvicorn main:app --host 0.0.0.0 --port $PORT"
