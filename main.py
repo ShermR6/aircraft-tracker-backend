@@ -341,6 +341,83 @@ async def create_alert_setting(
         created_at=setting.created_at
     )
 
+# ============================================================================
+# AIRPORT CONFIGURATION
+# ============================================================================
+
+@app.get("/api/airport/config")
+async def get_airport_config(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get airport configuration for current user"""
+    config = db.query(AirportConfig).filter(
+        AirportConfig.user_id == current_user.id
+    ).first()
+    
+    if not config:
+        raise HTTPException(status_code=404, detail="No airport configuration found")
+    
+    return {
+        "id": str(config.id),
+        "airport_code": config.airport_code,
+        "airport_name": config.airport_name,
+        "latitude": config.latitude,
+        "longitude": config.longitude,
+        "elevation_ft_msl": config.elevation_ft_msl,
+        "radius_nm": config.radius_nm,
+        "floor_ft_agl": config.floor_ft_agl,
+        "ceiling_ft_agl": config.ceiling_ft_agl,
+        "query_radius_nm": config.query_radius_nm,
+        "alert_distances_nm": config.alert_distances_nm,
+        "quiet_hours_enabled": config.quiet_hours_enabled,
+        "quiet_hours_start": config.quiet_hours_start,
+        "quiet_hours_end": config.quiet_hours_end,
+        "created_at": config.created_at,
+        "updated_at": config.updated_at
+    }
+
+
+@app.post("/api/airport/config")
+async def save_airport_config(
+    config_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create or update airport configuration"""
+    config = db.query(AirportConfig).filter(
+        AirportConfig.user_id == current_user.id
+    ).first()
+    
+    if config:
+        # Update existing
+        config.airport_code = config_data.get("airport_code", config.airport_code)
+        config.latitude = str(config_data.get("latitude", config.latitude))
+        config.longitude = str(config_data.get("longitude", config.longitude))
+        config.query_radius_nm = str(config_data.get("detection_radius_nm", config.query_radius_nm))
+        config.quiet_hours_start = config_data.get("quiet_hours_start", config.quiet_hours_start)
+        config.quiet_hours_end = config_data.get("quiet_hours_end", config.quiet_hours_end)
+        config.updated_at = datetime.utcnow()
+    else:
+        # Create new
+        config = AirportConfig(
+            user_id=current_user.id,
+            airport_code=config_data.get("airport_code", "KDTO"),
+            latitude=str(config_data.get("latitude", "33.2001")),
+            longitude=str(config_data.get("longitude", "-97.1998")),
+            elevation_ft_msl=config_data.get("elevation_ft_msl", 0),
+            query_radius_nm=str(config_data.get("detection_radius_nm", "100.0")),
+            quiet_hours_start=config_data.get("quiet_hours_start", "23:00"),
+            quiet_hours_end=config_data.get("quiet_hours_end", "06:00"),
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(config)
+    
+    db.commit()
+    db.refresh(config)
+    
+    return {"message": "Configuration saved successfully", "id": str(config.id)}
 
 # ============================================================================
 # INTEGRATIONS (Discord, Slack, etc.)
