@@ -509,7 +509,49 @@ async def test_integration(
         return {"message": "Test notification sent successfully"}
     else:
         raise HTTPException(status_code=500, detail="Failed to send test notification")
+    
+    # Add to main.py - DELETE integration
+@app.delete("/api/integrations/{integration_id}")
+async def delete_integration(
+    integration_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    integration = db.query(Integration).filter(
+        Integration.id == integration_id,
+        Integration.user_id == current_user.id
+    ).first()
+    if not integration:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    db.delete(integration)
+    db.commit()
+    return {"message": "Integration deleted"}
 
+# Add to main.py - PUT integration (update)
+@app.put("/api/integrations/{integration_id}", response_model=IntegrationResponse)
+async def update_integration(
+    integration_id: str,
+    integration_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    integration = db.query(Integration).filter(
+        Integration.id == integration_id,
+        Integration.user_id == current_user.id
+    ).first()
+    if not integration:
+        raise HTTPException(status_code=404, detail="Integration not found")
+    integration.config = integration_data.get("config", integration.config)
+    integration.enabled = integration_data.get("enabled", integration.enabled)
+    db.commit()
+    db.refresh(integration)
+    return IntegrationResponse(
+        id=str(integration.id),
+        type=integration.type,
+        config=integration.config,
+        enabled=integration.enabled,
+        created_at=integration.created_at
+    )
 
 # ============================================================================
 # HEALTH & STATUS
