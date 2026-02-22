@@ -13,7 +13,7 @@ import os
 from typing import List, Optional
 
 from database import get_db, engine, Base
-from models import User, License, Aircraft, AlertSetting, Integration
+from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig
 from schemas import (
     LicenseActivation, LicenseResponse,
     UserLogin, UserResponse, TokenResponse,
