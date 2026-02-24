@@ -554,6 +554,21 @@ async def update_integration(
     )
 
 # ============================================================================
+# APP VERSION CHECK
+# ============================================================================
+
+LATEST_APP_VERSION = "1.0.0"
+
+@app.get("/api/app/version")
+async def get_app_version():
+    """Returns the latest desktop app version for update checking"""
+    return {
+        "latest_version": LATEST_APP_VERSION,
+        "download_url": "https://skyping.xyz/download",
+    }
+
+
+# ============================================================================
 # HEALTH & STATUS
 # ============================================================================
 
