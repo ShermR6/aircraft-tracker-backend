@@ -50,6 +50,9 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "skyping-internal-secret")
 
+# License duration
+LICENSE_DURATION_DAYS = 30
+
 # Global tracker instance (runs 24/7)
 tracker = CloudAircraftTracker()
 
@@ -102,9 +105,9 @@ async def activate_license(
     db: Session = Depends(get_db)
 ):
     """
-    Activate a license key
-    Creates user account if first activation
-    Returns JWT token for API access
+    Activate a license key.
+    - First activation starts the 30-day timer.
+    - Subsequent activations (same key) just log in if not expired.
     """
     # Find license
     license = db.query(License).filter(
@@ -114,19 +117,31 @@ async def activate_license(
     if not license:
         raise HTTPException(status_code=404, detail="Invalid license key")
     
-    # Check license status
-    if license.status != "active":
-        raise HTTPException(status_code=403, detail=f"License is {license.status}")
+    # Check if expired
+    if license.status == "expired":
+        raise HTTPException(status_code=403, detail="License has expired")
     
-    # Check expiration
     if license.expires_at and license.expires_at < datetime.utcnow():
         license.status = "expired"
         db.commit()
-        raise HTTPException(status_code=403, detail="License expired")
+        raise HTTPException(status_code=403, detail="License has expired")
     
-    # Check activation limit
+    # If this is the first activation, start the 30-day timer
+    if not license.activated_at:
+        license.activated_at = datetime.utcnow()
+        license.expires_at = datetime.utcnow() + timedelta(days=LICENSE_DURATION_DAYS)
+        license.status = "active"
+        license.activations_used += 1
+        db.commit()
+        db.refresh(license)
+    elif license.status != "active":
+        # Was provisioned but not yet marked active (edge case)
+        license.status = "active"
+        db.commit()
+    
+    # Check activation limit (for re-activations on different devices)
     if license.activations_max != -1:  # -1 = unlimited
-        if license.activations_used >= license.activations_max:
+        if license.activations_used > license.activations_max:
             raise HTTPException(
                 status_code=403,
                 detail=f"Maximum activations ({license.activations_max}) reached"
@@ -136,17 +151,12 @@ async def activate_license(
     user = db.query(User).filter(User.email == activation.email).first()
     
     if not user:
-        # Create new user
         user = User(
             email=activation.email,
             license_id=license.id,
             created_at=datetime.utcnow()
         )
         db.add(user)
-        
-        # Increment activation count
-        license.activations_used += 1
-        
         db.commit()
         db.refresh(user)
     
@@ -191,8 +201,7 @@ async def provision_license(
 ):
     """
     Called by the website's Stripe webhook to create a license
-    in the backend database so the desktop app can activate it.
-    Protected by a shared secret.
+    in the backend database. Timer does NOT start until desktop activation.
     """
     # Verify internal secret
     secret = request.headers.get("X-Webhook-Secret")
@@ -208,20 +217,21 @@ async def provision_license(
     tier_limits = {
         "starter": 1,
         "premium": 3,
-        "pro": -1,  # unlimited
+        "pro": -1,
         "team-starter": 5,
         "team-premium": 15,
         "team-pro": -1,
     }
 
-    # Create the license
+    # Create the license — status is "inactive" until desktop activation
     license = License(
         license_key=data.license_key,
         tier=data.tier,
-        status="active",
+        status="inactive",
         activations_max=tier_limits.get(data.tier, 1),
         activations_used=0,
         created_at=datetime.utcnow(),
+        # activated_at and expires_at are NULL — set when user activates in desktop app
     )
     db.add(license)
     db.commit()
@@ -269,7 +279,6 @@ async def add_aircraft(
     db: Session = Depends(get_db)
 ):
     """Add new aircraft to track"""
-    # Check if already exists
     existing = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
         Aircraft.tail_number == aircraft_data.tail_number
@@ -278,7 +287,6 @@ async def add_aircraft(
     if existing:
         raise HTTPException(status_code=400, detail="Aircraft already exists")
     
-    # Create aircraft
     aircraft = Aircraft(
         user_id=current_user.id,
         tail_number=aircraft_data.tail_number,
@@ -292,7 +300,6 @@ async def add_aircraft(
     db.commit()
     db.refresh(aircraft)
     
-    # Start tracking for this user
     await tracker.update_user_aircraft(str(current_user.id), db)
     
     return AircraftResponse(
@@ -323,7 +330,6 @@ async def delete_aircraft(
     aircraft.active = False
     db.commit()
     
-    # Update tracker
     await tracker.update_user_aircraft(str(current_user.id), db)
     
     return {"message": "Aircraft deleted"}
@@ -371,21 +377,18 @@ async def create_alert_setting(
     db: Session = Depends(get_db)
 ):
     """Create or update alert setting"""
-    # Check if exists
     existing = db.query(AlertSetting).filter(
         AlertSetting.user_id == current_user.id,
         AlertSetting.alert_type == setting_data.alert_type
     ).first()
     
     if existing:
-        # Update
         existing.enabled = setting_data.enabled
         existing.message_template = setting_data.message_template
         db.commit()
         db.refresh(existing)
         setting = existing
     else:
-        # Create
         setting = AlertSetting(
             user_id=current_user.id,
             alert_type=setting_data.alert_type,
@@ -454,7 +457,6 @@ async def save_airport_config(
     ).first()
     
     if config:
-        # Update existing
         config.airport_code = config_data.get("airport_code", config.airport_code)
         config.latitude = str(config_data.get("latitude", config.latitude))
         config.longitude = str(config_data.get("longitude", config.longitude))
@@ -463,7 +465,6 @@ async def save_airport_config(
         config.quiet_hours_end = config_data.get("quiet_hours_end", config.quiet_hours_end)
         config.updated_at = datetime.utcnow()
     else:
-        # Create new
         config = AirportConfig(
             user_id=current_user.id,
             airport_code=config_data.get("airport_code", "KDTO"),
@@ -516,21 +517,18 @@ async def create_integration(
     db: Session = Depends(get_db)
 ):
     """Create or update integration"""
-    # Check if exists
     existing = db.query(Integration).filter(
         Integration.user_id == current_user.id,
         Integration.type == integration_data.type
     ).first()
     
     if existing:
-        # Update
         existing.config = integration_data.config
         existing.enabled = integration_data.enabled
         db.commit()
         db.refresh(existing)
         integration = existing
     else:
-        # Create
         integration = Integration(
             user_id=current_user.id,
             type=integration_data.type,
@@ -566,7 +564,6 @@ async def test_integration(
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
     
-    # Send test notification
     success = await tracker.send_test_notification(integration)
     
     if success:

@@ -35,11 +35,12 @@ class License(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     license_key = Column(String(24), unique=True, nullable=False, index=True)
-    tier = Column(String(20), nullable=False)  # 'single', 'school', 'enterprise'
+    tier = Column(String(20), nullable=False)
     activations_used = Column(Integer, default=0)
-    activations_max = Column(Integer, nullable=False)  # -1 = unlimited
-    expires_at = Column(DateTime, nullable=True)  # None = lifetime
-    status = Column(String(20), default="active")  # 'active', 'expired', 'revoked'
+    activations_max = Column(Integer, nullable=False)
+    activated_at = Column(DateTime, nullable=True)  # When first activated in desktop app (timer starts)
+    expires_at = Column(DateTime, nullable=True)     # activated_at + 30 days (set on activation)
+    status = Column(String(20), default="inactive")  # 'inactive', 'active', 'expired'
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -53,7 +54,7 @@ class Aircraft(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     tail_number = Column(String(10), nullable=False)
-    icao24 = Column(String(10), nullable=True)  # ICAO 24-bit address
+    icao24 = Column(String(10), nullable=True)
     friendly_name = Column(String(100), nullable=True)
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -103,7 +104,7 @@ class AlertSetting(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    alert_type = Column(String(50), nullable=False)  # '10nm', '5nm', '2nm', 'landing'
+    alert_type = Column(String(50), nullable=False)
     enabled = Column(Boolean, default=True)
     message_template = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -118,8 +119,8 @@ class Integration(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
-    type = Column(String(50), nullable=False)  # 'discord', 'slack', 'teams', 'email'
-    config = Column(JSON, nullable=False)  # webhook URLs, API keys, etc.
+    type = Column(String(50), nullable=False)
+    config = Column(JSON, nullable=False)
     enabled = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
@@ -137,5 +138,5 @@ class NotificationLog(Base):
     alert_type = Column(String(50), nullable=False)
     message = Column(Text, nullable=False)
     integration_type = Column(String(50), nullable=False)
-    status = Column(String(20), default="sent")  # 'sent', 'failed', 'pending'
+    status = Column(String(20), default="sent")
     sent_at = Column(DateTime, default=datetime.utcnow)
