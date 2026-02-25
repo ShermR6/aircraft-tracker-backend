@@ -3,11 +3,12 @@ AircraftTracker Cloud Backend
 Main FastAPI application
 """
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
+from pydantic import BaseModel
 import jwt
 import os
 from typing import List, Optional
@@ -47,9 +48,17 @@ app.add_middleware(
 security = HTTPBearer()
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
+WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "skyping-internal-secret")
 
 # Global tracker instance (runs 24/7)
 tracker = CloudAircraftTracker()
+
+
+# Schema for license provisioning
+class LicenseProvision(BaseModel):
+    license_key: str
+    tier: str
+    email: str
 
 
 # ============================================================================
@@ -168,6 +177,61 @@ async def get_current_user_info(
         license_tier=license.tier if license else "unknown",
         created_at=current_user.created_at
     )
+
+
+# ============================================================================
+# LICENSE PROVISIONING (called by website Stripe webhook)
+# ============================================================================
+
+@app.post("/api/licenses/provision")
+async def provision_license(
+    data: LicenseProvision,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Called by the website's Stripe webhook to create a license
+    in the backend database so the desktop app can activate it.
+    Protected by a shared secret.
+    """
+    # Verify internal secret
+    secret = request.headers.get("X-Webhook-Secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    # Check if license already exists
+    existing = db.query(License).filter(License.license_key == data.license_key).first()
+    if existing:
+        return {"message": "License already exists", "license_key": data.license_key}
+
+    # Determine max activations based on tier
+    tier_limits = {
+        "starter": 1,
+        "premium": 3,
+        "pro": -1,  # unlimited
+        "team-starter": 5,
+        "team-premium": 15,
+        "team-pro": -1,
+    }
+
+    # Create the license
+    license = License(
+        license_key=data.license_key,
+        tier=data.tier,
+        status="active",
+        activations_max=tier_limits.get(data.tier, 1),
+        activations_used=0,
+        created_at=datetime.utcnow(),
+    )
+    db.add(license)
+    db.commit()
+    db.refresh(license)
+
+    return {
+        "message": "License provisioned successfully",
+        "license_key": data.license_key,
+        "tier": data.tier,
+    }
 
 
 # ============================================================================
@@ -509,14 +573,15 @@ async def test_integration(
         return {"message": "Test notification sent successfully"}
     else:
         raise HTTPException(status_code=500, detail="Failed to send test notification")
-    
-    # Add to main.py - DELETE integration
+
+
 @app.delete("/api/integrations/{integration_id}")
 async def delete_integration(
     integration_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """Delete an integration"""
     integration = db.query(Integration).filter(
         Integration.id == integration_id,
         Integration.user_id == current_user.id
@@ -527,7 +592,7 @@ async def delete_integration(
     db.commit()
     return {"message": "Integration deleted"}
 
-# Add to main.py - PUT integration (update)
+
 @app.put("/api/integrations/{integration_id}", response_model=IntegrationResponse)
 async def update_integration(
     integration_id: str,
@@ -535,6 +600,7 @@ async def update_integration(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    """Update an integration"""
     integration = db.query(Integration).filter(
         Integration.id == integration_id,
         Integration.user_id == current_user.id
@@ -552,6 +618,7 @@ async def update_integration(
         enabled=integration.enabled,
         created_at=integration.created_at
     )
+
 
 # ============================================================================
 # APP VERSION CHECK
