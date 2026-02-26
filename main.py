@@ -215,11 +215,11 @@ async def provision_license(
 
     # Determine max activations based on tier
     tier_limits = {
-        "starter": 1,
-        "premium": 3,
+        "starter": 100,
+        "premium": 100,
         "pro": -1,
-        "team-starter": 5,
-        "team-premium": 15,
+        "team-starter": 100,
+        "team-premium": 100,
         "team-pro": -1,
     }
 
@@ -228,7 +228,7 @@ async def provision_license(
         license_key=data.license_key,
         tier=data.tier,
         status="inactive",
-        activations_max=tier_limits.get(data.tier, 1),
+        activations_max=tier_limits.get(data.tier, 100),
         activations_used=0,
         created_at=datetime.utcnow(),
         # activated_at and expires_at are NULL — set when user activates in desktop app
