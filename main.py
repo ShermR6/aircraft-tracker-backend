@@ -30,7 +30,7 @@ Base.metadata.create_all(bind=engine)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="AircraftTracker Cloud API",
+    title="SkyPing Cloud API",
     description="Real-time aircraft tracking and notifications",
     version="1.0.0"
 )
