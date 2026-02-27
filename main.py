@@ -1,5 +1,5 @@
 """
-AircraftTracker Cloud Backend
+FinalPing Cloud Backend
 Main FastAPI application
 """
 
@@ -31,7 +31,7 @@ Base.metadata.create_all(bind=engine)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="SkyPing Cloud API",
+    title="FinalPing Cloud API",
     description="Real-time aircraft tracking and notifications",
     version="1.0.0"
 )
@@ -55,7 +55,7 @@ WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "skyping-internal
 LICENSE_DURATION_DAYS = 30
 
 # Website URL for syncing license status
-WEBSITE_URL = os.getenv("WEBSITE_URL", "https://skyping.xyz")
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
 
 async def sync_license_to_website(license_key: str, activated_at: datetime, expires_at: datetime):
@@ -654,7 +654,7 @@ async def get_app_version():
     """Returns the latest desktop app version for update checking"""
     return {
         "latest_version": LATEST_APP_VERSION,
-        "download_url": "https://skyping.xyz/download",
+        "download_url": "https://finalpingapp.com/download",
     }
 
 
@@ -676,7 +676,7 @@ async def health_check():
 async def root():
     """Root endpoint"""
     return {
-        "message": "AircraftTracker Cloud API",
+        "message": "FinalPing Cloud API",
         "version": "1.0.0",
         "docs": "/docs"
     }
@@ -689,15 +689,15 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     """Start the global aircraft tracker on startup"""
-    print("🚀 Starting AircraftTracker Cloud Backend...")
+    print("🚀 Starting FinalPing Cloud Backend...")
     print("📡 Initializing global aircraft tracker...")
     await tracker.start()
-    print("✅ AircraftTracker Cloud Backend ready!")
+    print("✅ FinalPing Cloud Backend ready!")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    print("🛑 Shutting down AircraftTracker Cloud Backend...")
+    print("🛑 Shutting down FinalPing Cloud Backend...")
     await tracker.stop()
     print("✅ Shutdown complete")
