@@ -157,8 +157,6 @@ async def activate_license(
         db.commit()
         db.refresh(license)
 
-        # Sync activation status back to website DB (non-critical)
-        await sync_license_to_website(license.license_key, license.activated_at, license.expires_at)
     elif license.status != "active":
         # Was provisioned but not yet marked active (edge case)
         license.status = "active"
@@ -172,6 +170,9 @@ async def activate_license(
                 detail=f"Maximum activations ({license.activations_max}) reached"
             )
     
+    # Always sync license status to website DB (non-critical, fire-and-forget)
+    await sync_license_to_website(license.license_key, license.activated_at, license.expires_at)
+
     # Find or create user
     user = db.query(User).filter(User.email == activation.email).first()
     
