@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 import jwt
 import os
+import httpx
 from typing import List, Optional
 
 from database import get_db, engine, Base
@@ -52,6 +53,27 @@ WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "skyping-internal
 
 # License duration
 LICENSE_DURATION_DAYS = 30
+
+# Website URL for syncing license status
+WEBSITE_URL = os.getenv("WEBSITE_URL", "https://skyping.xyz")
+
+
+async def sync_license_to_website(license_key: str, activated_at: datetime, expires_at: datetime):
+    """Notify the website DB that a license has been activated. Fire-and-forget."""
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{WEBSITE_URL}/api/licenses/sync",
+                headers={"x-webhook-secret": WEBHOOK_INTERNAL_SECRET},
+                json={
+                    "license_key": license_key,
+                    "activated_at": activated_at.isoformat(),
+                    "expires_at": expires_at.isoformat(),
+                },
+                timeout=5.0
+            )
+    except Exception as e:
+        print(f"Website license sync failed (non-critical): {e}")
 
 # Global tracker instance (runs 24/7)
 tracker = CloudAircraftTracker()
@@ -134,6 +156,9 @@ async def activate_license(
         license.activations_used += 1
         db.commit()
         db.refresh(license)
+
+        # Sync activation status back to website DB (non-critical)
+        await sync_license_to_website(license.license_key, license.activated_at, license.expires_at)
     elif license.status != "active":
         # Was provisioned but not yet marked active (edge case)
         license.status = "active"
