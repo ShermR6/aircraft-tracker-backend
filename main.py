@@ -57,6 +57,37 @@ LICENSE_DURATION_DAYS = 30
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
+# ============================================================================
+# TIER LIMITS
+# ============================================================================
+
+TIER_LIMITS = {
+    "starter":             {"aircraft": 3,    "integrations": 1},
+    "premium":             {"aircraft": 10,   "integrations": 3},
+    "pro":                 {"aircraft": None, "integrations": None},
+    "team-starter":        {"aircraft": 25,   "integrations": 3},
+    "team-premium":        {"aircraft": 75,   "integrations": 10},
+    "team-pro":            {"aircraft": None, "integrations": None},
+    "starter-yearly":      {"aircraft": 3,    "integrations": 1},
+    "premium-yearly":      {"aircraft": 10,   "integrations": 3},
+    "pro-yearly":          {"aircraft": None, "integrations": None},
+    "team-starter-yearly": {"aircraft": 25,   "integrations": 3},
+    "team-premium-yearly": {"aircraft": 75,   "integrations": 10},
+    "team-pro-yearly":     {"aircraft": None, "integrations": None},
+}
+
+
+def get_tier_limit(tier: str, resource: str):
+    limits = TIER_LIMITS.get(tier, {"aircraft": 3, "integrations": 1})
+    return limits.get(resource, 0)
+
+
+def get_user_tier(user: User, db: Session) -> str:
+    if not user.license_id:
+        return "starter"
+    license = db.query(License).filter(License.id == user.license_id).first()
+    return license.tier if license else "starter"
+
 
 async def sync_license_to_website(license_key: str, activated_at: datetime, expires_at: datetime):
     """Notify the website DB that a license has been activated. Fire-and-forget."""
@@ -305,6 +336,20 @@ async def add_aircraft(
     db: Session = Depends(get_db)
 ):
     """Add new aircraft to track"""
+    # Enforce tier limit
+    tier = get_user_tier(current_user, db)
+    limit = get_tier_limit(tier, "aircraft")
+    if limit is not None:
+        current_count = db.query(Aircraft).filter(
+            Aircraft.user_id == current_user.id,
+            Aircraft.active == True
+        ).count()
+        if current_count >= limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Your {tier} plan allows up to {limit} aircraft. Upgrade your plan to add more."
+            )
+
     existing = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
         Aircraft.tail_number == aircraft_data.tail_number
@@ -547,6 +592,20 @@ async def create_integration(
         Integration.user_id == current_user.id,
         Integration.type == integration_data.type
     ).first()
+
+    # Only enforce limit when adding a brand new integration type
+    if not existing:
+        tier = get_user_tier(current_user, db)
+        limit = get_tier_limit(tier, "integrations")
+        if limit is not None:
+            current_count = db.query(Integration).filter(
+                Integration.user_id == current_user.id
+            ).count()
+            if current_count >= limit:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Your {tier} plan allows up to {limit} notification channel{'s' if limit != 1 else ''}. Upgrade your plan to add more."
+                )
     
     if existing:
         existing.config = integration_data.config
