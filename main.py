@@ -644,10 +644,73 @@ async def update_integration(
 
 
 # ============================================================================
+# NOTIFICATION LOGS
+# ============================================================================
+
+@app.get("/api/notifications/recent")
+async def get_recent_notifications(
+    limit: int = 10,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get recent notification logs for current user"""
+    from models import NotificationLog
+    logs = db.query(NotificationLog).filter(
+        NotificationLog.user_id == current_user.id
+    ).order_by(NotificationLog.sent_at.desc()).limit(limit).all()
+
+    return [
+        {
+            "id": str(log.id),
+            "aircraft_tail": log.aircraft_tail,
+            "alert_type": log.alert_type,
+            "message": log.message,
+            "integration_type": log.integration_type,
+            "status": log.status,
+            "sent_at": log.sent_at.isoformat(),
+        }
+        for log in logs
+    ]
+
+
+@app.get("/api/notifications/stats")
+async def get_notification_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get notification counts for today and this week"""
+    from models import NotificationLog
+    from datetime import date, timedelta
+
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=today_start.weekday())
+
+    today_count = db.query(NotificationLog).filter(
+        NotificationLog.user_id == current_user.id,
+        NotificationLog.sent_at >= today_start
+    ).count()
+
+    week_count = db.query(NotificationLog).filter(
+        NotificationLog.user_id == current_user.id,
+        NotificationLog.sent_at >= week_start
+    ).count()
+
+    total_count = db.query(NotificationLog).filter(
+        NotificationLog.user_id == current_user.id
+    ).count()
+
+    return {
+        "today": today_count,
+        "this_week": week_count,
+        "total": total_count,
+    }
+
+
+# ============================================================================
 # APP VERSION CHECK
 # ============================================================================
 
-LATEST_APP_VERSION = os.getenv("LATEST_APP_VERSION", "1.0.0")
+LATEST_APP_VERSION = "1.0.0"
 
 @app.get("/api/app/version")
 async def get_app_version():
