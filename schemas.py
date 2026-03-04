@@ -81,10 +81,12 @@ class LiveAircraftResponse(BaseModel):
     tail_number: str
     icao24: Optional[str]
     status: str  # 'in_airspace', 'outside', 'on_ground'
+    on_ground: Optional[bool] = False
     distance_nm: float
     altitude_ft_agl: Optional[float]
     altitude_ft_msl: Optional[float]
     velocity_kts: Optional[float]
+    heading: Optional[float] = None
     is_approaching: bool
     last_seen: datetime
     latitude: Optional[float]

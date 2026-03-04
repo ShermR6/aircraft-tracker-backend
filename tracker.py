@@ -175,7 +175,13 @@ class UserTracker:
             'in_airspace': in_airspace,
             'on_ground': on_ground,
             'last_update': datetime.now(),
-            'consecutive_missing': 0
+            'consecutive_missing': 0,
+            'latitude': aircraft_data['latitude'],
+            'longitude': aircraft_data['longitude'],
+            'altitude_agl': altitude_agl_ft,
+            'altitude_msl': altitude_msl_ft,
+            'velocity': aircraft_data.get('velocity'),
+            'heading': aircraft_data.get('heading'),
         })
         
         return notifications
@@ -316,7 +322,8 @@ class CloudAircraftTracker:
                                         'longitude': aircraft_data.get('lon'),
                                         'baro_altitude': aircraft_data.get('alt_baro'),
                                         'on_ground': aircraft_data.get('alt_baro') == 'ground',
-                                        'velocity': aircraft_data.get('gs')
+                                        'velocity': aircraft_data.get('gs'),
+                                        'heading': aircraft_data.get('track'),
                                     }
                                     
                                     # Check and get notifications
@@ -468,14 +475,16 @@ class CloudAircraftTracker:
                     'tail_number': tail,
                     'icao24': icao24,
                     'status': 'in_airspace' if state.get('in_airspace') else 'outside',
+                    'on_ground': state.get('on_ground', False),
                     'distance_nm': state.get('last_distance', 0),
                     'altitude_ft_agl': state.get('altitude_agl', 0),
                     'altitude_ft_msl': state.get('altitude_msl', 0),
                     'velocity_kts': state.get('velocity', 0),
+                    'heading': state.get('heading', 0),
                     'is_approaching': state.get('last_distance', 0) < state.get('max_distance', 999),
                     'last_seen': state.get('last_update', datetime.utcnow()),
-                    'latitude': None,  # Not stored in state currently
-                    'longitude': None
+                    'latitude': state.get('latitude'),
+                    'longitude': state.get('longitude'),
                 })
         
         return result
