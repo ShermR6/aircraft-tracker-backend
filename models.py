@@ -41,7 +41,6 @@ class License(Base):
     activated_at = Column(DateTime, nullable=True)
     expires_at = Column(DateTime, nullable=True)
     status = Column(String(20), default="inactive")
-    stripe_customer_id = Column(String(100), nullable=True)  # for billing portal
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
