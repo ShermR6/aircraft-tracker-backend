@@ -15,7 +15,7 @@ import httpx
 from typing import List, Optional
 
 from database import get_db, engine, Base
-from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig
+from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation
 from schemas import (
     LicenseActivation, LicenseResponse,
     UserLogin, UserResponse, TokenResponse,
@@ -56,6 +56,31 @@ LICENSE_DURATION_DAYS = 30
 
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
+
+# Tier feature limits (None = unlimited)
+TIER_LIMITS = {
+    "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 1},
+    "premium":      {"aircraft": 10,   "locations": 5,    "integrations": 3},
+    "pro":          {"aircraft": None, "locations": None, "integrations": None},
+    "team-starter": {"aircraft": 3,    "locations": 1,    "integrations": 1},
+    "team-premium": {"aircraft": 10,   "locations": 5,    "integrations": 3},
+    "team-pro":     {"aircraft": None, "locations": None, "integrations": None},
+}
+
+
+def get_user_tier(user: "User", db) -> str:
+    """Get the license tier for a user"""
+    if user.license_id:
+        from models import License
+        lic = db.query(License).filter(License.id == user.license_id).first()
+        if lic:
+            return lic.tier
+    return "starter"
+
+
+def get_tier_limit(tier: str, feature: str):
+    """Get the limit for a feature on a given tier. Returns None for unlimited."""
+    return TIER_LIMITS.get(tier, TIER_LIMITS["starter"]).get(feature, 1)
 
 
 async def sync_license_to_website(license_key: str, activated_at: datetime, expires_at: datetime):
@@ -462,8 +487,6 @@ async def get_airport_config(
         "floor_ft_agl": config.floor_ft_agl,
         "ceiling_ft_agl": config.ceiling_ft_agl,
         "query_radius_nm": config.query_radius_nm,
-        "detection_radius_nm": config.query_radius_nm,  # alias for frontend
-        "polling_interval_seconds": getattr(config, 'polling_interval_seconds', 10),
         "alert_distances_nm": config.alert_distances_nm,
         "quiet_hours_enabled": config.quiet_hours_enabled,
         "quiet_hours_start": config.quiet_hours_start,
@@ -489,8 +512,6 @@ async def save_airport_config(
         config.latitude = str(config_data.get("latitude", config.latitude))
         config.longitude = str(config_data.get("longitude", config.longitude))
         config.query_radius_nm = str(config_data.get("detection_radius_nm", config.query_radius_nm))
-        if hasattr(config, 'polling_interval_seconds') and config_data.get("polling_interval_seconds"):
-            config.polling_interval_seconds = int(config_data.get("polling_interval_seconds"))
         config.quiet_hours_start = config_data.get("quiet_hours_start", config.quiet_hours_start)
         config.quiet_hours_end = config_data.get("quiet_hours_end", config.quiet_hours_end)
         config.updated_at = datetime.utcnow()
@@ -708,6 +729,189 @@ async def get_notification_stats(
         "this_week": week_count,
         "total": total_count,
     }
+
+
+# ============================================================================
+# SAVED LOCATIONS
+# ============================================================================
+
+@app.get("/api/locations")
+async def get_locations(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    locations = db.query(SavedLocation).filter(
+        SavedLocation.user_id == current_user.id
+    ).order_by(SavedLocation.created_at).all()
+    return [
+        {
+            "id": str(loc.id),
+            "name": loc.name,
+            "airport_code": loc.airport_code,
+            "latitude": loc.latitude,
+            "longitude": loc.longitude,
+            "elevation_ft_msl": loc.elevation_ft_msl,
+            "is_active": loc.is_active,
+            "created_at": loc.created_at.isoformat(),
+        }
+        for loc in locations
+    ]
+
+
+@app.post("/api/locations")
+async def create_location(
+    data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Enforce tier limits
+    tier = get_user_tier(current_user, db)
+    limit = get_tier_limit(tier, "locations")
+    if limit is not None:
+        count = db.query(SavedLocation).filter(SavedLocation.user_id == current_user.id).count()
+        if count >= limit:
+            raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {limit} saved location(s). Upgrade to add more.")
+
+    # If this is the first location, make it active
+    existing_count = db.query(SavedLocation).filter(SavedLocation.user_id == current_user.id).count()
+    is_active = existing_count == 0
+
+    loc = SavedLocation(
+        user_id=current_user.id,
+        name=data.get("name", "My Location"),
+        airport_code=data.get("airport_code"),
+        latitude=str(data["latitude"]),
+        longitude=str(data["longitude"]),
+        elevation_ft_msl=data.get("elevation_ft_msl", 0),
+        is_active=is_active,
+    )
+    db.add(loc)
+    db.commit()
+    db.refresh(loc)
+    return {"id": str(loc.id), "name": loc.name, "is_active": loc.is_active}
+
+
+@app.put("/api/locations/{location_id}")
+async def update_location(
+    location_id: str,
+    data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    loc = db.query(SavedLocation).filter(
+        SavedLocation.id == location_id,
+        SavedLocation.user_id == current_user.id
+    ).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Location not found")
+    for field in ["name", "airport_code", "latitude", "longitude", "elevation_ft_msl"]:
+        if field in data:
+            setattr(loc, field, str(data[field]) if field in ["latitude", "longitude"] else data[field])
+    loc.updated_at = datetime.utcnow()
+    db.commit()
+    return {"message": "Updated"}
+
+
+@app.post("/api/locations/{location_id}/activate")
+async def activate_location(
+    location_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Deactivate all locations for this user
+    db.query(SavedLocation).filter(
+        SavedLocation.user_id == current_user.id
+    ).update({"is_active": False})
+    # Activate the selected one
+    loc = db.query(SavedLocation).filter(
+        SavedLocation.id == location_id,
+        SavedLocation.user_id == current_user.id
+    ).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Location not found")
+    loc.is_active = True
+
+    # Also sync to AirportConfig so tracker uses it
+    config = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
+    if config:
+        config.airport_code = loc.airport_code
+        config.latitude = loc.latitude
+        config.longitude = loc.longitude
+        config.elevation_ft_msl = loc.elevation_ft_msl or 0
+        config.updated_at = datetime.utcnow()
+
+    db.commit()
+    return {"message": f"{loc.name} is now active"}
+
+
+@app.delete("/api/locations/{location_id}")
+async def delete_location(
+    location_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    loc = db.query(SavedLocation).filter(
+        SavedLocation.id == location_id,
+        SavedLocation.user_id == current_user.id
+    ).first()
+    if not loc:
+        raise HTTPException(status_code=404, detail="Location not found")
+    was_active = loc.is_active
+    db.delete(loc)
+    db.commit()
+    # If deleted location was active, activate the next one
+    if was_active:
+        next_loc = db.query(SavedLocation).filter(
+            SavedLocation.user_id == current_user.id
+        ).first()
+        if next_loc:
+            next_loc.is_active = True
+            db.commit()
+    return {"message": "Deleted"}
+
+
+# ============================================================================
+# STRIPE BILLING PORTAL
+# ============================================================================
+
+@app.post("/api/billing/portal")
+async def create_billing_portal(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Create a Stripe billing portal session for the current user"""
+    stripe_secret = os.getenv("STRIPE_SECRET_KEY")
+    if not stripe_secret:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+
+    return_url = os.getenv("WEBSITE_URL", "https://finalpingapp.com") + "/dashboard"
+
+    async with httpx.AsyncClient() as client:
+        # Look up customer by email
+        search_resp = await client.get(
+            "https://api.stripe.com/v1/customers/search",
+            params={"query": f"email:'{current_user.email}'"},
+            auth=(stripe_secret, ""),
+        )
+        if search_resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to look up Stripe customer")
+
+        customers = search_resp.json().get("data", [])
+        if not customers:
+            raise HTTPException(status_code=404, detail="No Stripe customer found for this account. Please purchase a plan first.")
+
+        customer_id = customers[0]["id"]
+
+        # Create portal session
+        portal_resp = await client.post(
+            "https://api.stripe.com/v1/billing_portal/sessions",
+            data={"customer": customer_id, "return_url": return_url},
+            auth=(stripe_secret, ""),
+        )
+        if portal_resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to create billing portal session")
+
+        return {"url": portal_resp.json()["url"]}
 
 
 # ============================================================================

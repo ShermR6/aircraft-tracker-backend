@@ -38,9 +38,10 @@ class License(Base):
     tier = Column(String(20), nullable=False)
     activations_used = Column(Integer, default=0)
     activations_max = Column(Integer, nullable=False)
-    activated_at = Column(DateTime, nullable=True)  # When first activated in desktop app (timer starts)
-    expires_at = Column(DateTime, nullable=True)     # activated_at + 30 days (set on activation)
-    status = Column(String(20), default="inactive")  # 'inactive', 'active', 'expired'
+    activated_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+    status = Column(String(20), default="inactive")
+    stripe_customer_id = Column(String(100), nullable=True)  # for billing portal
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
@@ -140,3 +141,19 @@ class NotificationLog(Base):
     integration_type = Column(String(50), nullable=False)
     status = Column(String(20), default="sent")
     sent_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SavedLocation(Base):
+    """Saved tracking locations (multiple per user)"""
+    __tablename__ = "saved_locations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    name = Column(String(100), nullable=False)           # e.g. "KDTO Home Base"
+    airport_code = Column(String(10), nullable=True)
+    latitude = Column(String(20), nullable=False)
+    longitude = Column(String(20), nullable=False)
+    elevation_ft_msl = Column(Integer, default=0)
+    is_active = Column(Boolean, default=False)           # only one can be active
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
