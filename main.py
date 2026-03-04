@@ -462,6 +462,8 @@ async def get_airport_config(
         "floor_ft_agl": config.floor_ft_agl,
         "ceiling_ft_agl": config.ceiling_ft_agl,
         "query_radius_nm": config.query_radius_nm,
+        "detection_radius_nm": config.query_radius_nm,  # alias for frontend
+        "polling_interval_seconds": getattr(config, 'polling_interval_seconds', 10),
         "alert_distances_nm": config.alert_distances_nm,
         "quiet_hours_enabled": config.quiet_hours_enabled,
         "quiet_hours_start": config.quiet_hours_start,
@@ -487,6 +489,8 @@ async def save_airport_config(
         config.latitude = str(config_data.get("latitude", config.latitude))
         config.longitude = str(config_data.get("longitude", config.longitude))
         config.query_radius_nm = str(config_data.get("detection_radius_nm", config.query_radius_nm))
+        if hasattr(config, 'polling_interval_seconds') and config_data.get("polling_interval_seconds"):
+            config.polling_interval_seconds = int(config_data.get("polling_interval_seconds"))
         config.quiet_hours_start = config_data.get("quiet_hours_start", config.quiet_hours_start)
         config.quiet_hours_end = config_data.get("quiet_hours_end", config.quiet_hours_end)
         config.updated_at = datetime.utcnow()
