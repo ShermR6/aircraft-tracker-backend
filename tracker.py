@@ -407,6 +407,8 @@ class CloudAircraftTracker:
                 return await self.send_slack(integration.config, message)
             elif integration.type == 'teams':
                 return await self.send_teams(integration.config, message)
+            elif integration.type == 'email':
+                return await self.send_email(integration.config, message)
             else:
                 return False
         except Exception as e:
@@ -454,10 +456,65 @@ class CloudAircraftTracker:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 return response.status == 200
+
+    async def send_email(self, config: dict, message: str) -> bool:
+        """Send email notification via Resend"""
+        import os
+        to_email = config.get('to_email')
+        if not to_email:
+            return False
+
+        resend_api_key = os.environ.get('RESEND_API_KEY')
+        if not resend_api_key:
+            print("RESEND_API_KEY not set")
+            return False
+
+        # Convert plain message to simple HTML
+        html_body = message.replace('\n', '<br>').replace('**', '')
+        html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto;">
+            <div style="background: #0f1117; padding: 20px; border-radius: 8px;">
+                <h2 style="color: #38bdf8; margin: 0 0 16px 0;">✈️ FinalPing Alert</h2>
+                <div style="color: #f9fafb; font-size: 15px; line-height: 1.6;">
+                    {html_body}
+                </div>
+                <hr style="border-color: #2d3748; margin: 16px 0;">
+                <p style="color: #6b7280; font-size: 12px; margin: 0;">
+                    Sent by <a href="https://finalpingapp.com" style="color: #38bdf8;">FinalPing</a> &mdash;
+                    <a href="https://finalpingapp.com/account" style="color: #38bdf8;">Manage notifications</a>
+                </p>
+            </div>
+        </div>
+        """
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                'https://api.resend.com/emails',
+                headers={
+                    'Authorization': f'Bearer {resend_api_key}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'from': 'FinalPing <noreply@finalpingapp.com>',
+                    'to': [to_email],
+                    'subject': f'✈️ FinalPing: {message[:60].strip()}',
+                    'html': html,
+                },
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status == 200:
+                    return True
+                else:
+                    error = await response.text()
+                    print(f"Resend error: {error}")
+                    return False
     
     async def send_test_notification(self, integration: Integration) -> bool:
         """Send test notification"""
-        test_message = f"🧪 **Test Notification**\nYour {integration.type} integration is working! ✅"
+        if integration.type == 'email':
+            test_message = f"Test Notification\nYour email integration is working!"
+        else:
+            test_message = f"🧪 **Test Notification**\nYour {integration.type} integration is working! ✅"
         return await self.send_via_integration(integration, test_message)
     
     async def get_live_aircraft(self, user_id: str) -> List[dict]:
