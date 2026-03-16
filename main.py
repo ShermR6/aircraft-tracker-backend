@@ -332,9 +332,10 @@ async def add_aircraft(
     """Add new aircraft to track"""
     existing = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
-        Aircraft.tail_number == aircraft_data.tail_number
+        Aircraft.tail_number == aircraft_data.tail_number,
+        Aircraft.active == True
     ).first()
-    
+
     if existing:
         raise HTTPException(status_code=400, detail="Aircraft already exists")
     
@@ -377,57 +378,13 @@ async def delete_aircraft(
     
     if not aircraft:
         raise HTTPException(status_code=404, detail="Aircraft not found")
-    
-    aircraft.active = False
+
+    db.delete(aircraft)
     db.commit()
     
     await tracker.update_user_aircraft(str(current_user.id), db)
     
     return {"message": "Aircraft deleted"}
-
-
-@app.put("/api/aircraft/{aircraft_id}", response_model=AircraftResponse)
-async def update_aircraft(
-    aircraft_id: str,
-    aircraft_data: AircraftCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Update existing aircraft"""
-    aircraft = db.query(Aircraft).filter(
-        Aircraft.id == aircraft_id,
-        Aircraft.user_id == current_user.id
-    ).first()
-
-    if not aircraft:
-        raise HTTPException(status_code=404, detail="Aircraft not found")
-
-    # Check for duplicate tail number on a *different* aircraft
-    duplicate = db.query(Aircraft).filter(
-        Aircraft.user_id == current_user.id,
-        Aircraft.tail_number == aircraft_data.tail_number,
-        Aircraft.id != aircraft_id
-    ).first()
-
-    if duplicate:
-        raise HTTPException(status_code=400, detail="Aircraft already exists")
-
-    aircraft.tail_number = aircraft_data.tail_number
-    aircraft.icao24 = aircraft_data.icao24
-    aircraft.friendly_name = aircraft_data.friendly_name
-    db.commit()
-    db.refresh(aircraft)
-
-    await tracker.update_user_aircraft(str(current_user.id), db)
-
-    return AircraftResponse(
-        id=str(aircraft.id),
-        tail_number=aircraft.tail_number,
-        icao24=aircraft.icao24,
-        friendly_name=aircraft.friendly_name,
-        active=aircraft.active,
-        created_at=aircraft.created_at
-    )
 
 
 @app.get("/api/aircraft/live", response_model=List[LiveAircraftResponse])
