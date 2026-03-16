@@ -332,10 +332,9 @@ async def add_aircraft(
     """Add new aircraft to track"""
     existing = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
-        Aircraft.tail_number == aircraft_data.tail_number,
-        Aircraft.active == True
+        Aircraft.tail_number == aircraft_data.tail_number
     ).first()
-
+    
     if existing:
         raise HTTPException(status_code=400, detail="Aircraft already exists")
     
@@ -378,8 +377,8 @@ async def delete_aircraft(
     
     if not aircraft:
         raise HTTPException(status_code=404, detail="Aircraft not found")
-
-    db.delete(aircraft)
+    
+    aircraft.active = False
     db.commit()
     
     await tracker.update_user_aircraft(str(current_user.id), db)
@@ -730,6 +729,40 @@ async def get_notification_stats(
         "this_week": week_count,
         "total": total_count,
     }
+
+
+@app.get("/api/internal/notifications")
+async def get_notifications_for_website(
+    email: str,
+    limit: int = 50,
+    x_internal_secret: str = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Fetch notification logs for a user by email — for website use only"""
+    if x_internal_secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    from models import NotificationLog
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return []
+
+    logs = db.query(NotificationLog).filter(
+        NotificationLog.user_id == user.id
+    ).order_by(NotificationLog.sent_at.desc()).limit(limit).all()
+
+    return [
+        {
+            "id": str(log.id),
+            "aircraft_tail": log.aircraft_tail,
+            "alert_type": log.alert_type,
+            "message": log.message,
+            "integration_type": log.integration_type,
+            "status": log.status,
+            "sent_at": log.sent_at.isoformat(),
+        }
+        for log in logs
+    ]
 
 
 # ============================================================================
