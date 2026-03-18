@@ -230,12 +230,32 @@ async def get_current_user_info(
     db: Session = Depends(get_db)
 ):
     """Get current user information"""
-    license = db.query(License).filter(License.id == current_user.license_id).first()
-    
+    from sqlalchemy import desc
+
+    TIER_PRIORITY = {"pro": 3, "premium": 2, "starter": 1, "unknown": 0}
+
+    # Get all active licenses associated with this user
+    direct = db.query(License).filter(License.id == current_user.license_id).first()
+
+    # Find highest tier active license for this user
+    all_user_licenses = db.query(License).join(
+        User, User.license_id == License.id
+    ).filter(User.email == current_user.email).all()
+
+    if direct and direct not in all_user_licenses:
+        all_user_licenses.append(direct)
+
+    license = direct
+    for l in all_user_licenses:
+        if l.status == "active":
+            if license is None or TIER_PRIORITY.get(l.tier, 0) > TIER_PRIORITY.get(license.tier if license else "unknown", 0):
+                license = l
+
     return UserResponse(
         id=str(current_user.id),
         email=current_user.email,
         license_tier=license.tier if license else "unknown",
+        expires_at=license.expires_at if license else None,
         created_at=current_user.created_at
     )
 
