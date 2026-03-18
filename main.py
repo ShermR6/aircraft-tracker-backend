@@ -210,6 +210,11 @@ async def activate_license(
         db.add(user)
         db.commit()
         db.refresh(user)
+    elif user.license_id != license.id:
+        # User is activating a different/newer license — update their license_id
+        user.license_id = license.id
+        db.commit()
+        db.refresh(user)
     
     # Create access token
     access_token = create_access_token(str(user.id))
@@ -230,7 +235,28 @@ async def get_current_user_info(
     db: Session = Depends(get_db)
 ):
     """Get current user information"""
-    license = db.query(License).filter(License.id == current_user.license_id).first()
+    from sqlalchemy import desc
+    # Get the license pointed to by user, or find their most recent active one
+    license = db.query(License).filter(
+        License.id == current_user.license_id
+    ).first()
+
+    # Fallback: find any active license for this user in case license_id is stale
+    if not license or license.status != "active":
+        active = db.query(License).filter(
+            License.status == "active",
+            License.id == current_user.license_id
+        ).first()
+        if not active:
+            # Try finding by email match across all licenses
+            active = db.query(License).join(
+                User, User.license_id == License.id
+            ).filter(
+                User.email == current_user.email,
+                License.status == "active"
+            ).order_by(desc(License.activated_at)).first()
+        if active:
+            license = active
     
     return UserResponse(
         id=str(current_user.id),
