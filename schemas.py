@@ -140,7 +140,7 @@ class AirportConfigResponse(BaseModel):
 
 class AlertSettingCreate(BaseModel):
     """Create alert setting"""
-    alert_type: str = Field(..., pattern="^(\d+nm|landing)$")
+    alert_type: str = Field(..., pattern=r"^(\d+nm|landing)$")
     enabled: bool = True
     message_template: str
 
