@@ -236,27 +236,29 @@ async def get_current_user_info(
 ):
     """Get current user information"""
     from sqlalchemy import desc
-    # Get the license pointed to by user, or find their most recent active one
-    license = db.query(License).filter(
-        License.id == current_user.license_id
-    ).first()
 
-    # Fallback: find any active license for this user in case license_id is stale
-    if not license or license.status != "active":
-        active = db.query(License).filter(
-            License.status == "active",
-            License.id == current_user.license_id
-        ).first()
-        if not active:
-            # Try finding by email match across all licenses
-            active = db.query(License).join(
-                User, User.license_id == License.id
-            ).filter(
-                User.email == current_user.email,
-                License.status == "active"
-            ).order_by(desc(License.activated_at)).first()
-        if active:
-            license = active
+    TIER_PRIORITY = {"pro": 3, "premium": 2, "starter": 1, "unknown": 0}
+
+    # Get all active licenses associated with this user's email
+    all_licenses = db.query(License).filter(
+        License.status == "active",
+        License.id.in_(
+            db.query(License.id).join(User, User.license_id == License.id).filter(
+                User.email == current_user.email
+            )
+        )
+    ).all()
+
+    # Also include the directly linked license
+    direct = db.query(License).filter(License.id == current_user.license_id).first()
+    if direct and direct not in all_licenses:
+        all_licenses.append(direct)
+
+    # Pick the highest tier active license
+    license = None
+    for l in all_licenses:
+        if license is None or TIER_PRIORITY.get(l.tier, 0) > TIER_PRIORITY.get(license.tier, 0):
+            license = l
     
     return UserResponse(
         id=str(current_user.id),
