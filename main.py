@@ -14,7 +14,7 @@ import os
 import httpx
 from typing import List, Optional
 
-from database import get_db, engine, Base
+from database import get_db, engine, Base, SessionLocal
 from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation
 from schemas import (
     LicenseActivation, LicenseResponse,
@@ -210,11 +210,6 @@ async def activate_license(
         db.add(user)
         db.commit()
         db.refresh(user)
-    elif user.license_id != license.id:
-        # User is activating a different/newer license — update their license_id
-        user.license_id = license.id
-        db.commit()
-        db.refresh(user)
     
     # Create access token
     access_token = create_access_token(str(user.id))
@@ -235,36 +230,12 @@ async def get_current_user_info(
     db: Session = Depends(get_db)
 ):
     """Get current user information"""
-    from sqlalchemy import desc
-
-    TIER_PRIORITY = {"pro": 3, "premium": 2, "starter": 1, "unknown": 0}
-
-    # Get all active licenses associated with this user's email
-    all_licenses = db.query(License).filter(
-        License.status == "active",
-        License.id.in_(
-            db.query(License.id).join(User, User.license_id == License.id).filter(
-                User.email == current_user.email
-            )
-        )
-    ).all()
-
-    # Also include the directly linked license
-    direct = db.query(License).filter(License.id == current_user.license_id).first()
-    if direct and direct not in all_licenses:
-        all_licenses.append(direct)
-
-    # Pick the highest tier active license
-    license = None
-    for l in all_licenses:
-        if license is None or TIER_PRIORITY.get(l.tier, 0) > TIER_PRIORITY.get(license.tier, 0):
-            license = l
+    license = db.query(License).filter(License.id == current_user.license_id).first()
     
     return UserResponse(
         id=str(current_user.id),
         email=current_user.email,
         license_tier=license.tier if license else "unknown",
-        expires_at=license.expires_at if license else None,
         created_at=current_user.created_at
     )
 
@@ -992,6 +963,22 @@ async def startup_event():
     print("🚀 Starting FinalPing Cloud Backend...")
     print("📡 Initializing global aircraft tracker...")
     await tracker.start()
+
+    # Load all existing users into the tracker
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        for user in users:
+            try:
+                await tracker.update_user_aircraft(str(user.id), db)
+            except Exception as e:
+                print(f"Failed to load tracker for user {user.id}: {e}")
+        print(f"✅ Loaded {len(users)} users into tracker")
+    except Exception as e:
+        print(f"Error loading users on startup: {e}")
+    finally:
+        db.close()
+
     print("✅ FinalPing Cloud Backend ready!")
 
 
