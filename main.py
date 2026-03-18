@@ -3,7 +3,7 @@ FinalPing Cloud Backend
 Main FastAPI application
 """
 
-from fastapi import FastAPI, Depends, HTTPException, Request, status, Header
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -236,6 +236,7 @@ async def get_current_user_info(
         id=str(current_user.id),
         email=current_user.email,
         license_tier=license.tier if license else "unknown",
+        expires_at=license.expires_at if license else None,
         created_at=current_user.created_at
     )
 
