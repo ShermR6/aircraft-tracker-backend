@@ -242,26 +242,29 @@ async def get_current_user_info(
     from sqlalchemy import desc
 
     # Find the most recently activated active license for this user
-    # This correctly handles upgrades, downgrades, and renewals
-    license = db.query(License).filter(
-        License.id == current_user.license_id
-    ).first()
+    from sqlalchemy import desc
 
-    # Look for a better license — most recently activated and active
-    better = db.query(License).join(
-        User, User.license_id == License.id
-    ).filter(
-        User.email == current_user.email,
-        License.status == "active"
+    # Get all license IDs ever associated with this user's email
+    # by finding all users with this email (should be 1) and their license_id history
+    # Plus check the activation log — licenses activated by this user
+    user_license_ids = [u.license_id for u in db.query(User).filter(
+        User.email == current_user.email
+    ).all() if u.license_id]
+
+    # Also include any license that was activated and linked to this specific user
+    activated_licenses = db.query(License).filter(
+        License.id.in_(user_license_ids),
+        License.status == "active",
+        License.activated_at.isnot(None)
     ).order_by(desc(License.activated_at)).first()
 
-    if better:
-        license = better
-    elif not license:
-        # Fallback: any license linked to this user
-        license = db.query(License).join(
-            User, User.license_id == License.id
-        ).filter(User.email == current_user.email).order_by(desc(License.activated_at)).first()
+    license = activated_licenses
+
+    # Fallback to directly linked license
+    if not license:
+        license = db.query(License).filter(
+            License.id == current_user.license_id
+        ).first()
 
     return UserResponse(
         id=str(current_user.id),
@@ -969,6 +972,34 @@ async def get_app_version():
 # ============================================================================
 # HEALTH & STATUS
 # ============================================================================
+
+@app.get("/api/debug/licenses")
+async def debug_licenses(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Debug endpoint to see all license data for current user"""
+    licenses = db.query(License).filter(
+        License.id == current_user.license_id
+    ).all()
+    user = db.query(User).filter(User.id == current_user.id).first()
+    return {
+        "user_id": str(current_user.id),
+        "user_email": current_user.email,
+        "user_license_id": str(user.license_id) if user.license_id else None,
+        "licenses": [
+            {
+                "id": str(l.id),
+                "license_key": l.license_key,
+                "tier": l.tier,
+                "status": l.status,
+                "activated_at": l.activated_at.isoformat() if l.activated_at else None,
+                "expires_at": l.expires_at.isoformat() if l.expires_at else None,
+            }
+            for l in licenses
+        ]
+    }
+
 
 @app.get("/health")
 async def health_check():
