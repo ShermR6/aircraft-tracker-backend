@@ -181,7 +181,12 @@ async def activate_license(
         license.activations_used += 1
         db.commit()
         db.refresh(license)
-
+    elif not license.expires_at:
+        # Already activated but expires_at is missing — set it from activated_at
+        license.expires_at = license.activated_at + timedelta(days=LICENSE_DURATION_DAYS)
+        license.status = "active"
+        db.commit()
+        db.refresh(license)
     elif license.status != "active":
         # Was provisioned but not yet marked active (edge case)
         license.status = "active"
