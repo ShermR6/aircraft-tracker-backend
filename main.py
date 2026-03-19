@@ -241,22 +241,27 @@ async def get_current_user_info(
     """Get current user information"""
     from sqlalchemy import desc
 
-    TIER_PRIORITY = {"pro": 3, "premium": 2, "starter": 1, "unknown": 0}
+    # Find the most recently activated active license for this user
+    # This correctly handles upgrades, downgrades, and renewals
+    license = db.query(License).filter(
+        License.id == current_user.license_id
+    ).first()
 
-    direct = db.query(License).filter(License.id == current_user.license_id).first()
-
-    all_user_licenses = db.query(License).join(
+    # Look for a better license — most recently activated and active
+    better = db.query(License).join(
         User, User.license_id == License.id
-    ).filter(User.email == current_user.email).all()
+    ).filter(
+        User.email == current_user.email,
+        License.status == "active"
+    ).order_by(desc(License.activated_at)).first()
 
-    if direct and direct not in all_user_licenses:
-        all_user_licenses.append(direct)
-
-    license = direct
-    for l in all_user_licenses:
-        if l.status == "active":
-            if license is None or TIER_PRIORITY.get(l.tier, 0) > TIER_PRIORITY.get(license.tier if license else "unknown", 0):
-                license = l
+    if better:
+        license = better
+    elif not license:
+        # Fallback: any license linked to this user
+        license = db.query(License).join(
+            User, User.license_id == License.id
+        ).filter(User.email == current_user.email).order_by(desc(License.activated_at)).first()
 
     return UserResponse(
         id=str(current_user.id),
