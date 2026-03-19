@@ -14,7 +14,7 @@ import os
 import httpx
 from typing import List, Optional
 
-from database import get_db, engine, Base
+from database import get_db, engine, Base, SessionLocal
 from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation
 from schemas import (
     LicenseActivation, LicenseResponse,
