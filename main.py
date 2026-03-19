@@ -354,7 +354,8 @@ async def add_aircraft(
     """Add new aircraft to track"""
     existing = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
-        Aircraft.tail_number == aircraft_data.tail_number
+        Aircraft.tail_number == aircraft_data.tail_number,
+        Aircraft.active == True
     ).first()
     
     if existing:
@@ -400,7 +401,7 @@ async def delete_aircraft(
     if not aircraft:
         raise HTTPException(status_code=404, detail="Aircraft not found")
     
-    aircraft.active = False
+    db.delete(aircraft)
     db.commit()
     
     await tracker.update_user_aircraft(str(current_user.id), db)
@@ -989,6 +990,22 @@ async def startup_event():
     print("🚀 Starting FinalPing Cloud Backend...")
     print("📡 Initializing global aircraft tracker...")
     await tracker.start()
+
+    # Load all existing users into the tracker
+    db = SessionLocal()
+    try:
+        users = db.query(User).all()
+        for user in users:
+            try:
+                await tracker.update_user_aircraft(str(user.id), db)
+            except Exception as e:
+                print(f"Failed to load tracker for user {user.id}: {e}")
+        print(f"✅ Loaded {len(users)} users into tracker")
+    except Exception as e:
+        print(f"Error loading users on startup: {e}")
+    finally:
+        db.close()
+
     print("✅ FinalPing Cloud Backend ready!")
 
 
