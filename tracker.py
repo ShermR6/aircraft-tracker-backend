@@ -107,7 +107,7 @@ class UserTracker:
             
             if max_distance is not None and prev_distance is not None:
                 for alert_distance in alert_distances:
-                    alert_key = f"{alert_distance}nm"
+                    alert_key = f"{int(alert_distance) if alert_distance == int(alert_distance) else alert_distance}nm"
                     
                     was_beyond_boundary = max_distance > alert_distance
                     crossed_boundary = (prev_distance > alert_distance and distance_nm <= alert_distance)
@@ -380,13 +380,23 @@ class CloudAircraftTracker:
     
     def get_default_template(self, alert_type: str) -> str:
         """Get default message template"""
+        # Normalize alert_type — strip .0 from floats like "10.0nm" -> "10nm"
+        normalized = alert_type
+        if 'nm' in alert_type:
+            num = alert_type.replace('nm', '')
+            try:
+                f = float(num)
+                normalized = f'{int(f)}nm' if f == int(f) else f'{f}nm'
+            except ValueError:
+                pass
+
         templates = {
             '10nm': '**{tail} - 10nm out**\nETA ~{eta}min, Alt {altitude}ft AGL',
             '5nm': '**{tail} - 5nm out**\nETA ~{eta}min, Alt {altitude}ft AGL',
             '2nm': '**{tail} - 2nm out**\nETA ~{eta}min, Alt {altitude}ft AGL',
-            'landing': '**🛬 {tail} LANDING**\nTime: {time}\n✅ Ready to put away'
+            'landing': '**\U0001f6ec {tail} LANDING**\nTime: {time}\n\u2705 Ready to put away'
         }
-        return templates.get(alert_type, '{tail} alert')
+        return templates.get(normalized, f'**{{tail}} - {normalized}**\nAlt {{altitude}}ft AGL')
     
     def format_message(self, template: str, notification: dict) -> str:
         """Format message from template"""
