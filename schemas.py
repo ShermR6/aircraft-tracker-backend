@@ -49,6 +49,7 @@ class UserResponse(BaseModel):
     id: str
     email: str
     license_tier: str
+    expires_at: Optional[datetime]
     created_at: datetime
 
 
