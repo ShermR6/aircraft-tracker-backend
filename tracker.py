@@ -76,15 +76,14 @@ class UserTracker:
         
         # Check altitude
         altitude_msl_m = aircraft_data['baro_altitude']
-        field_elev = float(airspace['field_elevation_ft_msl']) if airspace['field_elevation_ft_msl'] else 0
-        if on_ground or altitude_msl_m is None:
-            altitude_agl_ft = 0
-            altitude_msl_ft = field_elev
-            in_vertical = on_ground
-        else:
-            altitude_msl_ft = float(altitude_msl_m) * 3.28084
-            altitude_agl_ft = max(0, altitude_msl_ft - field_elev)
+        if altitude_msl_m is not None:
+            altitude_msl_ft = altitude_msl_m * 3.28084
+            altitude_agl_ft = altitude_msl_ft - airspace['field_elevation_ft_msl']
             in_vertical = airspace['floor_ft_agl'] <= altitude_agl_ft <= airspace['ceiling_ft_agl']
+        else:
+            altitude_agl_ft = 0
+            altitude_msl_ft = 0
+            in_vertical = on_ground
         
         in_airspace = in_horizontal and in_vertical
         
@@ -125,7 +124,7 @@ class UserTracker:
                                             'type': 'landing',
                                             'tail': callsign,
                                             'distance': distance_nm,
-                                            'altitude': altitude_agl_ft,
+                                            'altitude': altitude_msl_ft,
                                             'time': datetime.now()
                                         })
                                         self.aircraft_state.setdefault(aircraft_id, {})['landed'] = True
@@ -138,7 +137,7 @@ class UserTracker:
                                         'type': f'{alert_distance}nm',
                                         'tail': callsign,
                                         'distance': distance_nm,
-                                        'altitude': altitude_agl_ft,
+                                        'altitude': altitude_msl_ft,
                                         'eta': eta_minutes,
                                         'time': datetime.now()
                                     })
@@ -151,7 +150,7 @@ class UserTracker:
                                     'type': f'{alert_distance}nm',
                                     'tail': callsign,
                                     'distance': distance_nm,
-                                    'altitude': altitude_agl_ft,
+                                    'altitude': altitude_msl_ft,
                                     'eta': eta_minutes,
                                     'time': datetime.now()
                                 })
@@ -321,12 +320,8 @@ class CloudAircraftTracker:
                                         'callsign': tracker.aircraft_to_track[icao24],
                                         'latitude': aircraft_data.get('lat'),
                                         'longitude': aircraft_data.get('lon'),
-                                        'baro_altitude': aircraft_data.get('alt_baro') if aircraft_data.get('alt_baro') != 'ground' else None,
-                                        'on_ground': (
-                                            aircraft_data.get('alt_baro') == 'ground' or
-                                            aircraft_data.get('on_ground') == 1 or
-                                            aircraft_data.get('gnd') == 1
-                                        ),
+                                        'baro_altitude': aircraft_data.get('alt_baro'),
+                                        'on_ground': aircraft_data.get('alt_baro') == 'ground',
                                         'velocity': aircraft_data.get('gs'),
                                         'heading': aircraft_data.get('track'),
                                     }
@@ -396,12 +391,12 @@ class CloudAircraftTracker:
                 pass
 
         templates = {
-            '10nm': '**{tail} - 10nm out**\nETA ~{eta}min, Alt {altitude}ft AGL',
-            '5nm': '**{tail} - 5nm out**\nETA ~{eta}min, Alt {altitude}ft AGL',
-            '2nm': '**{tail} - 2nm out**\nETA ~{eta}min, Alt {altitude}ft AGL',
+            '10nm': '**{tail} - 10nm out**\nETA ~{eta}min, Alt {altitude}ft MSL',
+            '5nm': '**{tail} - 5nm out**\nETA ~{eta}min, Alt {altitude}ft MSL',
+            '2nm': '**{tail} - 2nm out**\nETA ~{eta}min, Alt {altitude}ft MSL',
             'landing': '**\U0001f6ec {tail} LANDING**\nTime: {time}\n\u2705 Ready to put away'
         }
-        return templates.get(normalized, f'**{{tail}} - {normalized}**\nAlt {{altitude}}ft AGL')
+        return templates.get(normalized, f'**{{tail}} - {normalized}**\nAlt {{altitude}}ft MSL')
     
     def format_message(self, template: str, notification: dict) -> str:
         """Format message from template"""
