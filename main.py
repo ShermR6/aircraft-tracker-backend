@@ -827,6 +827,40 @@ async def get_notification_logs(
     }
 
 
+@app.get("/api/internal/notifications")
+async def get_notifications_for_website(
+    email: str,
+    limit: int = 50,
+    x_internal_secret: str = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Fetch notification logs for a user by email — for website use only"""
+    if x_internal_secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    from models import NotificationLog
+    user = db.query(User).filter(User.email == email.lower().strip()).first()
+    if not user:
+        return []
+
+    logs = db.query(NotificationLog).filter(
+        NotificationLog.user_id == user.id
+    ).order_by(NotificationLog.sent_at.desc()).limit(limit).all()
+
+    return [
+        {
+            "id": str(log.id),
+            "aircraft_tail": log.aircraft_tail,
+            "alert_type": log.alert_type,
+            "message": log.message,
+            "integration_type": log.integration_type,
+            "status": log.status,
+            "sent_at": log.sent_at.isoformat(),
+        }
+        for log in logs
+    ]
+
+
 # ============================================================================
 # SAVED LOCATIONS
 # ============================================================================
