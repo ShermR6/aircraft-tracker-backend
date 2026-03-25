@@ -778,6 +778,55 @@ async def get_notification_stats(
     }
 
 
+@app.get("/api/notifications/logs")
+async def get_notification_logs(
+    page: int = 1,
+    limit: int = 25,
+    aircraft: str = None,
+    alert_type: str = None,
+    integration: str = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get paginated notification logs with filters"""
+    from models import NotificationLog
+
+    query = db.query(NotificationLog).filter(
+        NotificationLog.user_id == current_user.id
+    )
+
+    if aircraft:
+        query = query.filter(NotificationLog.aircraft_tail == aircraft)
+    if alert_type:
+        query = query.filter(NotificationLog.alert_type == alert_type)
+    if integration:
+        query = query.filter(NotificationLog.integration_type == integration)
+
+    total = query.count()
+    pages = max(1, (total + limit - 1) // limit)
+    offset = (page - 1) * limit
+
+    logs = query.order_by(NotificationLog.sent_at.desc()).offset(offset).limit(limit).all()
+
+    return {
+        "logs": [
+            {
+                "id": str(log.id),
+                "aircraft_tail": log.aircraft_tail,
+                "alert_type": log.alert_type,
+                "message": log.message,
+                "integration_type": log.integration_type,
+                "status": log.status,
+                "sent_at": log.sent_at.isoformat(),
+            }
+            for log in logs
+        ],
+        "total": total,
+        "page": page,
+        "pages": pages,
+    }
+
+
 # ============================================================================
 # SAVED LOCATIONS
 # ============================================================================
