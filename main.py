@@ -1201,6 +1201,13 @@ async def merge_accounts(
     if best_license:
         keep_user.license_id = best_license.id
 
+    # Move notification logs to keep_user
+    from models import NotificationLog
+    db.query(NotificationLog).filter(NotificationLog.user_id == merge_user.id).update({"user_id": keep_user.id})
+
+    # Move saved locations
+    db.query(SavedLocation).filter(SavedLocation.user_id == merge_user.id).update({"user_id": keep_user.id})
+
     # Delete merge_user
     db.delete(merge_user)
     db.commit()
