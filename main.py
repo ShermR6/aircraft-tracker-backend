@@ -1155,6 +1155,63 @@ async def generate_license(
     }
 
 
+@app.post("/api/admin/merge-accounts")
+async def merge_accounts(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Merge two user accounts into one — admin only"""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    keep_email = body.get("keep_email", "").lower().strip()
+    merge_email = body.get("merge_email", "").lower().strip()
+
+    keep_user = db.query(User).filter(User.email == keep_email).first()
+    merge_user = db.query(User).filter(User.email == merge_email).first()
+
+    if not keep_user:
+        raise HTTPException(status_code=404, detail=f"User not found: {keep_email}")
+    if not merge_user:
+        raise HTTPException(status_code=404, detail=f"User not found: {merge_email}")
+
+    # Move all aircraft from merge_user to keep_user
+    db.query(Aircraft).filter(Aircraft.user_id == merge_user.id).update({"user_id": keep_user.id})
+
+    # Move all integrations
+    db.query(Integration).filter(Integration.user_id == merge_user.id).update({"user_id": keep_user.id})
+
+    # Move all alert settings
+    db.query(AlertSetting).filter(AlertSetting.user_id == merge_user.id).update({"user_id": keep_user.id})
+
+    # Move airport config if keep_user doesn't have one
+    keep_config = db.query(AirportConfig).filter(AirportConfig.user_id == keep_user.id).first()
+    if not keep_config:
+        db.query(AirportConfig).filter(AirportConfig.user_id == merge_user.id).update({"user_id": keep_user.id})
+
+    # Update keep_user license to the best active license from either account
+    from sqlalchemy import desc
+    best_license = db.query(License).filter(
+        License.id.in_([keep_user.license_id, merge_user.license_id]),
+        License.status == "active"
+    ).order_by(desc(License.activated_at)).first()
+
+    if best_license:
+        keep_user.license_id = best_license.id
+
+    # Delete merge_user
+    db.delete(merge_user)
+    db.commit()
+
+    return {
+        "message": f"Merged {merge_email} into {keep_email} successfully",
+        "keep_user_id": str(keep_user.id),
+        "license_id": str(keep_user.license_id) if keep_user.license_id else None,
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
