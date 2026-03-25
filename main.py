@@ -156,6 +156,9 @@ async def activate_license(
     - First activation starts the 30-day timer.
     - Subsequent activations (same key) just log in if not expired.
     """
+    # Normalize email to lowercase to prevent duplicate accounts
+    activation.email = activation.email.lower().strip()
+
     # Find license
     license = db.query(License).filter(
         License.license_key == activation.license_key
@@ -549,7 +552,6 @@ async def save_airport_config(
         config.airport_code = config_data.get("airport_code", config.airport_code)
         config.latitude = str(config_data.get("latitude", config.latitude))
         config.longitude = str(config_data.get("longitude", config.longitude))
-        config.elevation_ft_msl = config_data.get("elevation_ft_msl", config.elevation_ft_msl)
         config.query_radius_nm = str(config_data.get("detection_radius_nm", config.query_radius_nm))
         config.radius_nm = str(config_data.get("polling_interval_seconds", config.radius_nm))
         config.quiet_hours_start = config_data.get("quiet_hours_start", config.quiet_hours_start)
