@@ -49,7 +49,6 @@ class UserResponse(BaseModel):
     id: str
     email: str
     license_tier: str
-    expires_at: Optional[datetime]
     created_at: datetime
 
 
@@ -161,7 +160,7 @@ class AlertSettingResponse(BaseModel):
 
 class IntegrationCreate(BaseModel):
     """Create integration"""
-    type: str = Field(..., pattern="^(discord|slack|teams|email)$")
+    type: str = Field(..., pattern="^(discord|slack|teams|email|sms|whatsapp)$")
     config: Dict[str, Any]
     enabled: bool = True
 

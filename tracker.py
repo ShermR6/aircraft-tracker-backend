@@ -420,6 +420,10 @@ class CloudAircraftTracker:
                 return await self.send_teams(integration.config, message)
             elif integration.type == 'email':
                 return await self.send_email(integration.config, message)
+            elif integration.type == 'sms':
+                return await self.send_sms(integration.config, message)
+            elif integration.type == 'whatsapp':
+                return await self.send_whatsapp(integration.config, message)
             else:
                 return False
         except Exception as e:
@@ -520,10 +524,81 @@ class CloudAircraftTracker:
                     print(f"Resend error: {error}")
                     return False
     
+    async def send_sms(self, config: dict, message: str) -> bool:
+        """Send SMS via Twilio"""
+        import os
+        to_phone = config.get('to_phone')
+        if not to_phone:
+            return False
+
+        account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
+        auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
+        from_phone = os.environ.get('TWILIO_PHONE_NUMBER')
+
+        if not account_sid or not auth_token or not from_phone:
+            print("Twilio credentials not set")
+            return False
+
+        # Strip markdown bold formatting for SMS
+        plain_message = message.replace('**', '')
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json',
+                auth=aiohttp.BasicAuth(account_sid, auth_token),
+                data={
+                    'From': from_phone,
+                    'To': to_phone,
+                    'Body': plain_message,
+                }
+            ) as response:
+                if response.status == 201:
+                    return True
+                else:
+                    error = await response.text()
+                    print(f"Twilio SMS error: {error}")
+                    return False
+
+    async def send_whatsapp(self, config: dict, message: str) -> bool:
+        """Send WhatsApp message via Twilio"""
+        import os
+        to_phone = config.get('to_phone')
+        if not to_phone:
+            return False
+
+        account_sid = os.environ.get('TWILIO_ACCOUNT_SID')
+        auth_token = os.environ.get('TWILIO_AUTH_TOKEN')
+        from_phone = os.environ.get('TWILIO_WHATSAPP_NUMBER')
+
+        if not account_sid or not auth_token or not from_phone:
+            print("Twilio WhatsApp credentials not set")
+            return False
+
+        plain_message = message.replace('**', '')
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json',
+                auth=aiohttp.BasicAuth(account_sid, auth_token),
+                data={
+                    'From': f'whatsapp:{from_phone}',
+                    'To': f'whatsapp:{to_phone}',
+                    'Body': plain_message,
+                }
+            ) as response:
+                if response.status == 201:
+                    return True
+                else:
+                    error = await response.text()
+                    print(f"Twilio WhatsApp error: {error}")
+                    return False
+
     async def send_test_notification(self, integration: Integration) -> bool:
         """Send test notification"""
         if integration.type == 'email':
             test_message = f"Test Notification\nYour email integration is working!"
+        elif integration.type in ('sms', 'whatsapp'):
+            test_message = f"FinalPing Test: Your {integration.type.upper()} integration is working!"
         else:
             test_message = f"🧪 **Test Notification**\nYour {integration.type} integration is working! ✅"
         return await self.send_via_integration(integration, test_message)
