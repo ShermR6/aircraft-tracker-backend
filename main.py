@@ -12,6 +12,8 @@ from pydantic import BaseModel
 import jwt
 import os
 import httpx
+import secrets
+import string
 from typing import List, Optional
 
 from database import get_db, engine, Base, SessionLocal
@@ -1001,6 +1003,70 @@ async def debug_licenses(
             }
             for l in licenses
         ]
+    }
+
+
+@app.post("/api/admin/generate-license")
+async def generate_license(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Admin endpoint to generate a license key for any tier"""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    tier = body.get("tier", "starter")
+    email = body.get("email", "").lower().strip()
+    activations_max = body.get("activations_max", 1)
+
+    if tier not in ["starter", "premium", "pro", "team-starter", "team-premium", "team-pro"]:
+        raise HTTPException(status_code=400, detail="Invalid tier")
+
+    # Generate license key in XXXX-XXXX-XXXX-XXXX format
+    chars = string.ascii_uppercase + string.digits
+    segments = ["".join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
+    license_key = "-".join(segments)
+
+    # Create in backend DB
+    license = License(
+        license_key=license_key,
+        tier=tier,
+        status="inactive",
+        activations_used=0,
+        activations_max=activations_max,
+        created_at=datetime.utcnow()
+    )
+    db.add(license)
+    db.commit()
+    db.refresh(license)
+
+    # Provision on website DB via existing webhook
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{WEBSITE_URL}/api/licenses/provision",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Webhook-Secret": WEBHOOK_INTERNAL_SECRET,
+                },
+                json={
+                    "license_key": license_key,
+                    "tier": tier,
+                    "email": email,
+                },
+                timeout=10.0
+            )
+    except Exception as e:
+        print(f"Website provision failed (non-critical): {e}")
+
+    return {
+        "license_key": license_key,
+        "tier": tier,
+        "email": email,
+        "status": "inactive",
+        "message": "License created successfully. Share the key with the user."
     }
 
 
