@@ -85,7 +85,7 @@ def get_tier_limit(tier: str, feature: str):
     return TIER_LIMITS.get(tier, TIER_LIMITS["starter"]).get(feature, 1)
 
 
-async def sync_license_to_website(license_key: str, activated_at: datetime, expires_at: datetime):
+async def sync_license_to_website(license_key: str, activated_at: datetime, expires_at: datetime, tier: str = None, email: str = None):
     """Notify the website DB that a license has been activated. Fire-and-forget."""
     try:
         async with httpx.AsyncClient() as client:
@@ -96,6 +96,8 @@ async def sync_license_to_website(license_key: str, activated_at: datetime, expi
                     "license_key": license_key,
                     "activated_at": activated_at.isoformat(),
                     "expires_at": expires_at.isoformat(),
+                    "tier": tier,
+                    "email": email,
                 },
                 timeout=5.0
             )
@@ -206,7 +208,7 @@ async def activate_license(
             )
     
     # Always sync license status to website DB (non-critical, fire-and-forget)
-    await sync_license_to_website(license.license_key, license.activated_at, license.expires_at)
+    await sync_license_to_website(license.license_key, license.activated_at, license.expires_at, tier=license.tier, email=activation.email)
 
     # Find or create user
     user = db.query(User).filter(User.email == activation.email).first()
