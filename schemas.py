@@ -50,6 +50,8 @@ class UserResponse(BaseModel):
     email: str
     license_tier: str
     created_at: datetime
+    activated_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
 
 
 # ============================================================================

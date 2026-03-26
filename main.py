@@ -277,6 +277,7 @@ async def get_current_user_info(
         id=str(current_user.id),
         email=current_user.email,
         license_tier=license.tier if license else "unknown",
+        activated_at=license.activated_at if license else None,
         expires_at=license.expires_at if license else None,
         created_at=current_user.created_at
     )
@@ -1186,12 +1187,10 @@ async def merge_accounts(
     # Move all alert settings
     db.query(AlertSetting).filter(AlertSetting.user_id == merge_user.id).update({"user_id": keep_user.id})
 
-    # Move airport config if keep_user doesn't have one, otherwise delete merge user's config
+    # Move airport config if keep_user doesn't have one
     keep_config = db.query(AirportConfig).filter(AirportConfig.user_id == keep_user.id).first()
     if not keep_config:
         db.query(AirportConfig).filter(AirportConfig.user_id == merge_user.id).update({"user_id": keep_user.id})
-    else:
-        db.query(AirportConfig).filter(AirportConfig.user_id == merge_user.id).delete()
 
     # Update keep_user license to the best active license from either account
     from sqlalchemy import desc
@@ -1209,12 +1208,6 @@ async def merge_accounts(
 
     # Move saved locations
     db.query(SavedLocation).filter(SavedLocation.user_id == merge_user.id).update({"user_id": keep_user.id})
-
-    # Delete any remaining references to merge_user
-    db.query(AlertSetting).filter(AlertSetting.user_id == merge_user.id).delete()
-
-    # Flush to ensure all updates are applied before deleting user
-    db.flush()
 
     # Delete merge_user
     db.delete(merge_user)
