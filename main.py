@@ -1049,7 +1049,7 @@ async def create_billing_portal(
 # APP VERSION CHECK
 # ============================================================================
 
-LATEST_APP_VERSION = "1.0.0"
+LATEST_APP_VERSION = "1.0.4"
 
 @app.get("/api/app/version")
 async def get_app_version():
