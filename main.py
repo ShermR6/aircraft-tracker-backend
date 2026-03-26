@@ -35,7 +35,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="FinalPing Cloud API",
     description="Real-time aircraft tracking and notifications",
-    version="1.0.0"
+    version="1.0.4"
 )
 
 # CORS middleware (allow desktop app and web app to connect)
