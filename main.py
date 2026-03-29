@@ -35,7 +35,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="FinalPing Cloud API",
     description="Real-time aircraft tracking and notifications",
-    version="1.0.4"
+    version="1.0.6"
 )
 
 # CORS middleware (allow desktop app and web app to connect)
@@ -1049,7 +1049,7 @@ async def create_billing_portal(
 # APP VERSION CHECK
 # ============================================================================
 
-LATEST_APP_VERSION = "1.0.4"
+LATEST_APP_VERSION = "1.0.6"
 
 @app.get("/api/app/version")
 async def get_app_version():
