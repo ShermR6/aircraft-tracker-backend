@@ -205,12 +205,7 @@ async def login(
         raise HTTPException(status_code=403, detail="Your license has expired. Please renew at finalpingapp.com.")
 
     # Step 4 — Issue JWT token
-    token_data = {
-        "sub": str(user.id),
-        "email": user.email,
-        "license_tier": license.tier,
-    }
-    access_token = create_access_token(token_data)
+    access_token = create_access_token(str(user.id))
 
     return TokenResponse(
         access_token=access_token,
