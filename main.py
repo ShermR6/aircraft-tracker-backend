@@ -150,6 +150,78 @@ async def get_current_user(
     return user
 
 
+@app.post("/api/auth/login", response_model=TokenResponse)
+async def login(
+    credentials: UserLogin,
+    db: Session = Depends(get_db)
+):
+    """
+    Login with website email + password.
+    Verifies credentials against Vercel/Prisma via internal API call,
+    then issues a JWT token for the desktop app.
+    """
+    import aiohttp
+    import os
+
+    website_url = os.environ.get("WEBSITE_URL", "https://finalpingapp.com")
+    internal_secret = os.environ.get("WEBHOOK_INTERNAL_SECRET", "")
+
+    # Step 1 — Verify credentials with Vercel
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{website_url}/api/auth/verify",
+                json={"email": credentials.email.lower(), "password": credentials.password},
+                headers={"x-internal-secret": internal_secret},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status == 401:
+                    raise HTTPException(status_code=401, detail="Invalid email or password")
+                if resp.status != 200:
+                    raise HTTPException(status_code=502, detail="Could not verify credentials. Please try again.")
+                verified = await resp.json()
+    except aiohttp.ClientError:
+        raise HTTPException(status_code=502, detail="Could not reach verification service. Please check your connection.")
+
+    if not verified.get("valid"):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    email = credentials.email.lower().strip()
+
+    # Step 2 — Find user in Railway DB by email
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="No FinalPing account found for this email. Please activate your license first."
+        )
+
+    # Step 3 — Get license info
+    license = db.query(License).filter(License.id == user.license_id).first()
+    if not license:
+        raise HTTPException(status_code=403, detail="No active license found for this account.")
+
+    if license.status == "expired":
+        raise HTTPException(status_code=403, detail="Your license has expired. Please renew at finalpingapp.com.")
+
+    # Step 4 — Issue JWT token
+    token_data = {
+        "sub": str(user.id),
+        "email": user.email,
+        "license_tier": license.tier,
+    }
+    access_token = create_access_token(token_data)
+
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user_id=str(user.id),
+        email=user.email,
+        license_tier=license.tier,
+        expires_at=license.expires_at,
+    )
+
+
 @app.post("/api/activate", response_model=TokenResponse)
 async def activate_license(
     activation: LicenseActivation,
