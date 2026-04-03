@@ -147,7 +147,7 @@ async def get_current_user(
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
 
-    # Check license expiry
+    # Check license expiry — free accounts (no license) are allowed through
     if user.license_id:
         license = db.query(License).filter(License.id == user.license_id).first()
         if license and license.expires_at and license.expires_at < datetime.utcnow():
@@ -196,19 +196,26 @@ async def login(
 
     # Step 2 — Find user in Railway DB by email
     user = db.query(User).filter(User.email == email).first()
+
+    # If no Railway account exists, auto-create a free-tier account
     if not user:
-        raise HTTPException(
-            status_code=404,
-            detail="No FinalPing account found for this email. Please activate your license first."
-        )
+        user = User(email=email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        print(f"Auto-created free account for {email}")
 
-    # Step 3 — Get license info
-    license = db.query(License).filter(License.id == user.license_id).first()
-    if not license:
-        raise HTTPException(status_code=403, detail="No active license found for this account.")
+    # Step 3 — Get license info (may not exist for free accounts)
+    license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
 
-    if license.status == "expired":
-        raise HTTPException(status_code=403, detail="Your license has expired. Please renew at finalpingapp.com.")
+    # Determine tier — free if no license
+    tier = "free"
+    expires_at = None
+    if license:
+        if license.status == "expired" or (license.expires_at and license.expires_at < datetime.utcnow()):
+            raise HTTPException(status_code=401, detail="license_expired")
+        tier = license.tier
+        expires_at = license.expires_at
 
     # Step 4 — Issue JWT token
     access_token = create_access_token(str(user.id))
@@ -218,8 +225,8 @@ async def login(
         token_type="bearer",
         user_id=str(user.id),
         email=user.email,
-        license_tier=license.tier,
-        expires_at=license.expires_at,
+        license_tier=tier,
+        expires_at=expires_at,
     )
 
 
