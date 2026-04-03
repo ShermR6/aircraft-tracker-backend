@@ -27,6 +27,9 @@ class UserTracker:
         self.aircraft_state = {}
         self.distance_alerts_sent = {}
         self.last_notifications = {}
+        # Track last date SMS/WhatsApp opt-out was appended (once per day)
+        self.sms_stop_last_sent_date = None
+        self.whatsapp_stop_last_sent_date = None
         
     def haversine_distance(self, lat1, lon1, lat2, lon2):
         """Calculate distance between two points in nautical miles"""
@@ -542,6 +545,12 @@ class CloudAircraftTracker:
         # Strip markdown bold formatting for SMS
         plain_message = message.replace('**', '')
 
+        # Append opt-out text only on the first SMS of each day
+        today = datetime.now().date()
+        if self.sms_stop_last_sent_date != today:
+            plain_message = f"{plain_message}\n\nReply STOP to unsubscribe."
+            self.sms_stop_last_sent_date = today
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f'https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json',
@@ -575,6 +584,12 @@ class CloudAircraftTracker:
             return False
 
         plain_message = message.replace('**', '')
+
+        # Append opt-out text only on the first WhatsApp message of each day
+        today = datetime.now().date()
+        if self.whatsapp_stop_last_sent_date != today:
+            plain_message = f"{plain_message}\n\nReply STOP to unsubscribe."
+            self.whatsapp_stop_last_sent_date = today
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
