@@ -146,6 +146,12 @@ async def get_current_user(
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
+
+    # Check license expiry
+    if user.license_id:
+        license = db.query(License).filter(License.id == user.license_id).first()
+        if license and license.expires_at and license.expires_at < datetime.utcnow():
+            raise HTTPException(status_code=401, detail="license_expired")
     
     return user
 
