@@ -411,6 +411,38 @@ async def provision_license(
     }
 
 
+@app.post("/api/licenses/renew")
+async def renew_license(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Called by the website's Stripe webhook when a subscription renews.
+    Updates expires_at on the existing active license.
+    """
+    secret = request.headers.get("X-Webhook-Secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    body = await request.json()
+    license_key = body.get("license_key")
+    expires_at_str = body.get("expires_at")
+
+    if not license_key or not expires_at_str:
+        raise HTTPException(status_code=400, detail="Missing license_key or expires_at")
+
+    license = db.query(License).filter(License.license_key == license_key).first()
+    if not license:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    license.expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
+    license.status = "active"
+    db.commit()
+
+    print(f"License renewed: {license_key} until {expires_at_str}")
+    return {"message": "License renewed", "license_key": license_key, "expires_at": expires_at_str}
+
+
 # ============================================================================
 # AIRCRAFT MANAGEMENT
 # ============================================================================
