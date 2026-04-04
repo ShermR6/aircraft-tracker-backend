@@ -20,6 +20,7 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     license_id = Column(UUID(as_uuid=True), ForeignKey("licenses.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
+    ground_station_enabled = Column(Boolean, default=False)
     
     # Relationships
     license = relationship("License", back_populates="users")
