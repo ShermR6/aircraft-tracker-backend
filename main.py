@@ -1281,6 +1281,49 @@ async def generate_license(
     }
 
 
+@app.post("/api/admin/revoke-license")
+async def revoke_license(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Admin endpoint to revoke a license key.
+    - Sets license status to 'revoked' and expires_at to now
+    - Clears the license_id from the associated user so they lose access immediately
+    """
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    license_key = body.get("license_key", "").strip().upper()
+
+    if not license_key:
+        raise HTTPException(status_code=400, detail="license_key is required")
+
+    license = db.query(License).filter(License.license_key == license_key).first()
+    if not license:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    # Revoke the license
+    license.status = "revoked"
+    license.expires_at = datetime.utcnow()
+
+    # Clear from any user that has this license attached
+    users = db.query(User).filter(User.license_id == license.id).all()
+    for user in users:
+        user.license_id = None
+
+    db.commit()
+
+    return {
+        "message": f"License {license_key} revoked successfully",
+        "license_key": license_key,
+        "affected_users": len(users),
+        "revoked_at": datetime.utcnow().isoformat()
+    }
+
+
 @app.post("/api/admin/merge-accounts")
 async def merge_accounts(
     request: Request,
