@@ -1,0 +1,16 @@
+[Unit]
+Description=FinalPing Ground Station
+After=network.target dump1090-fa.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/finalping-ground
+ExecStart=/usr/bin/python3 /home/pi/finalping-ground/finalping_ground.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

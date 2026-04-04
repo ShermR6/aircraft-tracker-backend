@@ -230,6 +230,96 @@ async def login(
     )
 
 
+@app.post("/api/ground/ingest")
+async def ground_ingest(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Receives alert data from a user's local FinalPing Ground Station.
+    Processes the alert through their configured notification integrations
+    and logs it — exactly like the cloud tracker does.
+    """
+    from models import NotificationLog, Integration, AlertSetting
+
+    body = await request.json()
+    alert_type = body.get("type")        # e.g. "landing", "takeoff", "10nm", "5nm", "2nm"
+    tail = body.get("tail", "Unknown")
+    distance = body.get("distance", 0)
+    altitude = body.get("altitude", 0)
+    eta = body.get("eta", 0)
+    speed = body.get("speed", 0)
+
+    if not alert_type:
+        raise HTTPException(status_code=400, detail="Missing alert type")
+
+    # Get user's integrations
+    integrations = db.query(Integration).filter(
+        Integration.user_id == current_user.id,
+        Integration.enabled == True
+    ).all()
+
+    if not integrations:
+        return {"message": "No integrations configured", "alerts_sent": 0}
+
+    # Get custom message templates
+    alert_settings = {
+        s.alert_type: s.message_template
+        for s in db.query(AlertSetting).filter(AlertSetting.user_id == current_user.id).all()
+    }
+
+    # Build message
+    default_templates = {
+        "landing":  "🛬 **{tail} has landed** — Ground station confirmed touchdown",
+        "takeoff":  "🛫 **{tail} is airborne** — Departed at {speed}kts",
+        "10nm":     "✈️ **{tail} - 10nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
+        "5nm":      "⚠️ **{tail} - 5nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
+        "2nm":      "🔴 **{tail} - 2nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
+    }
+    template = alert_settings.get(alert_type, default_templates.get(alert_type, "✈️ **{tail}** — {type} alert"))
+    try:
+        message = template.format(
+            tail=tail, distance=f"{float(distance):.1f}",
+            altitude=f"{float(altitude):.0f}", eta=eta,
+            speed=f"{float(speed):.0f}", type=alert_type,
+            time=datetime.utcnow().strftime('%H:%M'),
+            airport=current_user.email,
+        )
+    except Exception:
+        message = f"✈️ {tail} — {alert_type} (Ground Station)"
+
+    # Send via each integration using the cloud tracker's existing send methods
+    from tracker import cloud_tracker
+    alerts_sent = 0
+    for integration in integrations:
+        try:
+            success = await cloud_tracker.send_via_integration(integration, message)
+            log_entry = NotificationLog(
+                user_id=current_user.id,
+                aircraft_tail=tail,
+                alert_type=alert_type,
+                message=message,
+                integration_type=integration.type,
+                status="sent" if success else "failed",
+                sent_at=datetime.utcnow(),
+            )
+            db.add(log_entry)
+            if success:
+                alerts_sent += 1
+        except Exception as e:
+            print(f"Ground ingest send error: {e}")
+
+    db.commit()
+
+    return {
+        "message": f"Alert processed — {alerts_sent}/{len(integrations)} notifications sent",
+        "alert_type": alert_type,
+        "tail": tail,
+        "alerts_sent": alerts_sent,
+    }
+
+
 @app.post("/api/activate", response_model=TokenResponse)
 async def activate_license(
     activation: LicenseActivation,
