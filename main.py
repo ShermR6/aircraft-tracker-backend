@@ -243,8 +243,12 @@ async def ground_ingest(
     """
     from models import NotificationLog, Integration, AlertSetting
 
+    # Check ground station access
+    if not getattr(current_user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+
     body = await request.json()
-    alert_type = body.get("type")        # e.g. "landing", "takeoff", "10nm", "5nm", "2nm"
+    alert_type = body.get("type")
     tail = body.get("tail", "Unknown")
     distance = body.get("distance", 0)
     altitude = body.get("altitude", 0)
@@ -254,7 +258,6 @@ async def ground_ingest(
     if not alert_type:
         raise HTTPException(status_code=400, detail="Missing alert type")
 
-    # Get user's integrations
     integrations = db.query(Integration).filter(
         Integration.user_id == current_user.id,
         Integration.enabled == True
@@ -263,19 +266,17 @@ async def ground_ingest(
     if not integrations:
         return {"message": "No integrations configured", "alerts_sent": 0}
 
-    # Get custom message templates
     alert_settings = {
         s.alert_type: s.message_template
         for s in db.query(AlertSetting).filter(AlertSetting.user_id == current_user.id).all()
     }
 
-    # Build message
     default_templates = {
-        "landing":  "🛬 **{tail} has landed** — Ground station confirmed touchdown",
-        "takeoff":  "🛫 **{tail} is airborne** — Departed at {speed}kts",
-        "10nm":     "✈️ **{tail} - 10nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
-        "5nm":      "⚠️ **{tail} - 5nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
-        "2nm":      "🔴 **{tail} - 2nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
+        "landing": "🛬 **{tail} has landed** — Ground station confirmed touchdown",
+        "takeoff": "🛫 **{tail} is airborne** — Departed at {speed}kts",
+        "10nm":    "✈️ **{tail} - 10nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
+        "5nm":     "⚠️ **{tail} - 5nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
+        "2nm":     "🔴 **{tail} - 2nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
     }
     template = alert_settings.get(alert_type, default_templates.get(alert_type, "✈️ **{tail}** — {type} alert"))
     try:
@@ -289,7 +290,6 @@ async def ground_ingest(
     except Exception:
         message = f"✈️ {tail} — {alert_type} (Ground Station)"
 
-    # Send via each integration using the cloud tracker's existing send methods
     from tracker import cloud_tracker
     alerts_sent = 0
     for integration in integrations:
@@ -317,6 +317,56 @@ async def ground_ingest(
         "alert_type": alert_type,
         "tail": tail,
         "alerts_sent": alerts_sent,
+    }
+
+
+@app.post("/api/ground/validate")
+async def ground_validate(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Called by FinalPing Ground Station on startup.
+    Returns whether this account has ground station access enabled.
+    """
+    enabled = getattr(current_user, 'ground_station_enabled', False)
+    if not enabled:
+        raise HTTPException(
+            status_code=403,
+            detail="ground_station_not_enabled"
+        )
+    return {
+        "enabled": True,
+        "email": current_user.email,
+        "message": "Ground station access confirmed",
+    }
+
+
+@app.post("/api/admin/grant-ground-station")
+async def grant_ground_station(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Admin endpoint to manually grant ground station access to a user"""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
+    enabled = body.get("enabled", True)
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.ground_station_enabled = enabled
+    db.commit()
+
+    return {
+        "email": email,
+        "ground_station_enabled": enabled,
+        "message": f"Ground station {'enabled' if enabled else 'disabled'} for {email}",
     }
 
 

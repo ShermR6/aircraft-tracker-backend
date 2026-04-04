@@ -114,6 +114,34 @@ class GroundStation:
             log.error(f"Login error: {e}")
             return False
 
+    def validate_ground_station(self):
+        """Check that this account has ground station access enabled"""
+        try:
+            resp = requests.post(
+                f"{BACKEND_URL}/api/ground/validate",
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                log.info("✅ Ground station access confirmed")
+                return True
+            elif resp.status_code == 403:
+                log.error("")
+                log.error("━" * 60)
+                log.error("  ❌ Ground Station not enabled for this account")
+                log.error("")
+                log.error("  Purchase FinalPing Ground Station at:")
+                log.error("  https://finalpingapp.com/ground")
+                log.error("━" * 60)
+                log.error("")
+                return False
+            else:
+                log.error(f"Validation failed: {resp.status_code}")
+                return False
+        except Exception as e:
+            log.error(f"Validation error: {e}")
+            return False
+
     # ── Receiver ──────────────────────────────────────────────────────────────
 
     def fetch_aircraft(self):
@@ -286,6 +314,9 @@ class GroundStation:
 
         if not self.login():
             log.error("Could not log in — check your credentials and try again.")
+            return
+
+        if not self.validate_ground_station():
             return
 
         # Re-login every 23 hours to keep token fresh
