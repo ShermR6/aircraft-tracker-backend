@@ -1218,6 +1218,8 @@ async def generate_license(
     tier = body.get("tier", "starter")
     email = body.get("email", "").lower().strip()
     activations_max = body.get("activations_max", 1)
+    duration_days = body.get("duration_days", LICENSE_DURATION_DAYS)
+    activate_immediately = body.get("activate_immediately", False)
 
     if tier not in ["starter", "premium", "pro", "team-starter", "team-premium", "team-pro"]:
         raise HTTPException(status_code=400, detail="Invalid tier")
@@ -1227,14 +1229,22 @@ async def generate_license(
     segments = ["".join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
     license_key = "-".join(segments)
 
+    # Calculate expiry based on duration_days (supports fractions for short test keys)
+    now = datetime.utcnow()
+    expires_at = now + timedelta(days=float(duration_days)) if activate_immediately else None
+    activated_at = now if activate_immediately else None
+    status = "active" if activate_immediately else "inactive"
+
     # Create in backend DB
     license = License(
         license_key=license_key,
         tier=tier,
-        status="inactive",
-        activations_used=0,
+        status=status,
+        activations_used=1 if activate_immediately else 0,
         activations_max=activations_max,
-        created_at=datetime.utcnow()
+        activated_at=activated_at,
+        expires_at=expires_at,
+        created_at=now,
     )
     db.add(license)
     db.commit()
@@ -1263,8 +1273,11 @@ async def generate_license(
         "license_key": license_key,
         "tier": tier,
         "email": email,
-        "status": "inactive",
-        "message": "License created successfully. Share the key with the user."
+        "status": status,
+        "duration_days": duration_days,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "activate_immediately": activate_immediately,
+        "message": f"License created successfully. {'Active immediately, expires ' + expires_at.strftime('%Y-%m-%d %H:%M:%S UTC') if activate_immediately else 'Share the key with the user to activate.'}"
     }
 
 
