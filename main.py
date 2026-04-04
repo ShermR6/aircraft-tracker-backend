@@ -1204,6 +1204,81 @@ async def debug_licenses(
     }
 
 
+@app.post("/api/admin/user-logs")
+async def admin_get_user_logs(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Return all notification logs for a user by email — used by website dashboard"""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return []
+
+    from models import NotificationLog
+    logs = db.query(NotificationLog).filter(
+        NotificationLog.user_id == user.id
+    ).order_by(NotificationLog.sent_at.desc()).limit(500).all()
+
+    return [{
+        "id": str(l.id),
+        "aircraft_tail": l.aircraft_tail,
+        "alert_type": l.alert_type,
+        "message": l.message,
+        "integration_type": l.integration_type,
+        "status": l.status,
+        "sent_at": l.sent_at.isoformat(),
+    } for l in logs]
+
+
+@app.post("/api/admin/user-aircraft")
+async def admin_get_user_aircraft(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Return all aircraft for a user by email — used by website dashboard filters"""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return []
+
+    aircraft = db.query(Aircraft).filter(Aircraft.user_id == user.id, Aircraft.active == True).all()
+    return [{"id": str(a.id), "tail_number": a.tail_number, "icao24": a.icao24, "friendly_name": a.friendly_name} for a in aircraft]
+
+
+@app.post("/api/admin/user-integrations")
+async def admin_get_user_integrations(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Return all integrations for a user by email — used by website dashboard filters"""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return []
+
+    integrations = db.query(Integration).filter(Integration.user_id == user.id).all()
+    return [{"id": str(i.id), "type": i.type, "enabled": i.enabled} for i in integrations]
+
+
 @app.post("/api/admin/generate-license")
 async def generate_license(
     request: Request,
@@ -1278,49 +1353,6 @@ async def generate_license(
         "expires_at": expires_at.isoformat() if expires_at else None,
         "activate_immediately": activate_immediately,
         "message": f"License created successfully. {'Active immediately, expires ' + expires_at.strftime('%Y-%m-%d %H:%M:%S UTC') if activate_immediately else 'Share the key with the user to activate.'}"
-    }
-
-
-@app.post("/api/admin/revoke-license")
-async def revoke_license(
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    """
-    Admin endpoint to revoke a license key.
-    - Sets license status to 'revoked' and expires_at to now
-    - Clears the license_id from the associated user so they lose access immediately
-    """
-    secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    body = await request.json()
-    license_key = body.get("license_key", "").strip().upper()
-
-    if not license_key:
-        raise HTTPException(status_code=400, detail="license_key is required")
-
-    license = db.query(License).filter(License.license_key == license_key).first()
-    if not license:
-        raise HTTPException(status_code=404, detail="License not found")
-
-    # Revoke the license
-    license.status = "revoked"
-    license.expires_at = datetime.utcnow()
-
-    # Clear from any user that has this license attached
-    users = db.query(User).filter(User.license_id == license.id).all()
-    for user in users:
-        user.license_id = None
-
-    db.commit()
-
-    return {
-        "message": f"License {license_key} revoked successfully",
-        "license_key": license_key,
-        "affected_users": len(users),
-        "revoked_at": datetime.utcnow().isoformat()
     }
 
 
