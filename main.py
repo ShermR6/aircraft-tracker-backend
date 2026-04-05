@@ -61,12 +61,12 @@ WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
 # Tier feature limits (None = unlimited)
 TIER_LIMITS = {
-    "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 1},
-    "premium":      {"aircraft": 10,   "locations": 5,    "integrations": 3},
-    "pro":          {"aircraft": None, "locations": None, "integrations": None},
-    "team-starter": {"aircraft": 3,    "locations": 1,    "integrations": 1},
-    "team-premium": {"aircraft": 10,   "locations": 5,    "integrations": 3},
-    "team-pro":     {"aircraft": None, "locations": None, "integrations": None},
+    "starter":      {"aircraft": 3,    "integrations": 2,    "allowed_channels": ["discord", "email"]},
+    "premium":      {"aircraft": 7,    "integrations": 5,    "allowed_channels": ["discord", "email", "slack", "sms", "teams"]},
+    "pro":          {"aircraft": 15,   "integrations": 6,    "allowed_channels": ["discord", "email", "slack", "sms", "teams", "whatsapp"]},
+    "team-starter": {"aircraft": 25,   "integrations": 3,    "allowed_channels": ["discord", "email", "slack"]},
+    "team-premium": {"aircraft": 75,   "integrations": 10,   "allowed_channels": ["discord", "email", "slack", "sms", "teams"]},
+    "team-pro":     {"aircraft": None, "integrations": None,  "allowed_channels": ["discord", "email", "slack", "sms", "teams", "whatsapp"]},
 }
 
 
@@ -868,6 +868,16 @@ async def create_integration(
     db: Session = Depends(get_db)
 ):
     """Create or update integration"""
+    tier = get_user_tier(current_user, db)
+
+    # Check if this channel type is allowed for the user's tier
+    allowed_channels = TIER_LIMITS.get(tier, TIER_LIMITS["starter"]).get("allowed_channels", [])
+    if integration_data.type not in allowed_channels:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{integration_data.type} is not available on the {tier} plan. Upgrade to unlock it."
+        )
+
     existing = db.query(Integration).filter(
         Integration.user_id == current_user.id,
         Integration.type == integration_data.type
@@ -880,6 +890,16 @@ async def create_integration(
         db.refresh(existing)
         integration = existing
     else:
+        # Check integration count limit before creating new
+        integration_limit = get_tier_limit(tier, "integrations")
+        if integration_limit is not None:
+            current_count = db.query(Integration).filter(Integration.user_id == current_user.id).count()
+            if current_count >= integration_limit:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Your {tier} plan allows up to {integration_limit} notification channels. Upgrade to add more."
+                )
+
         integration = Integration(
             user_id=current_user.id,
             type=integration_data.type,
