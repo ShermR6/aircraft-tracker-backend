@@ -17,12 +17,12 @@ from database import SessionLocal
 
 class UserTracker:
     """Tracks aircraft for a single user"""
-    
+
     def __init__(self, user_id: str, config: dict, aircraft_list: List[dict]):
         self.user_id = user_id
         self.config = config
         self.aircraft_to_track = {a['icao24']: a['tail_number'] for a in aircraft_list if a.get('icao24')}
-        
+
         # State tracking
         self.aircraft_state = {}
         self.distance_alerts_sent = {}
@@ -30,7 +30,7 @@ class UserTracker:
         # Track last date SMS/WhatsApp opt-out was appended (once per day)
         self.sms_stop_last_sent_date = None
         self.whatsapp_stop_last_sent_date = None
-        
+
     def haversine_distance(self, lat1, lon1, lat2, lon2):
         """Calculate distance between two points in nautical miles"""
         lat1, lon1, lat2, lon2 = map(radians, [float(lat1), float(lon1), float(lat2), float(lon2)])
@@ -40,43 +40,43 @@ class UserTracker:
         c = 2 * asin(sqrt(a))
         nm = 3440.065 * c
         return nm
-    
+
     def should_notify(self, event_type: str, aircraft_id: str) -> bool:
         """Check if enough time has passed since last notification (cooldown)"""
         cooldown_minutes = self.config.get('notification_cooldown_minutes', 1)
         key = f"{aircraft_id}_{event_type}"
-        
+
         if key in self.last_notifications:
             time_since_last = datetime.now() - self.last_notifications[key]
             if time_since_last < timedelta(minutes=cooldown_minutes):
                 return False
-        
+
         self.last_notifications[key] = datetime.now()
         return True
-    
+
     async def check_and_notify(self, aircraft_data: dict) -> List[dict]:
         """
         Check aircraft state and determine which notifications to send
         Returns list of notifications to send
         """
         notifications = []
-        
+
         aircraft_id = aircraft_data['icao24']
         callsign = aircraft_data['callsign']
         on_ground = aircraft_data['on_ground']
-        
+
         # Calculate distance
         if aircraft_data['latitude'] is None or aircraft_data['longitude'] is None:
             return notifications
-        
+
         airspace = self.config['airspace']
         distance_nm = self.haversine_distance(
             airspace['center_lat'], airspace['center_lon'],
             aircraft_data['latitude'], aircraft_data['longitude']
         )
-        
+
         in_horizontal = distance_nm <= float(airspace['radius_nm'])
-        
+
         # Check altitude — adsb.lol returns alt_baro already in feet
         altitude_msl_ft_raw = aircraft_data['baro_altitude']
         field_elev = float(airspace['field_elevation_ft_msl']) if airspace['field_elevation_ft_msl'] else 0
@@ -88,39 +88,48 @@ class UserTracker:
             altitude_msl_ft = float(altitude_msl_ft_raw)
             altitude_agl_ft = max(0, altitude_msl_ft - field_elev)
             in_vertical = airspace['floor_ft_agl'] <= altitude_agl_ft <= airspace['ceiling_ft_agl']
-        
+
         in_airspace = in_horizontal and in_vertical
-        
+
         # Get previous state
         was_in_airspace = self.aircraft_state.get(aircraft_id, {}).get('in_airspace', False)
         was_on_ground = self.aircraft_state.get(aircraft_id, {}).get('on_ground', None)
-        
+
         # Distance alerts (approaching only) - SEQUENTIAL ZONE CROSSING
         if not on_ground:
             alert_distances = sorted(self.config['airspace'].get('alert_distances_nm', [10.0, 5.0, 2.0]), reverse=True)
-            
+
             if aircraft_id not in self.distance_alerts_sent:
                 self.distance_alerts_sent[aircraft_id] = set()
-            
+
             prev_distance = self.aircraft_state.get(aircraft_id, {}).get('last_distance', None)
             max_distance = self.aircraft_state.get(aircraft_id, {}).get('max_distance', None)
-            
+
             # Track the maximum (farthest) distance
             if max_distance is None or distance_nm > max_distance:
                 max_distance = distance_nm
-            
+
+            # Normalize distance float to consistent key e.g. 10.0 -> "10nm", 2.5 -> "2.5nm"
+            def dist_key(d):
+                return f"{int(d) if d == int(d) else d}nm"
+
+            # Smallest configured distance triggers landing detection
+            min_distance = min(alert_distances) if alert_distances else 2.0
+
             if max_distance is not None and prev_distance is not None:
                 for alert_distance in alert_distances:
-                    alert_key = f"{int(alert_distance) if alert_distance == int(alert_distance) else alert_distance}nm"
-                    
+                    alert_key = dist_key(alert_distance)
+
                     was_beyond_boundary = max_distance > alert_distance
                     crossed_boundary = (prev_distance > alert_distance and distance_nm <= alert_distance)
-                    
+
                     if crossed_boundary and was_beyond_boundary and alert_key not in self.distance_alerts_sent[aircraft_id]:
-                        # Special handling for 2nm = landing assumption
-                        if alert_distance == 2.0:
-                            if "10.0nm" in self.distance_alerts_sent[aircraft_id] and "5.0nm" in self.distance_alerts_sent[aircraft_id]:
-                                # Plane crossed 10nm -> 5nm -> 2nm = LANDING!
+                        # The smallest configured distance triggers landing detection
+                        if alert_distance == min_distance:
+                            larger_distances = [d for d in alert_distances if d > min_distance]
+                            all_crossed = all(dist_key(d) in self.distance_alerts_sent[aircraft_id] for d in larger_distances)
+                            if larger_distances and all_crossed:
+                                # Plane crossed all zones sequentially = LANDING!
                                 if self.should_notify('landing', aircraft_id):
                                     already_landed = self.aircraft_state.get(aircraft_id, {}).get('landed', False)
                                     if not already_landed:
@@ -134,11 +143,11 @@ class UserTracker:
                                         self.aircraft_state.setdefault(aircraft_id, {})['landed'] = True
                                         self.distance_alerts_sent[aircraft_id].add(alert_key)
                             else:
-                                # Send distance alert instead
+                                # Not enough zones crossed — send distance alert
                                 if self.should_notify(f'distance_{alert_distance}', aircraft_id):
                                     eta_minutes = int(distance_nm / 1.5)
                                     notifications.append({
-                                        'type': f'{alert_distance}nm',
+                                        'type': alert_key,
                                         'tail': callsign,
                                         'distance': distance_nm,
                                         'altitude': altitude_msl_ft,
@@ -147,11 +156,11 @@ class UserTracker:
                                     })
                                     self.distance_alerts_sent[aircraft_id].add(alert_key)
                         else:
-                            # Regular distance alert (10nm or 5nm)
+                            # Regular distance alert
                             if self.should_notify(f'distance_{alert_distance}', aircraft_id):
                                 eta_minutes = int(distance_nm / 1.5)
                                 notifications.append({
-                                    'type': f'{alert_distance}nm',
+                                    'type': alert_key,
                                     'tail': callsign,
                                     'distance': distance_nm,
                                     'altitude': altitude_msl_ft,
@@ -159,22 +168,22 @@ class UserTracker:
                                     'time': datetime.now()
                                 })
                                 self.distance_alerts_sent[aircraft_id].add(alert_key)
-            
+
             # Reset alerts if plane goes back out beyond 12nm
             if distance_nm > 12.0:
                 self.distance_alerts_sent[aircraft_id] = set()
                 if aircraft_id in self.aircraft_state:
                     self.aircraft_state[aircraft_id]['max_distance'] = distance_nm
-            
+
             if aircraft_id not in self.aircraft_state:
                 self.aircraft_state[aircraft_id] = {}
             self.aircraft_state[aircraft_id]['last_distance'] = distance_nm
             self.aircraft_state[aircraft_id]['max_distance'] = max_distance
-        
+
         # Update state
         if aircraft_id not in self.aircraft_state:
             self.aircraft_state[aircraft_id] = {}
-        
+
         self.aircraft_state[aircraft_id].update({
             'in_airspace': in_airspace,
             'on_ground': on_ground,
@@ -187,7 +196,7 @@ class UserTracker:
             'velocity': aircraft_data.get('velocity'),
             'heading': aircraft_data.get('heading'),
         })
-        
+
         return notifications
 
 
@@ -196,17 +205,17 @@ class CloudAircraftTracker:
     Global aircraft tracker that tracks for ALL users
     Runs 24/7 in the cloud
     """
-    
+
     def __init__(self):
         self.user_trackers: Dict[str, UserTracker] = {}
         self.running = False
         self.task = None
-        
+
     async def start(self):
         """Start the global tracker"""
         self.running = True
         self.task = asyncio.create_task(self.tracking_loop())
-        
+
     async def stop(self):
         """Stop the global tracker"""
         self.running = False
@@ -216,30 +225,30 @@ class CloudAircraftTracker:
                 await self.task
             except asyncio.CancelledError:
                 pass
-    
+
     async def update_user_aircraft(self, user_id: str, db: Session):
         """Update tracked aircraft for a user"""
         # Get user configuration
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             return
-        
+
         airport_config = db.query(AirportConfig).filter(AirportConfig.user_id == user_id).first()
         if not airport_config:
             # No config yet, skip
             return
-        
+
         aircraft = db.query(Aircraft).filter(
             Aircraft.user_id == user_id,
             Aircraft.active == True
         ).all()
-        
+
         if not aircraft:
             # No aircraft to track, remove tracker
             if user_id in self.user_trackers:
                 del self.user_trackers[user_id]
             return
-        
+
         # Build config dict
         config = {
             'airspace': {
@@ -259,7 +268,7 @@ class CloudAircraftTracker:
                 'end': airport_config.quiet_hours_end
             }
         }
-        
+
         aircraft_list = [
             {
                 'tail_number': a.tail_number,
@@ -268,10 +277,10 @@ class CloudAircraftTracker:
             }
             for a in aircraft
         ]
-        
+
         # Create or update tracker
         self.user_trackers[user_id] = UserTracker(user_id, config, aircraft_list)
-    
+
     async def tracking_loop(self):
         """Main tracking loop - runs every 10 seconds"""
         while self.running:
@@ -281,24 +290,24 @@ class CloudAircraftTracker:
             except Exception as e:
                 print(f"Error in tracking loop: {e}")
                 await asyncio.sleep(10)
-    
+
     async def track_all_users(self):
         """Track aircraft for all active users"""
         if not self.user_trackers:
             return
-        
+
         # Gather all unique ICAO24 codes to track
         all_icao24 = set()
         for tracker in self.user_trackers.values():
             all_icao24.update(tracker.aircraft_to_track.keys())
-        
+
         if not all_icao24:
             return
-        
+
         # Fetch aircraft data from adsb.lol
         # Group by location to minimize API calls
         # For now, do one query per user's location
-        
+
         async with aiohttp.ClientSession() as session:
             for user_id, tracker in self.user_trackers.items():
                 try:
@@ -306,14 +315,14 @@ class CloudAircraftTracker:
                     lat = config['center_lat']
                     lon = config['center_lon']
                     radius = config['query_radius_nm']
-                    
+
                     url = f"https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{radius}"
-                    
+
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                         if response.status == 200:
                             data = await response.json()
                             aircraft_list = data.get('ac', [])
-                            
+
                             # Filter to only tracked aircraft
                             for aircraft_data in aircraft_list:
                                 icao24 = aircraft_data.get('hex', '').lower()
@@ -329,17 +338,17 @@ class CloudAircraftTracker:
                                         'velocity': aircraft_data.get('gs'),
                                         'heading': aircraft_data.get('track'),
                                     }
-                                    
+
                                     # Check and get notifications
                                     notifications = await tracker.check_and_notify(aircraft_dict)
-                                    
+
                                     # Send notifications
                                     if notifications:
                                         await self.send_notifications(user_id, notifications)
-                
+
                 except Exception as e:
                     print(f"Error tracking for user {user_id}: {e}")
-    
+
     async def send_notifications(self, user_id: str, notifications: List[dict]):
         """Send notifications via configured integrations"""
         db = SessionLocal()
@@ -349,23 +358,23 @@ class CloudAircraftTracker:
                 Integration.user_id == user_id,
                 Integration.enabled == True
             ).all()
-            
+
             # Get alert settings to get custom message templates
             alert_settings = {
                 s.alert_type: s.message_template
                 for s in db.query(AlertSetting).filter(AlertSetting.user_id == user_id).all()
             }
-            
+
             for notification in notifications:
                 # Build message from template
                 alert_type = notification['type']
                 template = alert_settings.get(alert_type, self.get_default_template(alert_type))
                 message = self.format_message(template, notification)
-                
+
                 # Send via each integration
                 for integration in integrations:
                     success = await self.send_via_integration(integration, message)
-                    
+
                     # Log notification
                     log = NotificationLog(
                         user_id=user_id,
@@ -377,11 +386,11 @@ class CloudAircraftTracker:
                         sent_at=datetime.utcnow()
                     )
                     db.add(log)
-            
+
             db.commit()
         finally:
             db.close()
-    
+
     def get_default_template(self, alert_type: str) -> str:
         """Get default message template"""
         # Normalize alert_type — strip .0 from floats like "10.0nm" -> "10nm"
@@ -401,7 +410,7 @@ class CloudAircraftTracker:
             'landing': '**\U0001f6ec {tail} LANDING**\nTime: {time}\n\u2705 Ready to put away'
         }
         return templates.get(normalized, f'**{{tail}} - {normalized}**\nAlt {{altitude}}ft MSL')
-    
+
     def format_message(self, template: str, notification: dict) -> str:
         """Format message from template"""
         return template.format(
@@ -411,7 +420,7 @@ class CloudAircraftTracker:
             eta=notification.get('eta', 'N/A'),
             time=notification.get('time', datetime.now()).strftime('%H:%M')
         )
-    
+
     async def send_via_integration(self, integration: Integration, message: str) -> bool:
         """Send notification via specific integration"""
         try:
@@ -432,13 +441,13 @@ class CloudAircraftTracker:
         except Exception as e:
             print(f"Error sending via {integration.type}: {e}")
             return False
-    
+
     async def send_discord(self, config: dict, message: str) -> bool:
         """Send Discord webhook"""
         webhook_url = config.get('webhook_url')
         if not webhook_url:
             return False
-        
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 webhook_url,
@@ -446,13 +455,13 @@ class CloudAircraftTracker:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 return response.status == 204
-    
+
     async def send_slack(self, config: dict, message: str) -> bool:
         """Send Slack webhook"""
         webhook_url = config.get('webhook_url')
         if not webhook_url:
             return False
-        
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 webhook_url,
@@ -460,13 +469,13 @@ class CloudAircraftTracker:
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 return response.status == 200
-    
+
     async def send_teams(self, config: dict, message: str) -> bool:
         """Send Microsoft Teams webhook"""
         webhook_url = config.get('webhook_url')
         if not webhook_url:
             return False
-        
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 webhook_url,
@@ -526,7 +535,7 @@ class CloudAircraftTracker:
                     error = await response.text()
                     print(f"Resend error: {error}")
                     return False
-    
+
     async def send_sms(self, config: dict, message: str) -> bool:
         """Send SMS via Twilio"""
         import os
@@ -617,13 +626,13 @@ class CloudAircraftTracker:
         else:
             test_message = f"🧪 **Test Notification**\nYour {integration.type} integration is working! ✅"
         return await self.send_via_integration(integration, test_message)
-    
+
     async def get_live_aircraft(self, user_id: str) -> List[dict]:
         """Get current aircraft data for a user"""
         tracker = self.user_trackers.get(user_id)
         if not tracker:
             return []
-        
+
         # Return current state
         result = []
         for icao24, tail in tracker.aircraft_to_track.items():
@@ -644,5 +653,5 @@ class CloudAircraftTracker:
                     'latitude': state.get('latitude'),
                     'longitude': state.get('longitude'),
                 })
-        
+
         return result
