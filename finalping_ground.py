@@ -29,8 +29,8 @@ from datetime import datetime, timedelta
 #  USER CONFIGURATION — edit these values
 # ══════════════════════════════════════════════════════════════════════════════
 
-FINALPING_EMAIL    = "andrew.p.sherman21@gmail.com"       # Your FinalPing account email
-FINALPING_PASSWORD = "forHyt-tadmo9-hebros"          # Your FinalPing password
+FINALPING_EMAIL    = "your@email.com"       # Your FinalPing account email
+FINALPING_PASSWORD = "yourpassword"          # Your FinalPing password
 
 # Your ADS-B receiver's dump1090 address
 # Default is localhost if running on the same device
