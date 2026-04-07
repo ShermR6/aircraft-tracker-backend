@@ -347,7 +347,10 @@ class CloudAircraftTracker:
                                         await self.send_notifications(user_id, notifications)
 
                 except Exception as e:
-                    print(f"Error tracking for user {user_id}: {e}")
+    import traceback
+    print(f"Error tracking for user {user_id}: {e}")
+    traceback.print_exc()
+
 
     async def send_notifications(self, user_id: str, notifications: List[dict]):
         """Send notifications via configured integrations"""
