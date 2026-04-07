@@ -422,10 +422,16 @@ class CloudAircraftTracker:
     def format_message(self, template: str, notification: dict) -> str:
         """Format message from template"""
         tail = notification.get('tail', 'N/A')
+        # Use the alert threshold distance (e.g. "2nm" -> "2") instead of actual distance
+        alert_type = notification.get('type', '')
+        if 'nm' in alert_type:
+            threshold = alert_type.replace('nm', '')
+        else:
+            threshold = f"{notification.get('distance', 0):.1f}"
         return template.format(
             tail=tail,
             tail_number=tail,
-            distance=f"{notification.get('distance', 0):.1f}",
+            distance=threshold,
             altitude=f"{notification.get('altitude', 0):.0f}",
             eta=notification.get('eta', 'N/A'),
             time=notification.get('time', datetime.now()).strftime('%H:%M'),
