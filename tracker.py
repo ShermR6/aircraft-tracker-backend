@@ -415,12 +415,15 @@ class CloudAircraftTracker:
 
     def format_message(self, template: str, notification: dict) -> str:
         """Format message from template"""
+        tail = notification.get('tail', 'N/A')
         return template.format(
-            tail=notification.get('tail', 'N/A'),
+            tail=tail,
+            tail_number=tail,
             distance=f"{notification.get('distance', 0):.1f}",
             altitude=f"{notification.get('altitude', 0):.0f}",
             eta=notification.get('eta', 'N/A'),
-            time=notification.get('time', datetime.now()).strftime('%H:%M')
+            time=notification.get('time', datetime.now()).strftime('%H:%M'),
+            airport=notification.get('airport', ''),
         )
 
     async def send_via_integration(self, integration: Integration, message: str) -> bool:
