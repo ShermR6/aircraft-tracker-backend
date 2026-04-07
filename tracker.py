@@ -261,6 +261,7 @@ class CloudAircraftTracker:
                 'query_radius_nm': airport_config.query_radius_nm,
                 'alert_distances_nm': [float(d) for d in airport_config.alert_distances_nm]
             },
+            'airport_code': airport_config.airport_code or '',
             'notification_cooldown_minutes': 1,
             'quiet_hours': {
                 'enabled': airport_config.quiet_hours_enabled,
@@ -368,6 +369,11 @@ class CloudAircraftTracker:
             }
 
             for notification in notifications:
+                # Add airport code from tracker config
+                tracker = self.user_trackers.get(user_id)
+                if tracker:
+                    notification['airport'] = tracker.config.get('airport_code', '')
+
                 # Build message from template
                 alert_type = notification['type']
                 template = alert_settings.get(alert_type, self.get_default_template(alert_type))
@@ -406,12 +412,12 @@ class CloudAircraftTracker:
                 pass
 
         templates = {
-            '10nm': '**{tail} - 10nm out**\nETA ~{eta}min, Alt {altitude}ft MSL',
-            '5nm': '**{tail} - 5nm out**\nETA ~{eta}min, Alt {altitude}ft MSL',
-            '2nm': '**{tail} - 2nm out**\nETA ~{eta}min, Alt {altitude}ft MSL',
-            'landing': '**\U0001f6ec {tail} LANDING**\nTime: {time}\n\u2705 Ready to put away'
+            'landing': '✅ **{tail_number}** has landed at {airport}'
         }
-        return templates.get(normalized, f'**{{tail}} - {normalized}**\nAlt {{altitude}}ft MSL')
+        # All distance alerts use the same format
+        if normalized != 'landing':
+            return f'✈️ **{{tail_number}}** – {normalized} from {{airport}}\nETA ~{{eta}}min, Alt {{altitude}}ft MSL'
+        return templates.get(normalized, f'✈️ **{{tail_number}}** – {normalized} from {{airport}}\nAlt {{altitude}}ft MSL')
 
     def format_message(self, template: str, notification: dict) -> str:
         """Format message from template"""
