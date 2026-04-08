@@ -835,7 +835,29 @@ async def save_airport_config(
     
     db.commit()
     db.refresh(config)
-    
+
+    # Clean up orphaned alert settings for distances that were removed
+    if "alert_distances_nm" in config_data:
+        try:
+            valid_types = {f"{int(float(d))}nm" if float(d) == int(float(d)) else f"{float(d)}nm"
+                          for d in config_data["alert_distances_nm"]}
+            valid_types.add("landing")  # never delete landing alerts
+            existing_settings = db.query(AlertSetting).filter(
+                AlertSetting.user_id == current_user.id
+            ).all()
+            for setting in existing_settings:
+                if setting.alert_type not in valid_types:
+                    db.delete(setting)
+            db.commit()
+        except Exception as e:
+            print(f"Failed to clean up orphaned alert settings: {e}")
+
+    # Reload the user's tracker so it picks up new distances immediately
+    try:
+        await tracker.update_user_aircraft(str(current_user.id), db)
+    except Exception as e:
+        print(f"Failed to reload tracker after config update: {e}")
+
     return {"message": "Configuration saved successfully", "id": str(config.id)}
 
 # ============================================================================
