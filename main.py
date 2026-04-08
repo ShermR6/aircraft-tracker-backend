@@ -1619,6 +1619,16 @@ async def startup_event():
     # Load all existing users into the tracker
     db = SessionLocal()
     try:
+        # One-time cleanup: normalize duplicate alert types (remove after deploy)
+        from sqlalchemy import text
+        db.execute(text("UPDATE notification_logs SET alert_type = '2nm' WHERE alert_type = '2.0nm'"))
+        db.execute(text("UPDATE notification_logs SET alert_type = '5nm' WHERE alert_type = '5.0nm'"))
+        db.execute(text("UPDATE notification_logs SET alert_type = '10nm' WHERE alert_type = '10.0nm'"))
+        db.execute(text("UPDATE notification_logs SET alert_type = '15nm' WHERE alert_type = '15.0nm'"))
+        db.execute(text("DELETE FROM alert_settings WHERE alert_type IN ('2.0nm', '5.0nm', '10.0nm', '15.0nm')"))
+        db.commit()
+        print("✅ Cleaned up duplicate alert types")
+
         users = db.query(User).all()
         for user in users:
             try:
