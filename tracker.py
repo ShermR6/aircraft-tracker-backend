@@ -124,53 +124,29 @@ class UserTracker:
                     crossed_boundary = (prev_distance > alert_distance and distance_nm <= alert_distance)
 
                     if crossed_boundary and was_beyond_boundary and alert_key not in self.distance_alerts_sent[aircraft_id]:
-                        # The smallest configured distance triggers landing detection
+                        # Send the distance alert
+                        if self.should_notify(f'distance_{alert_distance}', aircraft_id):
+                            eta_minutes = int(distance_nm / 1.5)
+                            notifications.append({
+                                'type': alert_key,
+                                'tail': callsign,
+                                'distance': distance_nm,
+                                'altitude': altitude_msl_ft,
+                                'eta': eta_minutes,
+                                'time': datetime.now()
+                            })
+                            self.distance_alerts_sent[aircraft_id].add(alert_key)
+
+                        # Mark as ready for landing detection once smallest distance is crossed sequentially
                         if alert_distance == min_distance:
                             larger_distances = [d for d in alert_distances if d > min_distance]
                             all_crossed = all(dist_key(d) in self.distance_alerts_sent[aircraft_id] for d in larger_distances)
                             if larger_distances and all_crossed:
-                                # Plane crossed all zones sequentially = LANDING!
-                                if self.should_notify('landing', aircraft_id):
-                                    already_landed = self.aircraft_state.get(aircraft_id, {}).get('landed', False)
-                                    if not already_landed:
-                                        notifications.append({
-                                            'type': 'landing',
-                                            'tail': callsign,
-                                            'distance': distance_nm,
-                                            'altitude': altitude_msl_ft,
-                                            'time': datetime.now()
-                                        })
-                                        self.aircraft_state.setdefault(aircraft_id, {})['landed'] = True
-                                        self.distance_alerts_sent[aircraft_id].add(alert_key)
-                            else:
-                                # Not enough zones crossed — send distance alert
-                                if self.should_notify(f'distance_{alert_distance}', aircraft_id):
-                                    eta_minutes = int(distance_nm / 1.5)
-                                    notifications.append({
-                                        'type': alert_key,
-                                        'tail': callsign,
-                                        'distance': distance_nm,
-                                        'altitude': altitude_msl_ft,
-                                        'eta': eta_minutes,
-                                        'time': datetime.now()
-                                    })
-                                    self.distance_alerts_sent[aircraft_id].add(alert_key)
-                        else:
-                            # Regular distance alert
-                            if self.should_notify(f'distance_{alert_distance}', aircraft_id):
-                                eta_minutes = int(distance_nm / 1.5)
-                                notifications.append({
-                                    'type': alert_key,
-                                    'tail': callsign,
-                                    'distance': distance_nm,
-                                    'altitude': altitude_msl_ft,
-                                    'eta': eta_minutes,
-                                    'time': datetime.now()
-                                })
-                                self.distance_alerts_sent[aircraft_id].add(alert_key)
+                                self.aircraft_state.setdefault(aircraft_id, {})['landing_ready'] = True
 
-            # Reset alerts if plane goes back out beyond 12nm
-            if distance_nm > 12.0:
+            # Reset alerts if plane goes back out beyond the largest configured distance + 2nm buffer
+            reset_distance = (max(alert_distances) + 2.0) if alert_distances else 12.0
+            if distance_nm > reset_distance:
                 self.distance_alerts_sent[aircraft_id] = set()
                 if aircraft_id in self.aircraft_state:
                     self.aircraft_state[aircraft_id]['max_distance'] = distance_nm
@@ -325,9 +301,11 @@ class CloudAircraftTracker:
                             aircraft_list = data.get('ac', [])
 
                             # Filter to only tracked aircraft
+                            seen_icao24 = set()
                             for aircraft_data in aircraft_list:
                                 icao24 = aircraft_data.get('hex', '').lower()
                                 if icao24 in tracker.aircraft_to_track:
+                                    seen_icao24.add(icao24)
                                     # Build aircraft dict
                                     aircraft_dict = {
                                         'icao24': icao24,
@@ -346,6 +324,28 @@ class CloudAircraftTracker:
                                     # Send notifications
                                     if notifications:
                                         await self.send_notifications(user_id, notifications)
+
+                            # Signal loss detection — check tracked aircraft NOT in the API response
+                            for icao24, tail in tracker.aircraft_to_track.items():
+                                if icao24 not in seen_icao24 and icao24 in tracker.aircraft_state:
+                                    state = tracker.aircraft_state[icao24]
+                                    missing = state.get('consecutive_missing', 0) + 1
+                                    state['consecutive_missing'] = missing
+
+                                    # If aircraft was ready for landing and disappeared for 3+ polls (~30 sec)
+                                    if (state.get('landing_ready', False)
+                                            and not state.get('landed', False)
+                                            and missing >= 3):
+                                        if tracker.should_notify('landing', icao24):
+                                            notifications = [{
+                                                'type': 'landing',
+                                                'tail': tail,
+                                                'distance': state.get('last_distance', 0),
+                                                'altitude': state.get('altitude_msl', 0),
+                                                'time': datetime.now()
+                                            }]
+                                            await self.send_notifications(user_id, notifications)
+                                            state['landed'] = True
 
                 except Exception as e:
                     import traceback
