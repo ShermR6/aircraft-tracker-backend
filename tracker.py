@@ -416,8 +416,8 @@ class CloudAircraftTracker:
         }
         # All distance alerts use the same format
         if normalized != 'landing':
-            return f'**{{tail_number}}** – {normalized} from **{{airport}}**\nETA ~{{eta}}min, Alt {{altitude}}ft MSL'
-        return templates.get(normalized, f'**{{tail_number}}** – {normalized} from **{{airport}}**\nAlt {{altitude}}ft MSL')
+            return f'**{{tail_number}}** – **{normalized}** from **{{airport}}**\nETA ~{{eta}}min, Alt {{altitude}}ft MSL'
+        return templates.get(normalized, f'**{{tail_number}}** – **{normalized}** from **{{airport}}**\nAlt {{altitude}}ft MSL')
 
     def format_message(self, template: str, notification: dict) -> str:
         """Format message from template"""
