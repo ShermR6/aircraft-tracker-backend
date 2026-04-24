@@ -156,6 +156,44 @@ async def get_current_user(
     return user
 
 
+@app.post("/api/auth/refresh")
+async def refresh_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    """Refresh an expired JWT token — allows tokens expired within the last 7 days"""
+    try:
+        token = credentials.credentials
+        # Decode WITHOUT verifying expiration — we want to accept recently expired tokens
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": False})
+        user_id: str = payload.get("sub")
+        exp = payload.get("exp", 0)
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        # Only allow refresh if token expired within the last 7 days
+        expired_at = datetime.utcfromtimestamp(exp)
+        if datetime.utcnow() - expired_at > timedelta(days=7):
+            raise HTTPException(status_code=401, detail="Token too old to refresh — please log in again")
+        
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    # Verify user still exists and license is valid
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    
+    if user.license_id:
+        license = db.query(License).filter(License.id == user.license_id).first()
+        if license and license.expires_at and license.expires_at < datetime.utcnow():
+            raise HTTPException(status_code=401, detail="license_expired")
+    
+    # Issue a fresh token
+    new_token = create_access_token(str(user.id))
+    return {"access_token": new_token, "token_type": "bearer"}
+
+
 @app.post("/api/auth/login", response_model=TokenResponse)
 async def login(
     credentials: UserLogin,
