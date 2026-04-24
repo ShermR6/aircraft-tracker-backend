@@ -801,6 +801,23 @@ async def save_airport_config(
     db: Session = Depends(get_db)
 ):
     """Create or update airport configuration"""
+    # Auto-lookup elevation from coordinates if not provided
+    lat = config_data.get("latitude")
+    lon = config_data.get("longitude")
+    elevation = config_data.get("elevation_ft_msl")
+
+    if lat and lon and (not elevation or elevation == 0):
+        try:
+            import httpx
+            resp = httpx.get(f"https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}", timeout=5)
+            if resp.status_code == 200:
+                elev_meters = resp.json().get("elevation", [0])[0]
+                elevation = int(elev_meters * 3.28084)  # convert meters to feet
+                print(f"✅ Auto-detected elevation: {elevation}ft MSL for {lat},{lon}")
+        except Exception as e:
+            print(f"Failed to auto-detect elevation: {e}")
+            elevation = config_data.get("elevation_ft_msl", 0)
+
     config = db.query(AirportConfig).filter(
         AirportConfig.user_id == current_user.id
     ).first()
@@ -809,6 +826,8 @@ async def save_airport_config(
         config.airport_code = config_data.get("airport_code", config.airport_code)
         config.latitude = str(config_data.get("latitude", config.latitude))
         config.longitude = str(config_data.get("longitude", config.longitude))
+        if elevation:
+            config.elevation_ft_msl = elevation
         config.query_radius_nm = str(config_data.get("detection_radius_nm", config.query_radius_nm))
         config.radius_nm = str(config_data.get("polling_interval_seconds", config.radius_nm))
         config.quiet_hours_start = config_data.get("quiet_hours_start", config.quiet_hours_start)
@@ -822,7 +841,7 @@ async def save_airport_config(
             airport_code=config_data.get("airport_code", "KDTO"),
             latitude=str(config_data.get("latitude", "33.2001")),
             longitude=str(config_data.get("longitude", "-97.1998")),
-            elevation_ft_msl=config_data.get("elevation_ft_msl", 0),
+            elevation_ft_msl=elevation or config_data.get("elevation_ft_msl", 0),
             query_radius_nm=str(config_data.get("detection_radius_nm", "100.0")),
             radius_nm=str(config_data.get("polling_interval_seconds", "10")),
             alert_distances_nm=[str(d) for d in config_data.get("alert_distances_nm", [10.0, 5.0, 2.0])],

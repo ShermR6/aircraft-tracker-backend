@@ -307,14 +307,43 @@ class CloudAircraftTracker:
                                 if icao24 in tracker.aircraft_to_track:
                                     seen_icao24.add(icao24)
                                     # Build aircraft dict
+                                    alt_baro = aircraft_data.get('alt_baro')
+                                    gs = aircraft_data.get('gs')
+                                    baro_rate = aircraft_data.get('baro_rate')
+                                    seen_pos = aircraft_data.get('seen_pos')  # seconds since last position update
+
+                                    # Ground detection: multiple signals
+                                    is_on_ground = alt_baro == 'ground'
+
+                                    if not is_on_ground and alt_baro is not None and alt_baro != 'ground':
+                                        field_elev = float(tracker.config['airspace'].get('field_elevation_ft_msl', 0))
+                                        alt_agl = float(alt_baro) - field_elev if isinstance(alt_baro, (int, float)) else 999
+
+                                        # On ground if: altitude within 150ft of field AND ground speed under 30kts
+                                        if alt_agl < 150 and gs is not None and gs < 30:
+                                            is_on_ground = True
+
+                                        # On ground if: very close to airport, low altitude, and stale position data (>30s)
+                                        ac_lat = aircraft_data.get('lat')
+                                        ac_lon = aircraft_data.get('lon')
+                                        if ac_lat and ac_lon and seen_pos is not None and seen_pos > 30:
+                                            center_lat = float(tracker.config['airspace']['center_lat'])
+                                            center_lon = float(tracker.config['airspace']['center_lon'])
+                                            # Quick distance estimate in nm
+                                            dlat = abs(float(ac_lat) - center_lat) * 60
+                                            dlon = abs(float(ac_lon) - center_lon) * 60 * 0.85  # rough cos correction
+                                            approx_dist = (dlat**2 + dlon**2) ** 0.5
+                                            if approx_dist < 3 and alt_agl < 500:
+                                                is_on_ground = True
+
                                     aircraft_dict = {
                                         'icao24': icao24,
                                         'callsign': tracker.aircraft_to_track[icao24],
                                         'latitude': aircraft_data.get('lat'),
                                         'longitude': aircraft_data.get('lon'),
-                                        'baro_altitude': aircraft_data.get('alt_baro'),
-                                        'on_ground': aircraft_data.get('alt_baro') == 'ground',
-                                        'velocity': aircraft_data.get('gs'),
+                                        'baro_altitude': alt_baro,
+                                        'on_ground': is_on_ground,
+                                        'velocity': gs,
                                         'heading': aircraft_data.get('track'),
                                     }
 
