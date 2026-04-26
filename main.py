@@ -113,6 +113,7 @@ class LicenseProvision(BaseModel):
     license_key: str
     tier: str
     email: str
+    stripe_subscription_id: str = None
 
 
 # ============================================================================
@@ -446,6 +447,22 @@ async def activate_license(
         license.activations_used += 1
         db.commit()
         db.refresh(license)
+
+        # Resume the paused Stripe subscription so billing starts from now
+        if license.stripe_subscription_id:
+            try:
+                import stripe as stripe_lib
+                stripe_lib.api_key = os.getenv("STRIPE_SECRET_KEY")
+                if stripe_lib.api_key:
+                    stripe_lib.Subscription.modify(
+                        license.stripe_subscription_id,
+                        pause_collection=None,  # unpause
+                        billing_cycle_anchor="now",  # reset billing to start from now
+                        proration_behavior="none",
+                    )
+                    print(f"✅ Resumed Stripe subscription {license.stripe_subscription_id}")
+            except Exception as e:
+                print(f"Failed to resume Stripe subscription: {e}")
     elif not license.expires_at:
         # Already activated but expires_at is missing — set it from activated_at
         license.expires_at = license.activated_at + timedelta(days=LICENSE_DURATION_DAYS)
@@ -582,6 +599,7 @@ async def provision_license(
         status="inactive",
         activations_max=tier_limits.get(data.tier, 100),
         activations_used=0,
+        stripe_subscription_id=data.stripe_subscription_id,
         created_at=datetime.utcnow(),
         # activated_at and expires_at are NULL — set when user activates in desktop app
     )
