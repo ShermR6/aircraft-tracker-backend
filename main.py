@@ -1696,6 +1696,7 @@ async def startup_event():
     try:
         # One-time cleanup: normalize duplicate alert types (remove after deploy)
         from sqlalchemy import text
+        db.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255)"))
         db.execute(text("UPDATE notification_logs SET alert_type = '2nm' WHERE alert_type = '2.0nm'"))
         db.execute(text("UPDATE notification_logs SET alert_type = '5nm' WHERE alert_type = '5.0nm'"))
         db.execute(text("UPDATE notification_logs SET alert_type = '10nm' WHERE alert_type = '10.0nm'"))
