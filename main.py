@@ -456,9 +456,7 @@ async def activate_license(
                 if stripe_lib.api_key:
                     stripe_lib.Subscription.modify(
                         license.stripe_subscription_id,
-                        pause_collection=None,  # unpause
-                        billing_cycle_anchor="now",  # reset billing to start from now
-                        proration_behavior="none",
+                        pause_collection="",  # unpause by setting to empty string
                     )
                     print(f"✅ Resumed Stripe subscription {license.stripe_subscription_id}")
             except Exception as e:
