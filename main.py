@@ -448,26 +448,35 @@ async def activate_license(
         db.commit()
         db.refresh(license)
 
-        # Resume the paused Stripe subscription, anchoring the billing cycle to
-        # activation time so Stripe's period_end matches our expires_at exactly.
+        # Resume the paused Stripe subscription, then anchor the billing cycle
+        # to activation time in a separate call (combining both in one call
+        # causes Stripe to silently ignore the anchor).
         if license.stripe_subscription_id:
             try:
                 import stripe as stripe_lib
                 stripe_lib.api_key = os.getenv("STRIPE_SECRET_KEY")
                 if stripe_lib.api_key:
-                    updated_sub = stripe_lib.Subscription.modify(
+                    # Step 1: unpause
+                    stripe_lib.Subscription.modify(
                         license.stripe_subscription_id,
                         pause_collection="",
+                    )
+                    print(f"Unpaused Stripe subscription {license.stripe_subscription_id}")
+                    # Step 2: reset billing cycle anchor to now
+                    updated_sub = stripe_lib.Subscription.modify(
+                        license.stripe_subscription_id,
                         billing_cycle_anchor="now",
                         proration_behavior="none",
                     )
-                    print(f"✅ Resumed Stripe subscription {license.stripe_subscription_id}")
-                    if updated_sub.current_period_end:
-                        license.expires_at = datetime.utcfromtimestamp(updated_sub.current_period_end)
+                    period_end = updated_sub.current_period_end
+                    print(f"Stripe period_end after anchor reset: {period_end}")
+                    if period_end:
+                        license.expires_at = datetime.utcfromtimestamp(period_end)
                         db.commit()
                         db.refresh(license)
+                        print(f"expires_at set to {license.expires_at} from Stripe")
             except Exception as e:
-                print(f"Failed to resume Stripe subscription: {e}")
+                print(f"Stripe error during activation: {e}")
     elif not license.expires_at:
         # Already activated but expires_at is missing — set it from activated_at
         license.expires_at = license.activated_at + timedelta(days=LICENSE_DURATION_DAYS)
