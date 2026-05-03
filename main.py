@@ -448,33 +448,26 @@ async def activate_license(
         db.commit()
         db.refresh(license)
 
-        # Resume the paused Stripe subscription, then anchor the billing cycle
-        # to activation time in a separate call (combining both in one call
-        # causes Stripe to silently ignore the anchor).
+        # Unpause the Stripe subscription and use its current_period_end as
+        # the authoritative expiry date.
         if license.stripe_subscription_id:
             try:
                 import stripe as stripe_lib
                 stripe_lib.api_key = os.getenv("STRIPE_SECRET_KEY")
                 if stripe_lib.api_key:
-                    # Step 1: unpause
-                    stripe_lib.Subscription.modify(
+                    updated_sub = stripe_lib.Subscription.modify(
                         license.stripe_subscription_id,
                         pause_collection="",
                     )
-                    print(f"Unpaused Stripe subscription {license.stripe_subscription_id}")
-                    # Step 2: reset billing cycle anchor to now
-                    updated_sub = stripe_lib.Subscription.modify(
-                        license.stripe_subscription_id,
-                        billing_cycle_anchor="now",
-                        proration_behavior="none",
-                    )
                     period_end = updated_sub.current_period_end
-                    print(f"Stripe period_end after anchor reset: {period_end}")
-                    if period_end:
+                    print(f"Stripe period_end after unpause: {period_end}")
+                    if period_end and period_end > datetime.utcnow().timestamp():
                         license.expires_at = datetime.utcfromtimestamp(period_end)
                         db.commit()
                         db.refresh(license)
                         print(f"expires_at set to {license.expires_at} from Stripe")
+                    else:
+                        print(f"Stripe period_end unusable ({period_end}), keeping +30 days fallback")
             except Exception as e:
                 print(f"Stripe error during activation: {e}")
     elif not license.expires_at:
