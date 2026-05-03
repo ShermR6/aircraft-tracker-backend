@@ -56,6 +56,10 @@ WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "skyping-internal
 # License duration
 LICENSE_DURATION_DAYS = 30
 
+# Grace period after expiry before blocking access — gives the Stripe renewal
+# webhook time to arrive and extend the license before users go dark.
+LICENSE_GRACE_PERIOD = timedelta(hours=2)
+
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
@@ -151,9 +155,9 @@ async def get_current_user(
     # Check license expiry — free accounts (no license) are allowed through
     if user.license_id:
         license = db.query(License).filter(License.id == user.license_id).first()
-        if license and license.expires_at and license.expires_at < datetime.utcnow():
+        if license and license.expires_at and license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow():
             raise HTTPException(status_code=401, detail="license_expired")
-    
+
     return user
 
 
@@ -187,9 +191,9 @@ async def refresh_token(
     
     if user.license_id:
         license = db.query(License).filter(License.id == user.license_id).first()
-        if license and license.expires_at and license.expires_at < datetime.utcnow():
+        if license and license.expires_at and license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow():
             raise HTTPException(status_code=401, detail="license_expired")
-    
+
     # Issue a fresh token
     new_token = create_access_token(str(user.id))
     return {"access_token": new_token, "token_type": "bearer"}
@@ -251,7 +255,7 @@ async def login(
     tier = "free"
     expires_at = None
     if license:
-        if license.status == "expired" or (license.expires_at and license.expires_at < datetime.utcnow()):
+        if license.status == "expired" or (license.expires_at and license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow()):
             raise HTTPException(status_code=401, detail="license_expired")
         tier = license.tier
         expires_at = license.expires_at
@@ -434,7 +438,7 @@ async def activate_license(
     if license.status == "expired":
         raise HTTPException(status_code=403, detail="License has expired")
     
-    if license.expires_at and license.expires_at < datetime.utcnow():
+    if license.expires_at and license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow():
         license.status = "expired"
         db.commit()
         raise HTTPException(status_code=403, detail="License has expired")
