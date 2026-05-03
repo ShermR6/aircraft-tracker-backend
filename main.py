@@ -455,12 +455,17 @@ async def activate_license(
                 import stripe as stripe_lib
                 stripe_lib.api_key = os.getenv("STRIPE_SECRET_KEY")
                 if stripe_lib.api_key:
-                    updated_sub = stripe_lib.Subscription.modify(
+                    # Unpause
+                    stripe_lib.Subscription.modify(
                         license.stripe_subscription_id,
                         pause_collection="",
                     )
-                    period_end = updated_sub.current_period_end
-                    print(f"Stripe period_end after unpause: {period_end}")
+                    # Retrieve fresh copy so we get the real current_period_end
+                    sub = stripe_lib.Subscription.retrieve(
+                        license.stripe_subscription_id
+                    )
+                    period_end = sub.current_period_end
+                    print(f"Stripe current_period_end: {period_end} pause_collection: {sub.pause_collection}")
                     if period_end and period_end > datetime.utcnow().timestamp():
                         license.expires_at = datetime.utcfromtimestamp(period_end)
                         db.commit()
