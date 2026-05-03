@@ -65,11 +65,11 @@ WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
 # Tier feature limits (None = unlimited)
 TIER_LIMITS = {
-    "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 1},
-    "premium":      {"aircraft": 10,   "locations": 5,    "integrations": 3},
-    "pro":          {"aircraft": None, "locations": None, "integrations": None},
-    "team-starter": {"aircraft": 3,    "locations": 1,    "integrations": 1},
-    "team-premium": {"aircraft": 10,   "locations": 5,    "integrations": 3},
+    "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 2},
+    "premium":      {"aircraft": 7,    "locations": 5,    "integrations": 5},
+    "pro":          {"aircraft": 15,   "locations": None, "integrations": None},
+    "team-starter": {"aircraft": 25,   "locations": 3,    "integrations": 3},
+    "team-premium": {"aircraft": 75,   "locations": 10,   "integrations": 10},
     "team-pro":     {"aircraft": None, "locations": None, "integrations": None},
 }
 
