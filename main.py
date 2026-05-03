@@ -462,13 +462,17 @@ async def activate_license(
                         license.stripe_subscription_id,
                         pause_collection="",
                     )
-                    # Fetch raw subscription JSON to get current_period_end
+                    # Fetch raw subscription JSON using a stable API version
                     async with httpx.AsyncClient() as client:
                         r = await client.get(
                             f"https://api.stripe.com/v1/subscriptions/{license.stripe_subscription_id}",
-                            headers={"Authorization": f"Bearer {stripe_key}"},
+                            headers={
+                                "Authorization": f"Bearer {stripe_key}",
+                                "Stripe-Version": "2023-10-16",
+                            },
                         )
                         sub_data = r.json()
+                    print(f"Stripe sub keys: {list(sub_data.keys())}")
                     period_end = sub_data.get("current_period_end")
                     print(f"Stripe raw period_end: {period_end}")
                     if period_end and period_end > datetime.utcnow().timestamp():
