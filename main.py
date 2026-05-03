@@ -448,17 +448,24 @@ async def activate_license(
         db.commit()
         db.refresh(license)
 
-        # Resume the paused Stripe subscription so billing starts from now
+        # Resume the paused Stripe subscription, anchoring the billing cycle to
+        # activation time so Stripe's period_end matches our expires_at exactly.
         if license.stripe_subscription_id:
             try:
                 import stripe as stripe_lib
                 stripe_lib.api_key = os.getenv("STRIPE_SECRET_KEY")
                 if stripe_lib.api_key:
-                    stripe_lib.Subscription.modify(
+                    updated_sub = stripe_lib.Subscription.modify(
                         license.stripe_subscription_id,
-                        pause_collection="",  # unpause by setting to empty string
+                        pause_collection="",
+                        billing_cycle_anchor="now",
+                        proration_behavior="none",
                     )
                     print(f"✅ Resumed Stripe subscription {license.stripe_subscription_id}")
+                    if updated_sub.current_period_end:
+                        license.expires_at = datetime.utcfromtimestamp(updated_sub.current_period_end)
+                        db.commit()
+                        db.refresh(license)
             except Exception as e:
                 print(f"Failed to resume Stripe subscription: {e}")
     elif not license.expires_at:
