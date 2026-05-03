@@ -449,23 +449,28 @@ async def activate_license(
         db.refresh(license)
 
         # Unpause the Stripe subscription and use its current_period_end as
-        # the authoritative expiry date.
+        # the authoritative expiry date. We fetch raw JSON via httpx to avoid
+        # stripe-python SDK attribute issues with newer API versions.
         if license.stripe_subscription_id:
             try:
                 import stripe as stripe_lib
-                stripe_lib.api_key = os.getenv("STRIPE_SECRET_KEY")
-                if stripe_lib.api_key:
-                    # Unpause
+                stripe_key = os.getenv("STRIPE_SECRET_KEY")
+                if stripe_key:
+                    stripe_lib.api_key = stripe_key
+                    # Unpause via SDK
                     stripe_lib.Subscription.modify(
                         license.stripe_subscription_id,
                         pause_collection="",
                     )
-                    # Retrieve fresh copy so we get the real current_period_end
-                    sub = stripe_lib.Subscription.retrieve(
-                        license.stripe_subscription_id
-                    )
-                    period_end = sub.current_period_end
-                    print(f"Stripe current_period_end: {period_end} pause_collection: {sub.pause_collection}")
+                    # Fetch raw subscription JSON to get current_period_end
+                    async with httpx.AsyncClient() as client:
+                        r = await client.get(
+                            f"https://api.stripe.com/v1/subscriptions/{license.stripe_subscription_id}",
+                            headers={"Authorization": f"Bearer {stripe_key}"},
+                        )
+                        sub_data = r.json()
+                    period_end = sub_data.get("current_period_end")
+                    print(f"Stripe raw period_end: {period_end}")
                     if period_end and period_end > datetime.utcnow().timestamp():
                         license.expires_at = datetime.utcfromtimestamp(period_end)
                         db.commit()
