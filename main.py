@@ -911,6 +911,7 @@ async def save_airport_config(
             config.elevation_ft_msl = elevation
         config.query_radius_nm = str(config_data.get("detection_radius_nm", config.query_radius_nm))
         config.radius_nm = str(config_data.get("polling_interval_seconds", config.radius_nm))
+        config.quiet_hours_enabled = config_data.get("quiet_hours_enabled", config.quiet_hours_enabled)
         config.quiet_hours_start = config_data.get("quiet_hours_start", config.quiet_hours_start)
         config.quiet_hours_end = config_data.get("quiet_hours_end", config.quiet_hours_end)
         if "alert_distances_nm" in config_data:
@@ -926,6 +927,7 @@ async def save_airport_config(
             query_radius_nm=str(config_data.get("detection_radius_nm", "100.0")),
             radius_nm=str(config_data.get("polling_interval_seconds", "10")),
             alert_distances_nm=[str(d) for d in config_data.get("alert_distances_nm", [10.0, 5.0, 2.0])],
+            quiet_hours_enabled=config_data.get("quiet_hours_enabled", False),
             quiet_hours_start=config_data.get("quiet_hours_start", "23:00"),
             quiet_hours_end=config_data.get("quiet_hours_end", "06:00"),
             created_at=datetime.utcnow(),

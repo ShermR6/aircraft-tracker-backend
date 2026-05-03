@@ -41,6 +41,19 @@ class UserTracker:
         nm = 3440.065 * c
         return nm
 
+    def in_quiet_hours(self) -> bool:
+        qh = self.config.get('quiet_hours', {})
+        if not qh.get('enabled', False):
+            return False
+        start_str = qh.get('start', '23:00')
+        end_str = qh.get('end', '06:00')
+        now_str = datetime.now().strftime('%H:%M')
+        if start_str <= end_str:
+            return start_str <= now_str <= end_str
+        else:
+            # Overnight span e.g. 23:00 → 06:00
+            return now_str >= start_str or now_str <= end_str
+
     def should_notify(self, event_type: str, aircraft_id: str) -> bool:
         """Check if enough time has passed since last notification (cooldown)"""
         cooldown_minutes = self.config.get('notification_cooldown_minutes', 1)
@@ -126,7 +139,11 @@ class UserTracker:
                     if crossed_boundary and was_beyond_boundary and alert_key not in self.distance_alerts_sent[aircraft_id]:
                         # Send the distance alert
                         if self.should_notify(f'distance_{alert_distance}', aircraft_id):
-                            eta_minutes = int(distance_nm / 1.5)
+                            speed_kts = aircraft_data.get('velocity')
+                            if speed_kts and speed_kts > 30:
+                                eta_minutes = max(1, int((distance_nm / speed_kts) * 60))
+                            else:
+                                eta_minutes = max(1, int(distance_nm / 1.5))
                             notifications.append({
                                 'type': alert_key,
                                 'tail': callsign,
@@ -350,8 +367,8 @@ class CloudAircraftTracker:
                                     # Check and get notifications
                                     notifications = await tracker.check_and_notify(aircraft_dict)
 
-                                    # Send notifications
-                                    if notifications:
+                                    # Send notifications (skip during quiet hours)
+                                    if notifications and not tracker.in_quiet_hours():
                                         await self.send_notifications(user_id, notifications)
 
                             # Signal loss detection — check tracked aircraft NOT in the API response
@@ -365,7 +382,7 @@ class CloudAircraftTracker:
                                     if (state.get('landing_ready', False)
                                             and not state.get('landed', False)
                                             and missing >= 3):
-                                        if tracker.should_notify('landing', icao24):
+                                        if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours():
                                             notifications = [{
                                                 'type': 'landing',
                                                 'tail': tail,
