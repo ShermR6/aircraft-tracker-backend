@@ -1544,6 +1544,31 @@ async def admin_get_user_integrations(
     return [{"id": str(i.id), "type": i.type, "enabled": i.enabled} for i in integrations]
 
 
+@app.put("/api/licenses/{license_key}/tier")
+async def update_license_tier(
+    license_key: str,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Update a license's tier — called by the web dashboard after a plan upgrade."""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    new_tier = body.get("tier")
+    if not new_tier or new_tier not in TIER_LIMITS:
+        raise HTTPException(status_code=400, detail="Invalid tier")
+
+    license = db.query(License).filter(License.license_key == license_key).first()
+    if not license:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    license.tier = new_tier
+    db.commit()
+    return {"message": "Tier updated", "tier": new_tier}
+
+
 @app.post("/api/admin/generate-license")
 async def generate_license(
     request: Request,
