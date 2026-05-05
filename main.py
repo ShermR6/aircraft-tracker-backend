@@ -1546,6 +1546,36 @@ async def admin_get_user_integrations(
     return [{"id": str(i.id), "type": i.type, "enabled": i.enabled} for i in integrations]
 
 
+@app.post("/api/licenses/{license_key}/expire")
+async def expire_license(
+    license_key: str,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Deactivate a license — called when a Stripe subscription is cancelled or a trial ends."""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    license = db.query(License).filter(License.license_key == license_key).first()
+    if not license:
+        raise HTTPException(status_code=404, detail="License not found")
+
+    license.status = "inactive"
+    license.expires_at = datetime.utcnow()
+    db.commit()
+
+    # Stop tracking for any user currently using this license
+    try:
+        user = db.query(User).filter(User.license_id == license.id).first()
+        if user:
+            tracker.remove_user(str(user.id))
+    except Exception as e:
+        print(f"Failed to stop tracker for expired license {license_key}: {e}")
+
+    return {"message": "License expired", "license_key": license_key}
+
+
 @app.put("/api/licenses/{license_key}/tier")
 async def update_license_tier(
     license_key: str,

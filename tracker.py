@@ -219,6 +219,10 @@ class CloudAircraftTracker:
             except asyncio.CancelledError:
                 pass
 
+    def remove_user(self, user_id: str):
+        """Remove a user from active tracking (e.g. after subscription cancellation)."""
+        self.user_trackers.pop(user_id, None)
+
     async def update_user_aircraft(self, user_id: str, db: Session):
         """Update tracked aircraft for a user"""
         # Get user configuration
