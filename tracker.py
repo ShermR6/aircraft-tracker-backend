@@ -203,6 +203,8 @@ class CloudAircraftTracker:
         self.user_trackers: Dict[str, UserTracker] = {}
         self.running = False
         self.task = None
+        self.sms_stop_last_sent_date = None
+        self.whatsapp_stop_last_sent_date = None
 
     async def start(self):
         """Start the global tracker"""
