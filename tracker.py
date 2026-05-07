@@ -294,108 +294,117 @@ class CloudAircraftTracker:
         if not self.user_trackers:
             return
 
-        # Gather all unique ICAO24 codes to track
-        all_icao24 = set()
-        for tracker in self.user_trackers.values():
-            all_icao24.update(tracker.aircraft_to_track.keys())
-
-        if not all_icao24:
-            return
-
-        # Fetch aircraft data from adsb.lol
-        # Group by location to minimize API calls
-        # For now, do one query per user's location
+        # Group users by approximate location (rounded to 0.5 deg ~30nm) to share API calls
+        location_groups: dict = {}
+        location_params: dict = {}
+        for user_id, tracker in self.user_trackers.items():
+            cfg = tracker.config['airspace']
+            lat_bucket = round(float(cfg['center_lat']) * 2) / 2
+            lon_bucket = round(float(cfg['center_lon']) * 2) / 2
+            key = (lat_bucket, lon_bucket)
+            if key not in location_groups:
+                location_groups[key] = []
+                location_params[key] = {'lat': cfg['center_lat'], 'lon': cfg['center_lon'], 'radius': float(cfg['query_radius_nm'])}
+            else:
+                location_params[key]['radius'] = max(location_params[key]['radius'], float(cfg['query_radius_nm']))
+            location_groups[key].append(user_id)
 
         async with aiohttp.ClientSession() as session:
-            for user_id, tracker in self.user_trackers.items():
+            # Fetch once per location bucket, share results across users in that bucket
+            location_aircraft: dict = {}
+            for key, params in location_params.items():
+                url = f"https://api.adsb.lol/v2/lat/{params['lat']}/lon/{params['lon']}/dist/{params['radius']}"
                 try:
-                    config = tracker.config['airspace']
-                    lat = config['center_lat']
-                    lon = config['center_lon']
-                    radius = config['query_radius_nm']
-
-                    url = f"https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{radius}"
-
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                         if response.status == 200:
                             data = await response.json()
-                            aircraft_list = data.get('ac', [])
+                            location_aircraft[key] = data.get('ac', [])
+                except Exception as e:
+                    print(f"Error fetching location bucket {key}: {e}")
 
-                            # Filter to only tracked aircraft
-                            seen_icao24 = set()
-                            for aircraft_data in aircraft_list:
-                                icao24 = aircraft_data.get('hex', '').lower()
-                                if icao24 in tracker.aircraft_to_track:
-                                    seen_icao24.add(icao24)
-                                    # Build aircraft dict
-                                    alt_baro = aircraft_data.get('alt_baro')
-                                    gs = aircraft_data.get('gs')
-                                    baro_rate = aircraft_data.get('baro_rate')
-                                    seen_pos = aircraft_data.get('seen_pos')  # seconds since last position update
+            for user_id, tracker in self.user_trackers.items():
+                try:
+                    cfg = tracker.config['airspace']
+                    lat_bucket = round(float(cfg['center_lat']) * 2) / 2
+                    lon_bucket = round(float(cfg['center_lon']) * 2) / 2
+                    key = (lat_bucket, lon_bucket)
+                    aircraft_list = location_aircraft.get(key, [])
 
-                                    # Ground detection: multiple signals
-                                    is_on_ground = alt_baro == 'ground'
+                    # Filter to only tracked aircraft
+                    seen_icao24 = set()
+                    for aircraft_data in aircraft_list:
+                        icao24 = aircraft_data.get('hex', '').lower()
+                        if icao24 in tracker.aircraft_to_track:
+                            seen_icao24.add(icao24)
+                            # Build aircraft dict
+                            alt_baro = aircraft_data.get('alt_baro')
+                            gs = aircraft_data.get('gs')
+                            baro_rate = aircraft_data.get('baro_rate')
+                            seen_pos = aircraft_data.get('seen_pos')  # seconds since last position update
 
-                                    if not is_on_ground and alt_baro is not None and alt_baro != 'ground':
-                                        field_elev = float(tracker.config['airspace'].get('field_elevation_ft_msl', 0))
-                                        alt_agl = float(alt_baro) - field_elev if isinstance(alt_baro, (int, float)) else 999
+                            # Ground detection: multiple signals
+                            is_on_ground = alt_baro == 'ground'
 
-                                        # On ground if: altitude within 150ft of field AND ground speed under 30kts
-                                        if alt_agl < 150 and gs is not None and gs < 30:
-                                            is_on_ground = True
+                            if not is_on_ground and alt_baro is not None and alt_baro != 'ground':
+                                field_elev = float(tracker.config['airspace'].get('field_elevation_ft_msl', 0))
+                                alt_agl = float(alt_baro) - field_elev if isinstance(alt_baro, (int, float)) else 999
 
-                                        # On ground if: very close to airport, low altitude, and stale position data (>30s)
-                                        ac_lat = aircraft_data.get('lat')
-                                        ac_lon = aircraft_data.get('lon')
-                                        if ac_lat and ac_lon and seen_pos is not None and seen_pos > 30:
-                                            center_lat = float(tracker.config['airspace']['center_lat'])
-                                            center_lon = float(tracker.config['airspace']['center_lon'])
-                                            # Quick distance estimate in nm
-                                            dlat = abs(float(ac_lat) - center_lat) * 60
-                                            dlon = abs(float(ac_lon) - center_lon) * 60 * 0.85  # rough cos correction
-                                            approx_dist = (dlat**2 + dlon**2) ** 0.5
-                                            if approx_dist < 3 and alt_agl < 500:
-                                                is_on_ground = True
+                                # On ground if: altitude within 150ft of field AND ground speed under 30kts
+                                if alt_agl < 150 and gs is not None and gs < 30:
+                                    is_on_ground = True
 
-                                    aircraft_dict = {
-                                        'icao24': icao24,
-                                        'callsign': tracker.aircraft_to_track[icao24],
-                                        'latitude': aircraft_data.get('lat'),
-                                        'longitude': aircraft_data.get('lon'),
-                                        'baro_altitude': alt_baro,
-                                        'on_ground': is_on_ground,
-                                        'velocity': gs,
-                                        'heading': aircraft_data.get('track'),
-                                    }
+                                # On ground if: very close to airport, low altitude, and stale position data (>30s)
+                                ac_lat = aircraft_data.get('lat')
+                                ac_lon = aircraft_data.get('lon')
+                                if ac_lat and ac_lon and seen_pos is not None and seen_pos > 30:
+                                    center_lat = float(tracker.config['airspace']['center_lat'])
+                                    center_lon = float(tracker.config['airspace']['center_lon'])
+                                    # Quick distance estimate in nm
+                                    dlat = abs(float(ac_lat) - center_lat) * 60
+                                    dlon = abs(float(ac_lon) - center_lon) * 60 * 0.85  # rough cos correction
+                                    approx_dist = (dlat**2 + dlon**2) ** 0.5
+                                    if approx_dist < 3 and alt_agl < 500:
+                                        is_on_ground = True
 
-                                    # Check and get notifications
-                                    notifications = await tracker.check_and_notify(aircraft_dict)
+                            aircraft_dict = {
+                                'icao24': icao24,
+                                'callsign': tracker.aircraft_to_track[icao24],
+                                'latitude': aircraft_data.get('lat'),
+                                'longitude': aircraft_data.get('lon'),
+                                'baro_altitude': alt_baro,
+                                'on_ground': is_on_ground,
+                                'velocity': gs,
+                                'heading': aircraft_data.get('track'),
+                            }
 
-                                    # Send notifications (skip during quiet hours)
-                                    if notifications and not tracker.in_quiet_hours():
-                                        await self.send_notifications(user_id, notifications)
+                            # Check and get notifications
+                            notifications = await tracker.check_and_notify(aircraft_dict)
 
-                            # Signal loss detection — check tracked aircraft NOT in the API response
-                            for icao24, tail in tracker.aircraft_to_track.items():
-                                if icao24 not in seen_icao24 and icao24 in tracker.aircraft_state:
-                                    state = tracker.aircraft_state[icao24]
-                                    missing = state.get('consecutive_missing', 0) + 1
-                                    state['consecutive_missing'] = missing
+                            # Send notifications (skip during quiet hours)
+                            if notifications and not tracker.in_quiet_hours():
+                                await self.send_notifications(user_id, notifications)
 
-                                    # If aircraft was ready for landing and disappeared for 3+ polls (~30 sec)
-                                    if (state.get('landing_ready', False)
-                                            and not state.get('landed', False)
-                                            and missing >= 3):
-                                        if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours():
-                                            notifications = [{
-                                                'type': 'landing',
-                                                'tail': tail,
-                                                'distance': state.get('last_distance', 0),
-                                                'altitude': state.get('altitude_msl', 0),
-                                                'time': datetime.now()
-                                            }]
-                                            await self.send_notifications(user_id, notifications)
-                                            state['landed'] = True
+                    # Signal loss detection — check tracked aircraft NOT in the API response
+                    for icao24, tail in tracker.aircraft_to_track.items():
+                        if icao24 not in seen_icao24 and icao24 in tracker.aircraft_state:
+                            state = tracker.aircraft_state[icao24]
+                            missing = state.get('consecutive_missing', 0) + 1
+                            state['consecutive_missing'] = missing
+
+                            # If aircraft was ready for landing and disappeared for 3+ polls (~30 sec)
+                            if (state.get('landing_ready', False)
+                                    and not state.get('landed', False)
+                                    and missing >= 3):
+                                if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours():
+                                    notifications = [{
+                                        'type': 'landing',
+                                        'tail': tail,
+                                        'distance': state.get('last_distance', 0),
+                                        'altitude': state.get('altitude_msl', 0),
+                                        'time': datetime.now()
+                                    }]
+                                    await self.send_notifications(user_id, notifications)
+                                    state['landed'] = True
 
                 except Exception as e:
                     import traceback
