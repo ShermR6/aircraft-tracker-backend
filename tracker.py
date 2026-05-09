@@ -413,15 +413,37 @@ class CloudAircraftTracker:
                     print(f"Error tracking for user {user_id}: {e}")
                     traceback.print_exc()
 
+    TIER_CHANNELS = {
+        "starter":      ["discord", "email"],
+        "premium":      ["discord", "email", "slack", "sms", "teams"],
+        "pro":          ["discord", "email", "slack", "sms", "teams", "whatsapp"],
+        "team-starter": ["discord", "email"],
+        "team-premium": ["discord", "email", "slack", "sms", "teams"],
+        "team-pro":     ["discord", "email", "slack", "sms", "teams", "whatsapp"],
+    }
+
     async def send_notifications(self, user_id: str, notifications: List[dict]):
         """Send notifications via configured integrations"""
         db = SessionLocal()
         try:
-            # Get user's integrations
-            integrations = db.query(Integration).filter(
-                Integration.user_id == user_id,
-                Integration.enabled == True
-            ).all()
+            # Get user's tier to enforce channel restrictions
+            user = db.query(User).filter(User.id == user_id).first()
+            tier = "starter"
+            if user and user.license_id:
+                from models import License
+                lic = db.query(License).filter(License.id == user.license_id).first()
+                if lic:
+                    tier = lic.tier
+            allowed_channels = self.TIER_CHANNELS.get(tier, self.TIER_CHANNELS["starter"])
+
+            # Get user's integrations (filter by tier-allowed channels)
+            integrations = [
+                i for i in db.query(Integration).filter(
+                    Integration.user_id == user_id,
+                    Integration.enabled == True
+                ).all()
+                if i.type in allowed_channels
+            ]
 
             # Get alert settings to get custom message templates
             alert_settings = {

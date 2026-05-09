@@ -65,12 +65,12 @@ WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
 # Tier feature limits (None = unlimited)
 TIER_LIMITS = {
-    "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 2},
-    "premium":      {"aircraft": 7,    "locations": 5,    "integrations": 5},
-    "pro":          {"aircraft": 15,   "locations": None, "integrations": None},
-    "team-starter": {"aircraft": 25,   "locations": 3,    "integrations": 3},
-    "team-premium": {"aircraft": 75,   "locations": 10,   "integrations": 10},
-    "team-pro":     {"aircraft": None, "locations": None, "integrations": None},
+    "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 2,    "channels": ["discord", "email"]},
+    "premium":      {"aircraft": 7,    "locations": 5,    "integrations": 5,    "channels": ["discord", "email", "slack", "sms", "teams"]},
+    "pro":          {"aircraft": 15,   "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "sms", "teams", "whatsapp"]},
+    "team-starter": {"aircraft": 25,   "locations": 3,    "integrations": 3,    "channels": ["discord", "email"]},
+    "team-premium": {"aircraft": 75,   "locations": 10,   "integrations": 10,   "channels": ["discord", "email", "slack", "sms", "teams"]},
+    "team-pro":     {"aircraft": None, "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "sms", "teams", "whatsapp"]},
 }
 
 
@@ -706,12 +706,19 @@ async def add_aircraft(
     db: Session = Depends(get_db)
 ):
     """Add new aircraft to track"""
+    tier = get_user_tier(current_user, db)
+    limit = get_tier_limit(tier, "aircraft")
+    if limit is not None:
+        count = db.query(Aircraft).filter(Aircraft.user_id == current_user.id, Aircraft.active == True).count()
+        if count >= limit:
+            raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {limit} aircraft. Upgrade to add more.")
+
     existing = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
         Aircraft.tail_number == aircraft_data.tail_number,
         Aircraft.active == True
     ).first()
-    
+
     if existing:
         raise HTTPException(status_code=400, detail="Aircraft already exists")
     
@@ -999,7 +1006,18 @@ async def create_integration(
         Integration.user_id == current_user.id,
         Integration.type == integration_data.type
     ).first()
-    
+
+    if not existing:
+        tier = get_user_tier(current_user, db)
+        allowed_channels = TIER_LIMITS.get(tier, TIER_LIMITS["starter"])["channels"]
+        if integration_data.type not in allowed_channels:
+            raise HTTPException(status_code=403, detail=f"Your {tier} plan does not include {integration_data.type} notifications. Upgrade to unlock.")
+        limit = get_tier_limit(tier, "integrations")
+        if limit is not None:
+            count = db.query(Integration).filter(Integration.user_id == current_user.id).count()
+            if count >= limit:
+                raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {limit} integrations. Upgrade to add more.")
+
     if existing:
         existing.config = integration_data.config
         existing.enabled = integration_data.enabled
