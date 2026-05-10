@@ -142,6 +142,16 @@ class UserTracker:
                     crossed_boundary = (prev_distance > alert_distance and distance_nm <= alert_distance)
 
                     if crossed_boundary and was_beyond_boundary and alert_key not in self.distance_alerts_sent[aircraft_id]:
+                        # Approach corridor filter — skip if aircraft heading is not aligned with runway
+                        if airspace.get('approach_corridor_enabled') and airspace.get('approach_runway_heading') is not None:
+                            track = aircraft_data.get('track') or aircraft_data.get('heading')
+                            if track is not None:
+                                rwy_hdg = float(airspace['approach_runway_heading'])
+                                diff = abs((track - rwy_hdg + 180) % 360 - 180)
+                                if diff > 35:
+                                    self.distance_alerts_sent[aircraft_id].add(alert_key)  # suppress quietly
+                                    continue
+
                         # Send the distance alert
                         if self.should_notify(f'distance_{alert_distance}', aircraft_id):
                             speed_kts = aircraft_data.get('velocity')
@@ -263,7 +273,9 @@ class CloudAircraftTracker:
                 'floor_ft_agl': airport_config.floor_ft_agl,
                 'ceiling_ft_agl': airport_config.ceiling_ft_agl,
                 'query_radius_nm': airport_config.query_radius_nm,
-                'alert_distances_nm': [float(d) for d in airport_config.alert_distances_nm]
+                'alert_distances_nm': [float(d) for d in airport_config.alert_distances_nm],
+                'approach_corridor_enabled': airport_config.approach_corridor_enabled or False,
+                'approach_runway_heading': airport_config.approach_runway_heading,
             },
             'airport_code': airport_config.airport_code or '',
             'notification_cooldown_minutes': 1,

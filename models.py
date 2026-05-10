@@ -3,7 +3,7 @@ Database Models
 SQLAlchemy ORM models for PostgreSQL
 """
 
-from sqlalchemy import Column, String, Boolean, Integer, DateTime, ForeignKey, JSON, Text
+from sqlalchemy import Column, String, Boolean, Integer, Float, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
@@ -90,6 +90,11 @@ class AirportConfig(Base):
     query_radius_nm = Column(String(10), default="100.0")
     alert_distances_nm = Column(JSON, default=["10.0", "5.0", "2.0"])
     
+    # Approach corridor
+    runway_info = Column(JSON, nullable=True)          # [{ident, leHdg, heHdg, lengthFt}, ...]
+    approach_corridor_enabled = Column(Boolean, default=False)
+    approach_runway_heading = Column(Float, nullable=True)  # degrees true
+
     # Quiet hours
     quiet_hours_enabled = Column(Boolean, default=True)
     quiet_hours_start = Column(String(5), default="23:00")

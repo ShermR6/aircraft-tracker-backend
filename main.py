@@ -966,6 +966,9 @@ async def get_airport_config(
         "detection_radius_nm": config.query_radius_nm,
         "polling_interval_seconds": config.radius_nm or "10",
         "alert_distances_nm": config.alert_distances_nm,
+        "runway_info": config.runway_info,
+        "approach_corridor_enabled": config.approach_corridor_enabled,
+        "approach_runway_heading": config.approach_runway_heading,
         "quiet_hours_enabled": config.quiet_hours_enabled,
         "quiet_hours_start": config.quiet_hours_start,
         "quiet_hours_end": config.quiet_hours_end,
@@ -1015,17 +1018,28 @@ async def save_airport_config(
         config.quiet_hours_end = config_data.get("quiet_hours_end", config.quiet_hours_end)
         if "alert_distances_nm" in config_data:
             config.alert_distances_nm = [str(d) for d in config_data["alert_distances_nm"]]
+        if "runway_info" in config_data:
+            config.runway_info = config_data["runway_info"]
+        if "approach_corridor_enabled" in config_data:
+            config.approach_corridor_enabled = config_data["approach_corridor_enabled"]
+        if "approach_runway_heading" in config_data:
+            config.approach_runway_heading = config_data["approach_runway_heading"]
+        config.airport_name = config_data.get("airport_name", config.airport_name)
         config.updated_at = datetime.utcnow()
     else:
         config = AirportConfig(
             user_id=current_user.id,
             airport_code=config_data.get("airport_code", "KDTO"),
+            airport_name=config_data.get("airport_name", ""),
             latitude=str(config_data.get("latitude", "33.2001")),
             longitude=str(config_data.get("longitude", "-97.1998")),
             elevation_ft_msl=elevation or config_data.get("elevation_ft_msl", 0),
             query_radius_nm=str(config_data.get("detection_radius_nm", "100.0")),
             radius_nm=str(config_data.get("polling_interval_seconds", "10")),
             alert_distances_nm=[str(d) for d in config_data.get("alert_distances_nm", [10.0, 5.0, 2.0])],
+            runway_info=config_data.get("runway_info", []),
+            approach_corridor_enabled=config_data.get("approach_corridor_enabled", False),
+            approach_runway_heading=config_data.get("approach_runway_heading"),
             quiet_hours_enabled=config_data.get("quiet_hours_enabled", False),
             quiet_hours_start=config_data.get("quiet_hours_start", "23:00"),
             quiet_hours_end=config_data.get("quiet_hours_end", "06:00"),
