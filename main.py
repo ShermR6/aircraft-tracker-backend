@@ -17,7 +17,16 @@ import os
 import httpx
 import secrets
 import string
+import logging
+import uuid
 from typing import List, Optional
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("finalpingapp")
 
 from database import get_db, engine, Base, SessionLocal
 from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation
@@ -121,7 +130,7 @@ async def sync_license_to_website(license_key: str, activated_at: datetime, expi
                 timeout=5.0
             )
     except Exception as e:
-        print(f"Website license sync failed (non-critical): {e}")
+        logger.warning("Website license sync failed (non-critical): %s", e)
 
 # Global tracker instance (runs 24/7)
 tracker = CloudAircraftTracker()
@@ -263,7 +272,7 @@ async def login(
         db.add(user)
         db.commit()
         db.refresh(user)
-        print(f"Auto-created free account for {email}")
+        logger.info("Auto-created free account for %s", email)
 
     # Step 3 — Get license info (may not exist for free accounts)
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
@@ -368,7 +377,7 @@ async def ground_ingest(
             if success:
                 alerts_sent += 1
         except Exception as e:
-            print(f"Ground ingest send error: {e}")
+            logger.error("Ground ingest send error: %s", e)
 
     db.commit()
 
@@ -493,18 +502,18 @@ async def activate_license(
                             },
                         )
                         sub_data = r.json()
-                    print(f"Stripe sub keys: {list(sub_data.keys())}")
+                    logger.debug("Stripe sub keys: %s", list(sub_data.keys()))
                     period_end = sub_data.get("current_period_end")
-                    print(f"Stripe raw period_end: {period_end}")
+                    logger.debug("Stripe raw period_end: %s", period_end)
                     if period_end and period_end > datetime.utcnow().timestamp():
                         license.expires_at = datetime.utcfromtimestamp(period_end)
                         db.commit()
                         db.refresh(license)
-                        print(f"expires_at set to {license.expires_at} from Stripe")
+                        logger.info("expires_at set to %s from Stripe", license.expires_at)
                     else:
-                        print(f"Stripe period_end unusable ({period_end}), keeping +30 days fallback")
+                        logger.warning("Stripe period_end unusable (%s), keeping +30 days fallback", period_end)
             except Exception as e:
-                print(f"Stripe error during activation: {e}")
+                logger.error("Stripe error during activation: %s", e)
     elif not license.expires_at:
         # Already activated but expires_at is missing — set it from activated_at
         license.expires_at = license.activated_at + timedelta(days=LICENSE_DURATION_DAYS)
@@ -684,7 +693,7 @@ async def renew_license(
     license.status = "active"
     db.commit()
 
-    print(f"License renewed: {license_key} until {expires_at_str}")
+    logger.info("License renewed: %s until %s", license_key, expires_at_str)
     return {"message": "License renewed", "license_key": license_key, "expires_at": expires_at_str}
 
 
@@ -918,9 +927,9 @@ async def save_airport_config(
             if resp.status_code == 200:
                 elev_meters = resp.json().get("elevation", [0])[0]
                 elevation = int(elev_meters * 3.28084)  # convert meters to feet
-                print(f"✅ Auto-detected elevation: {elevation}ft MSL for {lat},{lon}")
+                logger.info("Auto-detected elevation: %dft MSL for %s,%s", elevation, lat, lon)
         except Exception as e:
-            print(f"Failed to auto-detect elevation: {e}")
+            logger.warning("Failed to auto-detect elevation: %s", e)
             elevation = config_data.get("elevation_ft_msl", 0)
 
     config = db.query(AirportConfig).filter(
@@ -976,13 +985,13 @@ async def save_airport_config(
                     db.delete(setting)
             db.commit()
         except Exception as e:
-            print(f"Failed to clean up orphaned alert settings: {e}")
+            logger.warning("Failed to clean up orphaned alert settings: %s", e)
 
     # Reload the user's tracker so it picks up new distances immediately
     try:
         await tracker.update_user_aircraft(str(current_user.id), db)
     except Exception as e:
-        print(f"Failed to reload tracker after config update: {e}")
+        logger.error("Failed to reload tracker after config update: %s", e)
 
     return {"message": "Configuration saved successfully", "id": str(config.id)}
 
@@ -1606,7 +1615,7 @@ async def expire_license(
         if user:
             tracker.remove_user(str(user.id))
     except Exception as e:
-        print(f"Failed to stop tracker for expired license {license_key}: {e}")
+        logger.error("Failed to stop tracker for expired license %s: %s", license_key, e)
 
     return {"message": "License expired", "license_key": license_key}
 
@@ -1699,7 +1708,7 @@ async def generate_license(
                 timeout=10.0
             )
     except Exception as e:
-        print(f"Website provision failed (non-critical): {e}")
+        logger.warning("Website provision failed (non-critical): %s", e)
 
     return {
         "license_key": license_key,
@@ -1804,8 +1813,8 @@ async def root():
 @app.on_event("startup")
 async def startup_event():
     """Start the global aircraft tracker on startup"""
-    print("🚀 Starting FinalPing Cloud Backend...")
-    print("📡 Initializing global aircraft tracker...")
+    logger.info("Starting FinalPing Cloud Backend...")
+    logger.info("Initializing global aircraft tracker...")
     await tracker.start()
 
     # Load all existing users into the tracker
@@ -1820,26 +1829,26 @@ async def startup_event():
         db.execute(text("UPDATE notification_logs SET alert_type = '15nm' WHERE alert_type = '15.0nm'"))
         db.execute(text("DELETE FROM alert_settings WHERE alert_type IN ('2.0nm', '5.0nm', '10.0nm', '15.0nm')"))
         db.commit()
-        print("✅ Cleaned up duplicate alert types")
+        logger.info("Cleaned up duplicate alert types")
 
         users = db.query(User).all()
         for user in users:
             try:
                 await tracker.update_user_aircraft(str(user.id), db)
             except Exception as e:
-                print(f"Failed to load tracker for user {user.id}: {e}")
-        print(f"✅ Loaded {len(users)} users into tracker")
+                logger.error("Failed to load tracker for user %s: %s", user.id, e)
+        logger.info("Loaded %d users into tracker", len(users))
     except Exception as e:
-        print(f"Error loading users on startup: {e}")
+        logger.error("Error loading users on startup: %s", e)
     finally:
         db.close()
 
-    print("✅ FinalPing Cloud Backend ready!")
+    logger.info("FinalPing Cloud Backend ready!")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    print("🛑 Shutting down FinalPing Cloud Backend...")
+    logger.info("Shutting down FinalPing Cloud Backend...")
     await tracker.stop()
-    print("✅ Shutdown complete")
+    logger.info("Shutdown complete")
