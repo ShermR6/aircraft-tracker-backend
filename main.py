@@ -1902,16 +1902,35 @@ async def startup_event():
     # Load all existing users into the tracker
     db = SessionLocal()
     try:
-        # One-time cleanup: normalize duplicate alert types (remove after deploy)
         from sqlalchemy import text
-        db.execute(text("ALTER TABLE licenses ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255)"))
+
+        # Schema migrations — ADD COLUMN IF NOT EXISTS is idempotent on PostgreSQL
+        migrations = [
+            # Licenses
+            "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255)",
+            # Aircraft — added v1.0.6
+            "ALTER TABLE aircraft ADD COLUMN IF NOT EXISTS aircraft_type VARCHAR(100)",
+            "ALTER TABLE aircraft ADD COLUMN IF NOT EXISTS alert_distances JSON",
+            # AirportConfig — added v1.0.6
+            "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS runway_info JSON",
+            "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_corridor_enabled BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_runway_heading FLOAT",
+        ]
+        for sql in migrations:
+            try:
+                db.execute(text(sql))
+            except Exception as mig_err:
+                logger.warning("Migration skipped (%s): %s", sql[:60], mig_err)
+        db.commit()
+
+        # Normalize legacy alert type labels
         db.execute(text("UPDATE notification_logs SET alert_type = '2nm' WHERE alert_type = '2.0nm'"))
         db.execute(text("UPDATE notification_logs SET alert_type = '5nm' WHERE alert_type = '5.0nm'"))
         db.execute(text("UPDATE notification_logs SET alert_type = '10nm' WHERE alert_type = '10.0nm'"))
         db.execute(text("UPDATE notification_logs SET alert_type = '15nm' WHERE alert_type = '15.0nm'"))
         db.execute(text("DELETE FROM alert_settings WHERE alert_type IN ('2.0nm', '5.0nm', '10.0nm', '15.0nm')"))
         db.commit()
-        logger.info("Cleaned up duplicate alert types")
+        logger.info("Schema migrations complete")
 
         users = db.query(User).all()
         for user in users:
