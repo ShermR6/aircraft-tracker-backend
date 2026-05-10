@@ -1075,6 +1075,24 @@ async def save_airport_config(
 
     return {"message": "Configuration saved successfully", "id": str(config.id)}
 
+
+@app.delete("/api/airport/config")
+async def delete_airport_config(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete airport configuration for current user"""
+    config = db.query(AirportConfig).filter(
+        AirportConfig.user_id == current_user.id
+    ).first()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No airport configuration found")
+
+    db.delete(config)
+    db.commit()
+    return {"message": "Airport configuration deleted"}
+
 # ============================================================================
 # INTEGRATIONS (Discord, Slack, etc.)
 # ============================================================================
