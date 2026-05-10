@@ -197,7 +197,9 @@ async def get_current_user(
 
 
 @app.post("/api/auth/refresh")
+@limiter.limit("20/minute")
 async def refresh_token(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ):
@@ -451,7 +453,9 @@ async def grant_ground_station(
 
 
 @app.post("/api/activate", response_model=TokenResponse)
+@limiter.limit("10/minute")
 async def activate_license(
+    request: Request,
     activation: LicenseActivation,
     db: Session = Depends(get_db)
 ):
@@ -1083,8 +1087,10 @@ async def create_integration(
 
 
 @app.post("/api/integrations/{integration_id}/test")
+@limiter.limit("5/minute")
 async def test_integration(
     integration_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
