@@ -536,6 +536,12 @@ class CloudAircraftTracker:
                 return await self.send_sms(integration.config, message)
             elif integration.type == 'whatsapp':
                 return await self.send_whatsapp(integration.config, message)
+            elif integration.type == 'google_chat':
+                return await self.send_google_chat(integration.config, message)
+            elif integration.type == 'telegram':
+                return await self.send_telegram(integration.config, message)
+            elif integration.type == 'webhook':
+                return await self.send_webhook(integration.config, message)
             else:
                 return False
         except Exception as e:
@@ -716,6 +722,53 @@ class CloudAircraftTracker:
                     error = await response.text()
                     print(f"Twilio WhatsApp error: {error}")
                     return False
+
+    async def send_google_chat(self, config: dict, message: str) -> bool:
+        """Send Google Chat webhook"""
+        webhook_url = config.get('webhook_url')
+        if not webhook_url:
+            return False
+        plain = message.replace('**', '*')
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                webhook_url,
+                json={'text': plain},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                return response.status == 200
+
+    async def send_telegram(self, config: dict, message: str) -> bool:
+        """Send Telegram message via Bot API"""
+        bot_token = config.get('bot_token')
+        chat_id = config.get('chat_id')
+        if not bot_token or not chat_id:
+            return False
+        plain = message.replace('**', '')
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f'https://api.telegram.org/bot{bot_token}/sendMessage',
+                json={'chat_id': chat_id, 'text': plain},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                return response.status == 200
+
+    async def send_webhook(self, config: dict, message: str) -> bool:
+        """Send generic webhook POST"""
+        url = config.get('url')
+        if not url:
+            return False
+        headers = {'Content-Type': 'application/json'}
+        secret = config.get('secret')
+        if secret:
+            headers['X-FinalPing-Secret'] = secret
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json={'message': message, 'source': 'finalpingapp'},
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                return 200 <= response.status < 300
 
     async def send_test_notification(self, integration: Integration) -> bool:
         """Send test notification"""

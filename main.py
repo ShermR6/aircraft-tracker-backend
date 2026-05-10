@@ -101,11 +101,11 @@ WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 # Tier feature limits (None = unlimited)
 TIER_LIMITS = {
     "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 2,    "channels": ["discord", "email"]},
-    "premium":      {"aircraft": 7,    "locations": 5,    "integrations": 4,    "channels": ["discord", "email", "slack", "teams"]},
-    "pro":          {"aircraft": 15,   "locations": None, "integrations": 5,    "channels": ["discord", "email", "slack", "teams", "sms"]},
+    "premium":      {"aircraft": 7,    "locations": 5,    "integrations": 4,    "channels": ["discord", "email", "slack", "teams", "google_chat"]},
+    "pro":          {"aircraft": 15,   "locations": None, "integrations": 5,    "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
     "team-starter": {"aircraft": 25,   "locations": 3,    "integrations": 3,    "channels": ["discord", "email"]},
-    "team-premium": {"aircraft": 75,   "locations": 10,   "integrations": 10,   "channels": ["discord", "email", "slack", "teams", "sms"]},
-    "team-pro":     {"aircraft": None, "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "sms"]},
+    "team-premium": {"aircraft": 75,   "locations": 10,   "integrations": 10,   "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
+    "team-pro":     {"aircraft": None, "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
 }
 
 
