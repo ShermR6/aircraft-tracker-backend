@@ -28,6 +28,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("finalpingapp")
 
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
+
+sentry_sdk.init(
+    dsn="https://671a1631ac770069f122a26298e33a6c@o4511365849874432.ingest.us.sentry.io/4511365869928448",
+    integrations=[FastApiIntegration(), SqlalchemyIntegration()],
+    traces_sample_rate=0.2,
+    send_default_pii=False,
+)
+
 from database import get_db, engine, Base, SessionLocal
 from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation
 from schemas import (
