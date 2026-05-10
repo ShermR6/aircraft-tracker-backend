@@ -22,6 +22,7 @@ class UserTracker:
         self.user_id = user_id
         self.config = config
         self.aircraft_to_track = {a['icao24']: a['tail_number'] for a in aircraft_list if a.get('icao24')}
+        self.aircraft_alert_distances = {a['icao24']: a.get('alert_distances') for a in aircraft_list if a.get('icao24')}
 
         # State tracking
         self.aircraft_state = {}
@@ -110,7 +111,11 @@ class UserTracker:
 
         # Distance alerts (approaching only) - SEQUENTIAL ZONE CROSSING
         if not on_ground:
-            alert_distances = sorted(self.config['airspace'].get('alert_distances_nm', [10.0, 5.0, 2.0]), reverse=True)
+            per_aircraft = self.aircraft_alert_distances.get(aircraft_id)
+            alert_distances = sorted(
+                per_aircraft if per_aircraft else self.config['airspace'].get('alert_distances_nm', [10.0, 5.0, 2.0]),
+                reverse=True
+            )
 
             if aircraft_id not in self.distance_alerts_sent:
                 self.distance_alerts_sent[aircraft_id] = set()
@@ -273,7 +278,8 @@ class CloudAircraftTracker:
             {
                 'tail_number': a.tail_number,
                 'icao24': a.icao24,
-                'friendly_name': a.friendly_name
+                'friendly_name': a.friendly_name,
+                'alert_distances': [float(d) for d in a.alert_distances] if a.alert_distances else None
             }
             for a in aircraft
         ]

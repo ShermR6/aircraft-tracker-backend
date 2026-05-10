@@ -44,7 +44,7 @@ from models import User, License, Aircraft, AlertSetting, Integration, AirportCo
 from schemas import (
     LicenseActivation, LicenseResponse,
     UserLogin, UserResponse, TokenResponse,
-    AircraftCreate, AircraftResponse,
+    AircraftCreate, AircraftUpdate, AircraftResponse,
     AlertSettingCreate, AlertSettingResponse,
     IntegrationCreate, IntegrationResponse,
     LiveAircraftResponse
@@ -733,6 +733,8 @@ async def get_aircraft(
             tail_number=a.tail_number,
             icao24=a.icao24,
             friendly_name=a.friendly_name,
+            aircraft_type=a.aircraft_type,
+            alert_distances=a.alert_distances,
             active=a.active,
             created_at=a.created_at
         )
@@ -762,27 +764,76 @@ async def add_aircraft(
 
     if existing:
         raise HTTPException(status_code=400, detail="Aircraft already exists")
-    
+
     aircraft = Aircraft(
         user_id=current_user.id,
         tail_number=aircraft_data.tail_number,
         icao24=aircraft_data.icao24,
         friendly_name=aircraft_data.friendly_name,
+        aircraft_type=aircraft_data.aircraft_type,
+        alert_distances=aircraft_data.alert_distances,
         active=True,
         created_at=datetime.utcnow()
     )
-    
+
     db.add(aircraft)
     db.commit()
     db.refresh(aircraft)
-    
+
     await tracker.update_user_aircraft(str(current_user.id), db)
-    
+
     return AircraftResponse(
         id=str(aircraft.id),
         tail_number=aircraft.tail_number,
         icao24=aircraft.icao24,
         friendly_name=aircraft.friendly_name,
+        aircraft_type=aircraft.aircraft_type,
+        alert_distances=aircraft.alert_distances,
+        active=aircraft.active,
+        created_at=aircraft.created_at
+    )
+
+
+@app.put("/api/aircraft/{aircraft_id}", response_model=AircraftResponse)
+async def update_aircraft(
+    aircraft_id: str,
+    aircraft_data: AircraftUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Update an existing aircraft"""
+    aircraft = db.query(Aircraft).filter(
+        Aircraft.id == aircraft_id,
+        Aircraft.user_id == current_user.id,
+        Aircraft.active == True
+    ).first()
+
+    if not aircraft:
+        raise HTTPException(status_code=404, detail="Aircraft not found")
+
+    if aircraft_data.tail_number is not None:
+        aircraft.tail_number = aircraft_data.tail_number
+    if aircraft_data.icao24 is not None:
+        aircraft.icao24 = aircraft_data.icao24
+    if aircraft_data.friendly_name is not None:
+        aircraft.friendly_name = aircraft_data.friendly_name
+    if aircraft_data.aircraft_type is not None:
+        aircraft.aircraft_type = aircraft_data.aircraft_type
+    if aircraft_data.alert_distances is not None:
+        aircraft.alert_distances = aircraft_data.alert_distances
+
+    db.commit()
+    db.refresh(aircraft)
+
+    await tracker.update_user_aircraft(str(current_user.id), db)
+
+    return AircraftResponse(
+        id=str(aircraft.id),
+        tail_number=aircraft.tail_number,
+        icao24=aircraft.icao24,
+        friendly_name=aircraft.friendly_name,
+        aircraft_type=aircraft.aircraft_type,
+        alert_distances=aircraft.alert_distances,
         active=aircraft.active,
         created_at=aircraft.created_at
     )

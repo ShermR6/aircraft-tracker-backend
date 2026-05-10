@@ -63,6 +63,17 @@ class AircraftCreate(BaseModel):
     tail_number: str = Field(..., min_length=3, max_length=10)
     icao24: Optional[str] = Field(None, min_length=6, max_length=6)
     friendly_name: Optional[str] = None
+    aircraft_type: Optional[str] = None
+    alert_distances: Optional[List[float]] = None
+
+
+class AircraftUpdate(BaseModel):
+    """Update aircraft request"""
+    tail_number: Optional[str] = Field(None, min_length=3, max_length=10)
+    icao24: Optional[str] = Field(None, min_length=6, max_length=6)
+    friendly_name: Optional[str] = None
+    aircraft_type: Optional[str] = None
+    alert_distances: Optional[List[float]] = None
 
 
 class AircraftResponse(BaseModel):
@@ -71,9 +82,11 @@ class AircraftResponse(BaseModel):
     tail_number: str
     icao24: Optional[str]
     friendly_name: Optional[str]
+    aircraft_type: Optional[str] = None
+    alert_distances: Optional[List[float]] = None
     active: bool
     created_at: datetime
-    
+
     class Config:
         from_attributes = True
 

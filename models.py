@@ -58,6 +58,8 @@ class Aircraft(Base):
     tail_number = Column(String(10), nullable=False)
     icao24 = Column(String(10), nullable=True)
     friendly_name = Column(String(100), nullable=True)
+    aircraft_type = Column(String(100), nullable=True)
+    alert_distances = Column(JSON, nullable=True)
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
