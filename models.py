@@ -179,6 +179,9 @@ class Team(Base):
 
     members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
     channels = relationship("TeamChannel", back_populates="team", cascade="all, delete-orphan")
+    aircraft = relationship("TeamAircraft", back_populates="team", cascade="all, delete-orphan")
+    airport_config = relationship("TeamAirportConfig", back_populates="team", uselist=False, cascade="all, delete-orphan")
+    alert_settings = relationship("TeamAlertSetting", back_populates="team", cascade="all, delete-orphan")
 
 
 class TeamMember(Base):
@@ -208,3 +211,62 @@ class TeamChannel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     team = relationship("Team", back_populates="channels")
+
+
+class TeamAircraft(Base):
+    """Aircraft tracked by a team (separate from personal user aircraft)"""
+    __tablename__ = "team_aircraft"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    tail_number = Column(String(10), nullable=False)
+    icao24 = Column(String(10), nullable=True)
+    friendly_name = Column(String(100), nullable=True)
+    aircraft_type = Column(String(100), nullable=True)
+    alert_distances = Column(JSON, nullable=True)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team", back_populates="aircraft")
+
+
+class TeamAirportConfig(Base):
+    """Airport/location config for a team (separate from personal user config)"""
+    __tablename__ = "team_airport_configs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False, unique=True)
+    airport_code = Column(String(10), nullable=True)
+    airport_name = Column(String(255), nullable=True)
+    latitude = Column(String(20), nullable=False)
+    longitude = Column(String(20), nullable=False)
+    elevation_ft_msl = Column(Integer, nullable=False)
+    radius_nm = Column(String(10), default="4.0")
+    floor_ft_agl = Column(Integer, default=0)
+    ceiling_ft_agl = Column(Integer, default=2500)
+    query_radius_nm = Column(String(10), default="100.0")
+    alert_distances_nm = Column(JSON, default=["10.0", "5.0", "2.0"])
+    runway_info = Column(JSON, nullable=True)
+    approach_corridor_enabled = Column(Boolean, default=False)
+    approach_runway_heading = Column(Float, nullable=True)
+    quiet_hours_enabled = Column(Boolean, default=True)
+    quiet_hours_start = Column(String(5), default="23:00")
+    quiet_hours_end = Column(String(5), default="06:00")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    team = relationship("Team", back_populates="airport_config")
+
+
+class TeamAlertSetting(Base):
+    """Alert setting for a team (separate from personal user alert settings)"""
+    __tablename__ = "team_alert_settings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    alert_type = Column(String(50), nullable=False)
+    enabled = Column(Boolean, default=True)
+    message_template = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team", back_populates="alert_settings")

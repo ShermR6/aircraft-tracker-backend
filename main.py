@@ -40,7 +40,7 @@ sentry_sdk.init(
 )
 
 from database import get_db, engine, Base, SessionLocal
-from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation, Team, TeamMember, TeamChannel
+from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation, Team, TeamMember, TeamChannel, TeamAircraft, TeamAirportConfig, TeamAlertSetting
 from schemas import (
     LicenseActivation, LicenseResponse,
     UserLogin, UserResponse, TokenResponse,
@@ -2242,6 +2242,320 @@ async def get_team_activity(
         }
         for l in logs
     ]
+
+
+# ============================================================================
+# TEAM-SCOPED AIRCRAFT (isolated from personal user aircraft)
+# ============================================================================
+
+@app.get("/api/teams/aircraft", response_model=List[AircraftResponse])
+async def get_team_aircraft(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    aircraft = db.query(TeamAircraft).filter(
+        TeamAircraft.team_id == team.id,
+        TeamAircraft.active == True
+    ).all()
+    return [
+        AircraftResponse(
+            id=str(a.id), tail_number=a.tail_number, icao24=a.icao24,
+            friendly_name=a.friendly_name, aircraft_type=a.aircraft_type,
+            alert_distances=a.alert_distances, active=a.active, created_at=a.created_at
+        )
+        for a in aircraft
+    ]
+
+
+@app.post("/api/teams/aircraft", response_model=AircraftResponse, status_code=201)
+async def add_team_aircraft(
+    aircraft_data: AircraftCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    tier = get_user_tier(current_user, db)
+    limit = get_tier_limit(tier, "aircraft")
+    if limit is not None:
+        count = db.query(TeamAircraft).filter(TeamAircraft.team_id == team.id, TeamAircraft.active == True).count()
+        if count >= limit:
+            raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {limit} aircraft.")
+    existing = db.query(TeamAircraft).filter(
+        TeamAircraft.team_id == team.id,
+        TeamAircraft.tail_number == aircraft_data.tail_number,
+        TeamAircraft.active == True
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Aircraft already exists")
+    aircraft = TeamAircraft(
+        team_id=team.id,
+        tail_number=aircraft_data.tail_number,
+        icao24=aircraft_data.icao24,
+        friendly_name=aircraft_data.friendly_name,
+        aircraft_type=aircraft_data.aircraft_type,
+        alert_distances=aircraft_data.alert_distances,
+        active=True,
+        created_at=datetime.utcnow()
+    )
+    db.add(aircraft)
+    db.commit()
+    db.refresh(aircraft)
+    return AircraftResponse(
+        id=str(aircraft.id), tail_number=aircraft.tail_number, icao24=aircraft.icao24,
+        friendly_name=aircraft.friendly_name, aircraft_type=aircraft.aircraft_type,
+        alert_distances=aircraft.alert_distances, active=aircraft.active, created_at=aircraft.created_at
+    )
+
+
+@app.put("/api/teams/aircraft/{aircraft_id}", response_model=AircraftResponse)
+async def update_team_aircraft(
+    aircraft_id: str,
+    aircraft_data: AircraftUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    aircraft = db.query(TeamAircraft).filter(
+        TeamAircraft.id == aircraft_id,
+        TeamAircraft.team_id == team.id,
+        TeamAircraft.active == True
+    ).first()
+    if not aircraft:
+        raise HTTPException(status_code=404, detail="Aircraft not found")
+    if aircraft_data.tail_number is not None:
+        aircraft.tail_number = aircraft_data.tail_number
+    if aircraft_data.icao24 is not None:
+        aircraft.icao24 = aircraft_data.icao24
+    if aircraft_data.friendly_name is not None:
+        aircraft.friendly_name = aircraft_data.friendly_name
+    if aircraft_data.aircraft_type is not None:
+        aircraft.aircraft_type = aircraft_data.aircraft_type
+    if aircraft_data.alert_distances is not None:
+        aircraft.alert_distances = aircraft_data.alert_distances
+    db.commit()
+    db.refresh(aircraft)
+    return AircraftResponse(
+        id=str(aircraft.id), tail_number=aircraft.tail_number, icao24=aircraft.icao24,
+        friendly_name=aircraft.friendly_name, aircraft_type=aircraft.aircraft_type,
+        alert_distances=aircraft.alert_distances, active=aircraft.active, created_at=aircraft.created_at
+    )
+
+
+@app.delete("/api/teams/aircraft/{aircraft_id}")
+async def delete_team_aircraft(
+    aircraft_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    aircraft = db.query(TeamAircraft).filter(
+        TeamAircraft.id == aircraft_id,
+        TeamAircraft.team_id == team.id
+    ).first()
+    if not aircraft:
+        raise HTTPException(status_code=404, detail="Aircraft not found")
+    db.delete(aircraft)
+    db.commit()
+    return {"message": "Aircraft deleted"}
+
+
+@app.get("/api/teams/aircraft/live", response_model=List[LiveAircraftResponse])
+async def get_team_live_aircraft(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    aircraft_data = await tracker.get_live_aircraft(f"team:{team.id}")
+    return aircraft_data
+
+
+# ============================================================================
+# TEAM-SCOPED AIRPORT CONFIG (isolated from personal user airport config)
+# ============================================================================
+
+@app.get("/api/teams/airport/config")
+async def get_team_airport_config(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    config = db.query(TeamAirportConfig).filter(TeamAirportConfig.team_id == team.id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="No airport configuration found")
+    return {
+        "id": str(config.id),
+        "airport_code": config.airport_code,
+        "airport_name": config.airport_name,
+        "latitude": config.latitude,
+        "longitude": config.longitude,
+        "elevation_ft_msl": config.elevation_ft_msl,
+        "radius_nm": config.radius_nm,
+        "floor_ft_agl": config.floor_ft_agl,
+        "ceiling_ft_agl": config.ceiling_ft_agl,
+        "query_radius_nm": config.query_radius_nm,
+        "detection_radius_nm": config.query_radius_nm,
+        "polling_interval_seconds": config.radius_nm or "10",
+        "alert_distances_nm": config.alert_distances_nm,
+        "runway_info": config.runway_info,
+        "approach_corridor_enabled": config.approach_corridor_enabled,
+        "approach_runway_heading": config.approach_runway_heading,
+        "quiet_hours_enabled": config.quiet_hours_enabled,
+        "quiet_hours_start": config.quiet_hours_start,
+        "quiet_hours_end": config.quiet_hours_end,
+        "created_at": config.created_at,
+        "updated_at": config.updated_at,
+    }
+
+
+@app.post("/api/teams/airport/config")
+async def save_team_airport_config(
+    config_data: dict,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    lat = config_data.get("latitude")
+    lon = config_data.get("longitude")
+    elevation = config_data.get("elevation_ft_msl")
+    if lat and lon and (not elevation or elevation == 0):
+        try:
+            import httpx
+            resp = httpx.get(f"https://api.open-meteo.com/v1/elevation?latitude={lat}&longitude={lon}", timeout=5)
+            if resp.status_code == 200:
+                elev_meters = resp.json().get("elevation", [0])[0]
+                elevation = int(elev_meters * 3.28084)
+        except Exception as e:
+            logger.warning("Failed to auto-detect elevation for team config: %s", e)
+            elevation = config_data.get("elevation_ft_msl", 0)
+    config = db.query(TeamAirportConfig).filter(TeamAirportConfig.team_id == team.id).first()
+    if config:
+        config.airport_code = config_data.get("airport_code", config.airport_code)
+        config.airport_name = config_data.get("airport_name", config.airport_name)
+        config.latitude = str(config_data.get("latitude", config.latitude))
+        config.longitude = str(config_data.get("longitude", config.longitude))
+        if elevation:
+            config.elevation_ft_msl = elevation
+        config.query_radius_nm = str(config_data.get("detection_radius_nm", config.query_radius_nm))
+        config.radius_nm = str(config_data.get("polling_interval_seconds", config.radius_nm))
+        config.quiet_hours_enabled = config_data.get("quiet_hours_enabled", config.quiet_hours_enabled)
+        config.quiet_hours_start = config_data.get("quiet_hours_start", config.quiet_hours_start)
+        config.quiet_hours_end = config_data.get("quiet_hours_end", config.quiet_hours_end)
+        if "alert_distances_nm" in config_data:
+            config.alert_distances_nm = [str(d) for d in config_data["alert_distances_nm"]]
+        if "runway_info" in config_data:
+            config.runway_info = config_data["runway_info"]
+        if "approach_corridor_enabled" in config_data:
+            config.approach_corridor_enabled = config_data["approach_corridor_enabled"]
+        if "approach_runway_heading" in config_data:
+            config.approach_runway_heading = config_data["approach_runway_heading"]
+        config.updated_at = datetime.utcnow()
+    else:
+        config = TeamAirportConfig(
+            team_id=team.id,
+            airport_code=config_data.get("airport_code", ""),
+            airport_name=config_data.get("airport_name", ""),
+            latitude=str(config_data.get("latitude", "0")),
+            longitude=str(config_data.get("longitude", "0")),
+            elevation_ft_msl=elevation or config_data.get("elevation_ft_msl", 0),
+            query_radius_nm=str(config_data.get("detection_radius_nm", "100.0")),
+            radius_nm=str(config_data.get("polling_interval_seconds", "10")),
+            alert_distances_nm=[str(d) for d in config_data.get("alert_distances_nm", [10.0, 5.0, 2.0])],
+            runway_info=config_data.get("runway_info", []),
+            approach_corridor_enabled=config_data.get("approach_corridor_enabled", False),
+            approach_runway_heading=config_data.get("approach_runway_heading"),
+            quiet_hours_enabled=config_data.get("quiet_hours_enabled", False),
+            quiet_hours_start=config_data.get("quiet_hours_start", "23:00"),
+            quiet_hours_end=config_data.get("quiet_hours_end", "06:00"),
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(config)
+    db.commit()
+    db.refresh(config)
+
+    # Clean up team alert settings for distances that were removed
+    if "alert_distances_nm" in config_data:
+        try:
+            valid_types = {f"{int(float(d))}nm" if float(d) == int(float(d)) else f"{float(d)}nm"
+                          for d in config_data["alert_distances_nm"]}
+            valid_types.add("landing")
+            for setting in list(team.alert_settings):
+                if setting.alert_type not in valid_types:
+                    db.delete(setting)
+            db.commit()
+        except Exception as e:
+            logger.warning("Failed to clean up orphaned team alert settings: %s", e)
+
+    return {"message": "Configuration saved successfully", "id": str(config.id)}
+
+
+@app.delete("/api/teams/airport/config")
+async def delete_team_airport_config(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    config = db.query(TeamAirportConfig).filter(TeamAirportConfig.team_id == team.id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="No airport configuration found")
+    db.delete(config)
+    db.commit()
+    return {"message": "Airport configuration deleted"}
+
+
+# ============================================================================
+# TEAM-SCOPED ALERT SETTINGS (isolated from personal user alert settings)
+# ============================================================================
+
+@app.get("/api/teams/alert-settings", response_model=List[AlertSettingResponse])
+async def get_team_alert_settings(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    settings = db.query(TeamAlertSetting).filter(TeamAlertSetting.team_id == team.id).all()
+    return [
+        AlertSettingResponse(
+            id=str(s.id), alert_type=s.alert_type, enabled=s.enabled,
+            message_template=s.message_template, created_at=s.created_at
+        )
+        for s in settings
+    ]
+
+
+@app.post("/api/teams/alert-settings", response_model=AlertSettingResponse)
+async def save_team_alert_setting(
+    setting_data: AlertSettingCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    existing = db.query(TeamAlertSetting).filter(
+        TeamAlertSetting.team_id == team.id,
+        TeamAlertSetting.alert_type == setting_data.alert_type
+    ).first()
+    if existing:
+        existing.enabled = setting_data.enabled
+        existing.message_template = setting_data.message_template
+        db.commit()
+        db.refresh(existing)
+        setting = existing
+    else:
+        setting = TeamAlertSetting(
+            team_id=team.id,
+            alert_type=setting_data.alert_type,
+            enabled=setting_data.enabled,
+            message_template=setting_data.message_template,
+            created_at=datetime.utcnow()
+        )
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+    return AlertSettingResponse(
+        id=str(setting.id), alert_type=setting.alert_type, enabled=setting.enabled,
+        message_template=setting.message_template, created_at=setting.created_at
+    )
 
 
 @app.on_event("shutdown")
