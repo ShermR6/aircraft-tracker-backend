@@ -40,14 +40,16 @@ sentry_sdk.init(
 )
 
 from database import get_db, engine, Base, SessionLocal
-from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation
+from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation, Team, TeamMember, TeamChannel
 from schemas import (
     LicenseActivation, LicenseResponse,
     UserLogin, UserResponse, TokenResponse,
     AircraftCreate, AircraftUpdate, AircraftResponse,
     AlertSettingCreate, AlertSettingResponse,
     IntegrationCreate, IntegrationResponse,
-    LiveAircraftResponse
+    LiveAircraftResponse,
+    TeamChannelCreate, TeamChannelResponse, TeamMemberResponse,
+    TeamResponse, TeamRoutingUpdate, TeamInviteRequest, TeamActivityResponse
 )
 from tracker import CloudAircraftTracker
 
@@ -577,9 +579,28 @@ async def activate_license(
         db.commit()
         db.refresh(user)
     
+    # For team tiers: create or join the team linked to this license
+    if license.tier.startswith("team-"):
+        team = db.query(Team).filter(Team.license_id == license.id).first()
+        if not team:
+            team = Team(license_id=license.id)
+            db.add(team)
+            db.commit()
+            db.refresh(team)
+            db.add(TeamMember(team_id=team.id, user_id=user.id, role="owner"))
+            db.commit()
+        else:
+            existing = db.query(TeamMember).filter(
+                TeamMember.team_id == team.id,
+                TeamMember.user_id == user.id
+            ).first()
+            if not existing:
+                db.add(TeamMember(team_id=team.id, user_id=user.id, role="member"))
+                db.commit()
+
     # Create access token
     access_token = create_access_token(str(user.id))
-    
+
     return TokenResponse(
         access_token=access_token,
         token_type="bearer",
@@ -1973,6 +1994,254 @@ async def startup_event():
         db.close()
 
     logger.info("FinalPing Cloud Backend ready!")
+
+
+# ============================================================================
+# TEAM HELPERS
+# ============================================================================
+
+def _channel_value(integration_type: str, config: dict) -> str:
+    if integration_type == "sms":
+        return config.get("to_phone", "")
+    elif integration_type == "email":
+        return config.get("to_email", "")
+    return config.get("webhook_url", "")
+
+
+def _channel_config(integration_type: str, value: str) -> dict:
+    if integration_type == "sms":
+        return {"to_phone": value}
+    elif integration_type == "email":
+        return {"to_email": value}
+    return {"webhook_url": value}
+
+
+def _get_user_team(user: User, db: Session) -> Team:
+    if not user.license_id:
+        raise HTTPException(status_code=404, detail="No team found")
+    team = db.query(Team).filter(Team.license_id == user.license_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="No team found")
+    return team
+
+
+def _build_team_response(team: Team, db: Session) -> dict:
+    members = []
+    for m in team.members:
+        user = db.query(User).filter(User.id == m.user_id).first()
+        members.append({
+            "id": str(m.id),
+            "user_id": str(m.user_id),
+            "email": user.email if user else "",
+            "role": m.role,
+            "joined_at": m.joined_at,
+        })
+    channels = [
+        {
+            "id": str(c.id),
+            "integration_type": c.integration_type,
+            "label": c.label,
+            "value": _channel_value(c.integration_type, c.config),
+            "enabled": c.enabled,
+            "created_at": c.created_at,
+        }
+        for c in team.channels
+    ]
+    return {
+        "id": str(team.id),
+        "name": team.name,
+        "members": members,
+        "channels": channels,
+        "routing": team.routing or {},
+        "created_at": team.created_at,
+    }
+
+
+# ============================================================================
+# TEAM ENDPOINTS
+# ============================================================================
+
+@app.get("/api/teams/me")
+async def get_my_team(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    return _build_team_response(team, db)
+
+
+@app.post("/api/teams/channels", status_code=201)
+async def add_team_channel(
+    body: TeamChannelCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    channel = TeamChannel(
+        team_id=team.id,
+        integration_type=body.integration_type,
+        label=body.label,
+        config=_channel_config(body.integration_type, body.value),
+    )
+    db.add(channel)
+    db.commit()
+    db.refresh(channel)
+    return {
+        "id": str(channel.id),
+        "integration_type": channel.integration_type,
+        "label": channel.label,
+        "value": body.value,
+        "enabled": channel.enabled,
+        "created_at": channel.created_at,
+    }
+
+
+@app.delete("/api/teams/channels/{channel_id}", status_code=204)
+async def remove_team_channel(
+    channel_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    channel = db.query(TeamChannel).filter(
+        TeamChannel.id == channel_id,
+        TeamChannel.team_id == team.id
+    ).first()
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    # Remove channel from routing rules
+    routing = dict(team.routing or {})
+    for dist in routing:
+        routing[dist] = [cid for cid in routing[dist] if cid != channel_id]
+    team.routing = routing
+    db.delete(channel)
+    db.commit()
+    return None
+
+
+@app.put("/api/teams/routing")
+async def update_team_routing(
+    body: TeamRoutingUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    team.routing = body.routing
+    db.commit()
+    return {"routing": team.routing}
+
+
+@app.post("/api/teams/invite")
+async def invite_team_member(
+    body: TeamInviteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    license = db.query(License).filter(License.id == team.license_id).first()
+    if not license:
+        raise HTTPException(status_code=500, detail="Team license not found")
+
+    resend_key = os.getenv("RESEND_API_KEY")
+    if resend_key:
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;">
+          <div style="background:#0f1117;padding:32px;border-radius:12px;">
+            <h2 style="color:#0ea5e9;margin:0 0 8px">You've been invited to FinalPing for Teams</h2>
+            <p style="color:#9ca3af;margin:0 0 24px;font-size:14px;line-height:1.6">
+              {current_user.email} has invited you to join their team on FinalPing for Teams —
+              real-time aircraft proximity alerts for your whole crew.
+            </p>
+            <div style="background:#1a2030;border:1px solid #2d3748;border-radius:8px;padding:16px;margin-bottom:24px;">
+              <div style="font-size:11px;color:#4b5563;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Your Team License Key</div>
+              <div style="font-size:18px;font-weight:700;color:#f9fafb;letter-spacing:.05em">{license.license_key}</div>
+            </div>
+            <p style="color:#9ca3af;font-size:13px;line-height:1.6;margin:0 0 20px">
+              1. Download <strong style="color:#f9fafb">FinalPing for Teams</strong> at finalpingapp.com/download<br>
+              2. Open the app and click <strong style="color:#f9fafb">Activate License</strong><br>
+              3. Enter the key above and your email address to join the team
+            </p>
+            <hr style="border-color:#2d3748;margin:20px 0">
+            <p style="color:#4b5563;font-size:12px;margin:0">
+              Sent by <a href="https://finalpingapp.com" style="color:#0ea5e9">FinalPing</a>
+            </p>
+          </div>
+        </div>
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    "https://api.resend.com/emails",
+                    headers={"Authorization": f"Bearer {resend_key}", "Content-Type": "application/json"},
+                    json={
+                        "from": "FinalPing <noreply@finalpingapp.com>",
+                        "to": [body.email],
+                        "subject": f"You've been invited to join FinalPing for Teams",
+                        "html": html,
+                    },
+                    timeout=10.0,
+                )
+        except Exception as e:
+            logger.warning("Invite email failed (non-critical): %s", e)
+
+    logger.info("Team invite sent to %s by %s", body.email, current_user.email)
+    return {"message": f"Invite sent to {body.email}"}
+
+
+@app.delete("/api/teams/members/{member_id}", status_code=204)
+async def remove_team_member(
+    member_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    caller = db.query(TeamMember).filter(
+        TeamMember.team_id == team.id,
+        TeamMember.user_id == current_user.id
+    ).first()
+    if not caller or caller.role not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Only owners and admins can remove members")
+    member = db.query(TeamMember).filter(
+        TeamMember.id == member_id,
+        TeamMember.team_id == team.id
+    ).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.role == "owner":
+        raise HTTPException(status_code=403, detail="Cannot remove the team owner")
+    db.delete(member)
+    db.commit()
+    return None
+
+
+@app.get("/api/teams/activity")
+async def get_team_activity(
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    from models import NotificationLog
+    team = _get_user_team(current_user, db)
+    member_user_ids = [m.user_id for m in team.members]
+    logs = (
+        db.query(NotificationLog)
+        .filter(NotificationLog.user_id.in_(member_user_ids))
+        .order_by(NotificationLog.sent_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": str(l.id),
+            "aircraft_tail": l.aircraft_tail,
+            "alert_type": l.alert_type,
+            "message": l.message,
+            "integration_type": l.integration_type,
+            "status": l.status,
+            "sent_at": l.sent_at,
+        }
+        for l in logs
+    ]
 
 
 @app.on_event("shutdown")

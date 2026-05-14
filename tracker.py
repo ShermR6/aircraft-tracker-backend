@@ -444,7 +444,6 @@ class CloudAircraftTracker:
         """Send notifications via configured integrations"""
         db = SessionLocal()
         try:
-            # Get user's tier to enforce channel restrictions
             user = db.query(User).filter(User.id == user_id).first()
             tier = "starter"
             if user and user.license_id:
@@ -452,53 +451,90 @@ class CloudAircraftTracker:
                 lic = db.query(License).filter(License.id == user.license_id).first()
                 if lic:
                     tier = lic.tier
-            allowed_channels = self.TIER_CHANNELS.get(tier, self.TIER_CHANNELS["starter"])
 
-            # Get user's integrations (filter by tier-allowed channels)
-            integrations = [
-                i for i in db.query(Integration).filter(
-                    Integration.user_id == user_id,
-                    Integration.enabled == True
-                ).all()
-                if i.type in allowed_channels
-            ]
-
-            # Get alert settings to get custom message templates
             alert_settings = {
                 s.alert_type: s.message_template
                 for s in db.query(AlertSetting).filter(AlertSetting.user_id == user_id).all()
             }
 
-            for notification in notifications:
-                # Add airport code from tracker config
-                tracker = self.user_trackers.get(user_id)
-                if tracker:
-                    notification['airport'] = tracker.config.get('airport_code', '')
-
-                # Build message from template
-                alert_type = notification['type']
-                template = alert_settings.get(alert_type, self.get_default_template(alert_type))
-                message = self.format_message(template, notification)
-
-                # Send via each integration
-                for integration in integrations:
-                    success = await self.send_via_integration(integration, message)
-
-                    # Log notification
-                    log = NotificationLog(
-                        user_id=user_id,
-                        aircraft_tail=notification['tail'],
-                        alert_type=alert_type,
-                        message=message,
-                        integration_type=integration.type,
-                        status='sent' if success else 'failed',
-                        sent_at=datetime.utcnow()
-                    )
-                    db.add(log)
+            if tier.startswith("team-"):
+                await self._send_team_notifications(user_id, user, notifications, alert_settings, db)
+            else:
+                allowed_channels = self.TIER_CHANNELS.get(tier, self.TIER_CHANNELS["starter"])
+                integrations = [
+                    i for i in db.query(Integration).filter(
+                        Integration.user_id == user_id,
+                        Integration.enabled == True
+                    ).all()
+                    if i.type in allowed_channels
+                ]
+                for notification in notifications:
+                    tracker = self.user_trackers.get(user_id)
+                    if tracker:
+                        notification['airport'] = tracker.config.get('airport_code', '')
+                    alert_type = notification['type']
+                    template = alert_settings.get(alert_type, self.get_default_template(alert_type))
+                    message = self.format_message(template, notification)
+                    for integration in integrations:
+                        success = await self.send_via_integration(integration, message)
+                        db.add(NotificationLog(
+                            user_id=user_id,
+                            aircraft_tail=notification['tail'],
+                            alert_type=alert_type,
+                            message=message,
+                            integration_type=integration.type,
+                            status='sent' if success else 'failed',
+                            sent_at=datetime.utcnow()
+                        ))
 
             db.commit()
         finally:
             db.close()
+
+    async def _send_team_notifications(self, user_id, user, notifications, alert_settings, db):
+        """Fan out alerts to all team channels, filtered by per-distance routing rules."""
+        from models import Team, TeamChannel
+
+        if not user or not user.license_id:
+            return
+        team = db.query(Team).filter(Team.license_id == user.license_id).first()
+        if not team:
+            return
+
+        all_channels = db.query(TeamChannel).filter(
+            TeamChannel.team_id == team.id,
+            TeamChannel.enabled == True
+        ).all()
+        routing = team.routing or {}
+
+        for notification in notifications:
+            tracker = self.user_trackers.get(user_id)
+            if tracker:
+                notification['airport'] = tracker.config.get('airport_code', '')
+
+            alert_type = notification['type']
+            template = alert_settings.get(alert_type, self.get_default_template(alert_type))
+            message = self.format_message(template, notification)
+
+            disabled_ids = set(routing.get(alert_type, []))
+            channels = [c for c in all_channels if str(c.id) not in disabled_ids]
+
+            for channel in channels:
+                class _W:
+                    def __init__(self, c):
+                        self.type = c.integration_type
+                        self.config = c.config
+                        self.id = c.id
+                success = await self.send_via_integration(_W(channel), message)
+                db.add(NotificationLog(
+                    user_id=user_id,
+                    aircraft_tail=notification['tail'],
+                    alert_type=alert_type,
+                    message=message,
+                    integration_type=channel.integration_type,
+                    status='sent' if success else 'failed',
+                    sent_at=datetime.utcnow()
+                ))
 
     def get_default_template(self, alert_type: str) -> str:
         """Get default message template"""

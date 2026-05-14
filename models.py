@@ -165,3 +165,46 @@ class SavedLocation(Base):
     is_active = Column(Boolean, default=False)           # only one can be active
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Team(Base):
+    """Team for multi-user (team tier) accounts"""
+    __tablename__ = "teams"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    license_id = Column(UUID(as_uuid=True), ForeignKey("licenses.id"), unique=True, nullable=False)
+    name = Column(String(255), nullable=True)
+    routing = Column(JSON, default=dict)  # {"10nm": [disabled_channel_id, ...], ...}
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
+    channels = relationship("TeamChannel", back_populates="team", cascade="all, delete-orphan")
+
+
+class TeamMember(Base):
+    """Member of a team"""
+    __tablename__ = "team_members"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    role = Column(String(20), default="member")  # "owner", "admin", "member"
+    joined_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team", back_populates="members")
+    user = relationship("User")
+
+
+class TeamChannel(Base):
+    """A notification channel belonging to a team"""
+    __tablename__ = "team_channels"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    integration_type = Column(String(50), nullable=False)  # "sms", "discord", "slack", "email"
+    label = Column(String(100), nullable=False)
+    config = Column(JSON, nullable=False)  # {"to_phone": ...} / {"webhook_url": ...} / {"to_email": ...}
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team", back_populates="channels")

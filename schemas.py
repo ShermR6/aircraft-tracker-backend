@@ -209,3 +209,57 @@ class NotificationResponse(BaseModel):
     integration_type: str
     status: str
     sent_at: datetime
+
+
+# ============================================================================
+# TEAMS
+# ============================================================================
+
+class TeamMemberResponse(BaseModel):
+    id: str
+    user_id: str
+    email: str
+    role: str
+    joined_at: datetime
+
+
+class TeamChannelCreate(BaseModel):
+    integration_type: str = Field(..., pattern="^(sms|discord|slack|email)$")
+    label: str = Field(..., min_length=1, max_length=100)
+    value: str = Field(..., min_length=1)
+
+
+class TeamChannelResponse(BaseModel):
+    id: str
+    integration_type: str
+    label: str
+    value: str
+    enabled: bool
+    created_at: datetime
+
+
+class TeamResponse(BaseModel):
+    id: str
+    name: Optional[str]
+    members: List[TeamMemberResponse]
+    channels: List[TeamChannelResponse]
+    routing: Dict[str, List[str]]
+    created_at: datetime
+
+
+class TeamRoutingUpdate(BaseModel):
+    routing: Dict[str, List[str]]
+
+
+class TeamInviteRequest(BaseModel):
+    email: EmailStr
+
+
+class TeamActivityResponse(BaseModel):
+    id: str
+    aircraft_tail: str
+    alert_type: str
+    message: str
+    integration_type: str
+    status: str
+    sent_at: datetime
