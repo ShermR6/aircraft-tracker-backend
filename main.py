@@ -474,7 +474,16 @@ async def activate_license(
     
     if not license:
         raise HTTPException(status_code=404, detail="Invalid license key")
-    
+
+    # Enforce key prefix matches license tier
+    key_upper = activation.license_key.upper()
+    is_team_key = key_upper.startswith("FPT-")
+    is_team_tier = license.tier.startswith("team-")
+    if is_team_key and not is_team_tier:
+        raise HTTPException(status_code=400, detail="This is a Teams license key. Please use FinalPing for Teams.")
+    if not is_team_key and is_team_tier and (key_upper.startswith("FP-") or not key_upper[0].isalpha()):
+        raise HTTPException(status_code=400, detail="This is a personal license key. Please use the personal FinalPing app.")
+
     # Check if expired
     if license.status == "expired":
         raise HTTPException(status_code=403, detail="License has expired")
@@ -1765,10 +1774,11 @@ async def generate_license(
     if tier not in ["starter", "premium", "pro", "team-starter", "team-premium", "team-pro"]:
         raise HTTPException(status_code=400, detail="Invalid tier")
 
-    # Generate license key in XXXX-XXXX-XXXX-XXXX format
+    # Generate prefixed license key: FPT-XXXX-XXXX-XXXX-XXXX for teams, FP-XXXX-XXXX-XXXX-XXXX for personal
     chars = string.ascii_uppercase + string.digits
     segments = ["".join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
-    license_key = "-".join(segments)
+    prefix = "FPT" if tier.startswith("team-") else "FP"
+    license_key = f"{prefix}-{'-'.join(segments)}"
 
     # Calculate expiry based on duration_days (supports fractions for short test keys)
     now = datetime.utcnow()
