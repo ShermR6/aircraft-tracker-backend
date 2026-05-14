@@ -40,7 +40,7 @@ sentry_sdk.init(
 )
 
 from database import get_db, engine, Base, SessionLocal
-from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation, Team, TeamMember, TeamChannel, TeamAircraft, TeamAirportConfig, TeamAlertSetting
+from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation, Team, TeamMember, TeamChannel, TeamAircraft, TeamAirportConfig, TeamAlertSetting, TeamInviteToken, TeamRole
 from schemas import (
     LicenseActivation, LicenseResponse,
     UserLogin, UserResponse, TokenResponse,
@@ -49,7 +49,8 @@ from schemas import (
     IntegrationCreate, IntegrationResponse,
     LiveAircraftResponse,
     TeamChannelCreate, TeamChannelResponse, TeamMemberResponse,
-    TeamResponse, TeamRoutingUpdate, TeamInviteRequest, TeamActivityResponse
+    TeamResponse, TeamRoutingUpdate, TeamInviteRequest, TeamActivityResponse,
+    TeamInviteCreate, TeamActivateInviteRequest, TeamRoleCreate, TeamRoleUpdate, AssignMemberRoleRequest
 )
 from tracker import CloudAircraftTracker
 
@@ -2005,6 +2006,8 @@ def _channel_value(integration_type: str, config: dict) -> str:
         return config.get("to_phone", "")
     elif integration_type == "email":
         return config.get("to_email", "")
+    elif integration_type == "telegram":
+        return config.get("value", "")
     return config.get("webhook_url", "")
 
 
@@ -2013,15 +2016,19 @@ def _channel_config(integration_type: str, value: str) -> dict:
         return {"to_phone": value}
     elif integration_type == "email":
         return {"to_email": value}
+    elif integration_type == "telegram":
+        return {"value": value}
     return {"webhook_url": value}
 
 
 def _get_user_team(user: User, db: Session) -> Team:
-    if not user.license_id:
-        raise HTTPException(status_code=404, detail="No team found")
-    team = db.query(Team).filter(Team.license_id == user.license_id).first()
+    # Use TeamMember as the source of truth — removing a member immediately revokes access
+    member = db.query(TeamMember).filter(TeamMember.user_id == user.id).first()
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a member of any team")
+    team = db.query(Team).filter(Team.id == member.team_id).first()
     if not team:
-        raise HTTPException(status_code=404, detail="No team found")
+        raise HTTPException(status_code=404, detail="Team not found")
     return team
 
 
@@ -2029,11 +2036,15 @@ def _build_team_response(team: Team, db: Session) -> dict:
     members = []
     for m in team.members:
         user = db.query(User).filter(User.id == m.user_id).first()
+        custom_role = db.query(TeamRole).filter(TeamRole.id == m.custom_role_id).first() if m.custom_role_id else None
         members.append({
             "id": str(m.id),
             "user_id": str(m.user_id),
             "email": user.email if user else "",
             "role": m.role,
+            "custom_role_id": str(m.custom_role_id) if m.custom_role_id else None,
+            "custom_role_name": custom_role.name if custom_role else None,
+            "custom_role_color": custom_role.color if custom_role else None,
             "joined_at": m.joined_at,
         })
     channels = [
@@ -2047,12 +2058,30 @@ def _build_team_response(team: Team, db: Session) -> dict:
         }
         for c in team.channels
     ]
+    now = datetime.utcnow()
+    pending_invites = [
+        {
+            "id": str(i.id),
+            "token": i.token,
+            "note": i.note,
+            "expires_at": i.expires_at,
+            "created_at": i.created_at,
+        }
+        for i in team.invite_tokens
+        if i.used_at is None and i.expires_at > now
+    ]
+    roles = [
+        {"id": str(r.id), "name": r.name, "permissions": r.permissions or [], "color": r.color}
+        for r in team.roles
+    ]
     return {
         "id": str(team.id),
         "name": team.name,
         "members": members,
         "channels": channels,
         "routing": team.routing or {},
+        "pending_invites": pending_invites,
+        "roles": roles,
         "created_at": team.created_at,
     }
 
@@ -2212,6 +2241,215 @@ async def remove_team_member(
     db.delete(member)
     db.commit()
     return None
+
+
+@app.post("/api/teams/invites", status_code=201)
+async def generate_team_invite(
+    body: TeamInviteCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    import secrets
+    team = _get_user_team(current_user, db)
+    caller = db.query(TeamMember).filter(TeamMember.team_id == team.id, TeamMember.user_id == current_user.id).first()
+    if not caller or caller.role not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Only owners and admins can generate invite codes")
+    raw = secrets.token_hex(6).upper()
+    token = f"FPTI-{raw[0:4]}-{raw[4:8]}-{raw[8:12]}"
+    invite = TeamInviteToken(
+        team_id=team.id,
+        token=token,
+        created_by=current_user.id,
+        note=body.note,
+        expires_at=datetime.utcnow() + timedelta(hours=48),
+    )
+    db.add(invite)
+    db.commit()
+    db.refresh(invite)
+    return {"id": str(invite.id), "token": invite.token, "note": invite.note, "expires_at": invite.expires_at, "created_at": invite.created_at}
+
+
+@app.get("/api/teams/invites")
+async def list_team_invites(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    now = datetime.utcnow()
+    invites = db.query(TeamInviteToken).filter(
+        TeamInviteToken.team_id == team.id,
+        TeamInviteToken.used_at.is_(None),
+        TeamInviteToken.expires_at > now,
+    ).order_by(TeamInviteToken.created_at.desc()).all()
+    return [{"id": str(i.id), "token": i.token, "note": i.note, "expires_at": i.expires_at, "created_at": i.created_at} for i in invites]
+
+
+@app.delete("/api/teams/invites/{invite_id}", status_code=204)
+async def revoke_team_invite(
+    invite_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    caller = db.query(TeamMember).filter(TeamMember.team_id == team.id, TeamMember.user_id == current_user.id).first()
+    if not caller or caller.role not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Only owners and admins can revoke invites")
+    invite = db.query(TeamInviteToken).filter(TeamInviteToken.id == invite_id, TeamInviteToken.team_id == team.id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    db.delete(invite)
+    db.commit()
+    return None
+
+
+@app.post("/api/teams/activate-invite", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def activate_team_invite(
+    request: Request,
+    body: TeamActivateInviteRequest,
+    db: Session = Depends(get_db)
+):
+    body.email = body.email.lower().strip()
+    now = datetime.utcnow()
+    invite = db.query(TeamInviteToken).filter(
+        TeamInviteToken.token == body.token.upper().strip(),
+        TeamInviteToken.used_at.is_(None),
+        TeamInviteToken.expires_at > now,
+    ).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invalid or expired invite code")
+    team = db.query(Team).filter(Team.id == invite.team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    license = db.query(License).filter(License.id == team.license_id).first()
+    if not license:
+        raise HTTPException(status_code=404, detail="Team license not found")
+    user = db.query(User).filter(User.email == body.email).first()
+    if not user:
+        user = User(email=body.email, license_id=license.id, created_at=datetime.utcnow())
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    elif user.license_id != license.id:
+        user.license_id = license.id
+        db.commit()
+    existing = db.query(TeamMember).filter(TeamMember.team_id == team.id, TeamMember.user_id == user.id).first()
+    if not existing:
+        db.add(TeamMember(team_id=team.id, user_id=user.id, role="member"))
+        db.commit()
+    invite.used_at = now
+    invite.used_by_user_id = user.id
+    db.commit()
+    access_token = create_access_token(str(user.id))
+    return TokenResponse(access_token=access_token, token_type="bearer", user_id=str(user.id), email=user.email, license_tier=license.tier, expires_at=license.expires_at)
+
+
+@app.get("/api/teams/roles")
+async def get_team_roles(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    roles = db.query(TeamRole).filter(TeamRole.team_id == team.id).all()
+    return [{"id": str(r.id), "name": r.name, "permissions": r.permissions or [], "color": r.color} for r in roles]
+
+
+@app.post("/api/teams/roles", status_code=201)
+async def create_team_role(
+    body: TeamRoleCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    caller = db.query(TeamMember).filter(TeamMember.team_id == team.id, TeamMember.user_id == current_user.id).first()
+    if not caller or caller.role != "owner":
+        raise HTTPException(status_code=403, detail="Only the owner can create roles")
+    role = TeamRole(team_id=team.id, name=body.name, permissions=body.permissions, color=body.color)
+    db.add(role)
+    db.commit()
+    db.refresh(role)
+    return {"id": str(role.id), "name": role.name, "permissions": role.permissions or [], "color": role.color}
+
+
+@app.put("/api/teams/roles/{role_id}")
+async def update_team_role(
+    role_id: str,
+    body: TeamRoleUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    caller = db.query(TeamMember).filter(TeamMember.team_id == team.id, TeamMember.user_id == current_user.id).first()
+    if not caller or caller.role != "owner":
+        raise HTTPException(status_code=403, detail="Only the owner can edit roles")
+    role = db.query(TeamRole).filter(TeamRole.id == role_id, TeamRole.team_id == team.id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    if body.name is not None:
+        role.name = body.name
+    if body.permissions is not None:
+        role.permissions = body.permissions
+    if body.color is not None:
+        role.color = body.color
+    db.commit()
+    db.refresh(role)
+    return {"id": str(role.id), "name": role.name, "permissions": role.permissions or [], "color": role.color}
+
+
+@app.delete("/api/teams/roles/{role_id}", status_code=204)
+async def delete_team_role(
+    role_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    caller = db.query(TeamMember).filter(TeamMember.team_id == team.id, TeamMember.user_id == current_user.id).first()
+    if not caller or caller.role != "owner":
+        raise HTTPException(status_code=403, detail="Only the owner can delete roles")
+    role = db.query(TeamRole).filter(TeamRole.id == role_id, TeamRole.team_id == team.id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    db.query(TeamMember).filter(TeamMember.custom_role_id == role.id).update({"custom_role_id": None})
+    db.delete(role)
+    db.commit()
+    return None
+
+
+@app.put("/api/teams/members/{member_id}/role")
+async def update_member_role(
+    member_id: str,
+    body: AssignMemberRoleRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    team = _get_user_team(current_user, db)
+    caller = db.query(TeamMember).filter(TeamMember.team_id == team.id, TeamMember.user_id == current_user.id).first()
+    if not caller or caller.role not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Only owners and admins can assign roles")
+    member = db.query(TeamMember).filter(TeamMember.id == member_id, TeamMember.team_id == team.id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.role == "owner":
+        raise HTTPException(status_code=403, detail="Cannot change the owner's role")
+    if body.role:
+        if body.role not in ("admin", "member"):
+            raise HTTPException(status_code=400, detail="Use 'admin' or 'member'")
+        member.role = body.role
+        member.custom_role_id = None
+    elif body.custom_role_id:
+        custom_role = db.query(TeamRole).filter(TeamRole.id == body.custom_role_id, TeamRole.team_id == team.id).first()
+        if not custom_role:
+            raise HTTPException(status_code=404, detail="Custom role not found")
+        member.custom_role_id = custom_role.id
+    db.commit()
+    user = db.query(User).filter(User.id == member.user_id).first()
+    custom_role = db.query(TeamRole).filter(TeamRole.id == member.custom_role_id).first() if member.custom_role_id else None
+    return {
+        "id": str(member.id), "user_id": str(member.user_id), "email": user.email if user else "",
+        "role": member.role, "custom_role_id": str(member.custom_role_id) if member.custom_role_id else None,
+        "custom_role_name": custom_role.name if custom_role else None, "custom_role_color": custom_role.color if custom_role else None,
+        "joined_at": member.joined_at,
+    }
 
 
 @app.get("/api/teams/activity")

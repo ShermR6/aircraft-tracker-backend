@@ -182,6 +182,8 @@ class Team(Base):
     aircraft = relationship("TeamAircraft", back_populates="team", cascade="all, delete-orphan")
     airport_config = relationship("TeamAirportConfig", back_populates="team", uselist=False, cascade="all, delete-orphan")
     alert_settings = relationship("TeamAlertSetting", back_populates="team", cascade="all, delete-orphan")
+    invite_tokens = relationship("TeamInviteToken", back_populates="team", cascade="all, delete-orphan")
+    roles = relationship("TeamRole", back_populates="team", cascade="all, delete-orphan")
 
 
 class TeamMember(Base):
@@ -192,10 +194,12 @@ class TeamMember(Base):
     team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     role = Column(String(20), default="member")  # "owner", "admin", "member"
+    custom_role_id = Column(UUID(as_uuid=True), ForeignKey("team_roles.id"), nullable=True)
     joined_at = Column(DateTime, default=datetime.utcnow)
 
     team = relationship("Team", back_populates="members")
     user = relationship("User")
+    custom_role = relationship("TeamRole", foreign_keys=[custom_role_id])
 
 
 class TeamChannel(Base):
@@ -270,3 +274,34 @@ class TeamAlertSetting(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     team = relationship("Team", back_populates="alert_settings")
+
+
+class TeamInviteToken(Base):
+    """One-time-use invite token for joining a team"""
+    __tablename__ = "team_invite_tokens"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    token = Column(String(36), unique=True, nullable=False, index=True)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    note = Column(String(100), nullable=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    used_by_user_id = Column(UUID(as_uuid=True), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team", back_populates="invite_tokens")
+
+
+class TeamRole(Base):
+    """Custom role defined by team owner"""
+    __tablename__ = "team_roles"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    name = Column(String(50), nullable=False)
+    permissions = Column(JSON, default=list)
+    color = Column(String(7), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team", back_populates="roles")

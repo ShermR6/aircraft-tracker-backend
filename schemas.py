@@ -220,11 +220,14 @@ class TeamMemberResponse(BaseModel):
     user_id: str
     email: str
     role: str
+    custom_role_id: Optional[str] = None
+    custom_role_name: Optional[str] = None
+    custom_role_color: Optional[str] = None
     joined_at: datetime
 
 
 class TeamChannelCreate(BaseModel):
-    integration_type: str = Field(..., pattern="^(sms|discord|slack|email)$")
+    integration_type: str = Field(..., pattern="^(sms|discord|slack|email|teams|google_chat|telegram|webhook)$")
     label: str = Field(..., min_length=1, max_length=100)
     value: str = Field(..., min_length=1)
 
@@ -263,3 +266,29 @@ class TeamActivityResponse(BaseModel):
     integration_type: str
     status: str
     sent_at: datetime
+
+
+class TeamInviteCreate(BaseModel):
+    note: Optional[str] = Field(None, max_length=100)
+
+
+class TeamActivateInviteRequest(BaseModel):
+    token: str
+    email: EmailStr
+
+
+class TeamRoleCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=50)
+    permissions: List[str] = []
+    color: Optional[str] = Field(None, pattern="^#[0-9a-fA-F]{6}$")
+
+
+class TeamRoleUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=50)
+    permissions: Optional[List[str]] = None
+    color: Optional[str] = Field(None, pattern="^#[0-9a-fA-F]{6}$")
+
+
+class AssignMemberRoleRequest(BaseModel):
+    role: Optional[str] = None
+    custom_role_id: Optional[str] = None
