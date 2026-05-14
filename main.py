@@ -565,7 +565,7 @@ async def activate_license(
 
     # Find or create user
     user = db.query(User).filter(User.email == activation.email).first()
-    
+
     if not user:
         user = User(
             email=activation.email,
@@ -575,6 +575,18 @@ async def activate_license(
         db.add(user)
         db.commit()
         db.refresh(user)
+    elif license.tier.startswith("team-"):
+        # For team licenses: only set license_id if user has no existing personal license.
+        # Team access is managed via TeamMember — we don't want to overwrite a personal
+        # license with the team license, as that would corrupt the personal app's tier display.
+        existing_license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
+        if not existing_license or existing_license.tier.startswith("team-"):
+            # No personal license (or already has a team license) — safe to link team license
+            if user.license_id != license.id:
+                user.license_id = license.id
+                db.commit()
+                db.refresh(user)
+        # If user has a personal license, leave user.license_id alone — team access via TeamMember
     elif user.license_id != license.id:
         user.license_id = license.id
         db.commit()
@@ -620,37 +632,44 @@ async def get_current_user_info(
     """Get current user information"""
     from sqlalchemy import desc
 
-    # Find the most recently activated active license for this user
+    # Find the most recently activated personal (non-team) license for this user.
+    # Team licenses are excluded here — team access is via TeamMember, and the personal
+    # app should display the user's personal tier, not the team tier.
     from sqlalchemy import desc
 
-    # Get all license IDs ever associated with this user's email
-    # by finding all users with this email (should be 1) and their license_id history
-    # Plus check the activation log — licenses activated by this user
     user_license_ids = [u.license_id for u in db.query(User).filter(
         User.email == current_user.email
     ).all() if u.license_id]
 
-    # Also include any license that was activated and linked to this specific user
-    activated_licenses = db.query(License).filter(
+    # Prefer personal (non-team) licenses
+    license = db.query(License).filter(
         License.id.in_(user_license_ids),
         License.status == "active",
-        License.activated_at.isnot(None)
+        License.activated_at.isnot(None),
+        ~License.tier.startswith("team-")
     ).order_by(desc(License.activated_at)).first()
 
-    license = activated_licenses
-
-    # Fallback to directly linked license
-    if not license:
+    # Fallback: directly linked license (could be team tier)
+    if not license and current_user.license_id:
         license = db.query(License).filter(
             License.id == current_user.license_id
         ).first()
 
+    # If the only license we found is a team license, report the tier as "starter"
+    # so the personal app renders correct personal-tier limits.
+    display_tier = "starter"
+    if license:
+        if license.tier.startswith("team-"):
+            display_tier = "starter"
+        else:
+            display_tier = license.tier
+
     return UserResponse(
         id=str(current_user.id),
         email=current_user.email,
-        license_tier=license.tier if license else "unknown",
+        license_tier=display_tier,
         activated_at=license.activated_at if license else None,
-        expires_at=license.expires_at if license else None,
+        expires_at=license.expires_at if license and not license.tier.startswith("team-") else None,
         created_at=current_user.created_at
     )
 
