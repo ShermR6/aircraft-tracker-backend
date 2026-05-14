@@ -1965,6 +1965,9 @@ async def startup_event():
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS runway_info JSON",
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_corridor_enabled BOOLEAN DEFAULT FALSE",
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_runway_heading FLOAT",
+            # TeamMember — added for custom roles
+            "ALTER TABLE team_members ADD COLUMN IF NOT EXISTS custom_role_id UUID REFERENCES team_roles(id) ON DELETE SET NULL",
+            # TeamChannel — value column (legacy channels stored config without top-level value)
         ]
         for sql in migrations:
             try:
