@@ -2051,6 +2051,10 @@ def _get_user_team(user: User, db: Session) -> Team:
     team = db.query(Team).filter(Team.id == member.team_id).first()
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
+    # Validate the team's license hasn't expired
+    team_license = db.query(License).filter(License.id == team.license_id).first()
+    if team_license and team_license.expires_at and team_license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow():
+        raise HTTPException(status_code=403, detail="team_license_expired")
     return team
 
 
