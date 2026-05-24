@@ -89,7 +89,7 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not SECRET_KEY:
     raise RuntimeError("JWT_SECRET_KEY environment variable is not set")
 ALGORITHM = "HS256"
-WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "skyping-internal-secret")
+WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "finalping-internal-secret")
 
 # License duration
 LICENSE_DURATION_DAYS = 30
