@@ -1937,6 +1937,49 @@ async def merge_accounts(
     }
 
 
+@app.delete("/api/internal/user")
+async def delete_user_account(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Delete a user account and all associated data — called by web dashboard on account deletion"""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return {"message": "User not found — already deleted or never existed"}
+
+    # Stop active tracker if running
+    tracker.remove_user(str(user.id))
+
+    # Delete records that don't cascade from User
+    from models import NotificationLog, SavedLocation, TeamMember, TeamInviteToken
+    db.query(NotificationLog).filter(NotificationLog.user_id == user.id).delete()
+    db.query(SavedLocation).filter(SavedLocation.user_id == user.id).delete()
+    db.query(TeamMember).filter(TeamMember.user_id == user.id).delete()
+    db.query(TeamInviteToken).filter(TeamInviteToken.created_by == user.id).delete()
+
+    # Deactivate the license so the key can't be reused
+    if user.license_id:
+        license = db.query(License).filter(License.id == user.license_id).first()
+        if license:
+            license.status = "cancelled"
+            license.activations_used = 0
+
+    # Delete user — cascades: aircraft, alert_settings, integrations, airport_config
+    db.delete(user)
+    db.commit()
+
+    return {"message": f"User {email} and all associated data deleted"}
+
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     """Health check endpoint"""
