@@ -306,7 +306,7 @@ class CloudAircraftTracker:
                 await self.track_all_users()
                 await asyncio.sleep(10)  # 10-second polling
             except Exception as e:
-                print(f"Error in tracking loop: {e}")
+                print(f"Error in tracking loop: {type(e).__name__}: {e}")
                 await asyncio.sleep(10)
 
     async def track_all_users(self):
@@ -340,7 +340,7 @@ class CloudAircraftTracker:
                             data = await response.json()
                             location_aircraft[key] = data.get('ac', [])
                 except Exception as e:
-                    print(f"Error fetching location bucket {key}: {e}")
+                    print(f"Error fetching location bucket {key}: {type(e).__name__}: {e}")
 
             for user_id, tracker in self.user_trackers.items():
                 try:
@@ -436,8 +436,8 @@ class CloudAircraftTracker:
         "premium":      ["discord", "email", "slack", "sms", "teams"],
         "pro":          ["discord", "email", "slack", "sms", "teams", "whatsapp"],
         "team-starter": ["discord", "email"],
-        "team-premium": ["discord", "email", "slack", "sms", "teams"],
-        "team-pro":     ["discord", "email", "slack", "sms", "teams", "whatsapp"],
+        "team-premium": ["discord", "email", "slack", "sms", "teams", "google_chat", "webhook"],
+        "team-pro":     ["discord", "email", "slack", "sms", "teams", "google_chat", "webhook", "whatsapp"],
     }
 
     async def send_notifications(self, user_id: str, notifications: List[dict]):
@@ -808,7 +808,7 @@ class CloudAircraftTracker:
 
     async def send_webhook(self, config: dict, message: str) -> bool:
         """Send generic webhook POST"""
-        url = config.get('url')
+        url = config.get('webhook_url') or config.get('url')
         if not url:
             return False
         headers = {'Content-Type': 'application/json'}
