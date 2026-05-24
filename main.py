@@ -1959,10 +1959,23 @@ async def delete_user_account(
     # Stop active tracker if running
     tracker.remove_user(str(user.id))
 
-    # Delete records that don't cascade from User
-    from models import NotificationLog, SavedLocation, TeamMember, TeamInviteToken
+    from models import NotificationLog, SavedLocation, TeamMember, TeamInviteToken, Team
+
+    # Delete notification logs and saved locations
     db.query(NotificationLog).filter(NotificationLog.user_id == user.id).delete()
     db.query(SavedLocation).filter(SavedLocation.user_id == user.id).delete()
+
+    # Find teams this user owns — must be deleted before the license to avoid FK violation
+    owned_team_ids = [
+        m.team_id for m in
+        db.query(TeamMember).filter(TeamMember.user_id == user.id, TeamMember.role == "owner").all()
+    ]
+    if owned_team_ids:
+        for team in db.query(Team).filter(Team.id.in_(owned_team_ids)).all():
+            db.delete(team)  # cascades: channels, aircraft, airport_config, alert_settings, invite_tokens, roles, members
+        db.flush()
+
+    # Remove user from any teams they were a member of (non-owner)
     db.query(TeamMember).filter(TeamMember.user_id == user.id).delete()
     db.query(TeamInviteToken).filter(TeamInviteToken.created_by == user.id).delete()
 
@@ -1977,7 +1990,7 @@ async def delete_user_account(
         if license:
             db.delete(license)
 
-    # Delete user — cascades: aircraft, alert_settings, integrations, airport_config
+    # Delete user — cascades: personal aircraft, alert_settings, integrations, airport_config
     db.delete(user)
     db.commit()
 
