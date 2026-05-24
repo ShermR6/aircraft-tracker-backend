@@ -2100,9 +2100,12 @@ def _build_team_response(team: Team, db: Session) -> dict:
         {"id": str(r.id), "name": r.name, "permissions": r.permissions or [], "color": r.color}
         for r in team.roles
     ]
+    license = db.query(License).filter(License.id == team.license_id).first()
     return {
         "id": str(team.id),
         "name": team.name,
+        "license_tier": license.tier if license else "team-starter",
+        "license_expires_at": license.expires_at.isoformat() if license and license.expires_at else None,
         "members": members,
         "channels": channels,
         "routing": team.routing or {},
