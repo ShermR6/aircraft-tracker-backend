@@ -1966,12 +1966,16 @@ async def delete_user_account(
     db.query(TeamMember).filter(TeamMember.user_id == user.id).delete()
     db.query(TeamInviteToken).filter(TeamInviteToken.created_by == user.id).delete()
 
-    # Deactivate the license so the key can't be reused
-    if user.license_id:
-        license = db.query(License).filter(License.id == user.license_id).first()
+    # Null out user's license_id first so the license can be deleted independently
+    license_id = user.license_id
+    user.license_id = None
+    db.flush()
+
+    # Delete the license so the key can never be reused or reactivated
+    if license_id:
+        license = db.query(License).filter(License.id == license_id).first()
         if license:
-            license.status = "cancelled"
-            license.activations_used = 0
+            db.delete(license)
 
     # Delete user — cascades: aircraft, alert_settings, integrations, airport_config
     db.delete(user)
