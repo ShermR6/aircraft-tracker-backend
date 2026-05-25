@@ -419,10 +419,10 @@ class CloudAircraftTracker:
                                 await self.send_notifications(user_id, notifications)
                                 state['landed'] = True
 
-                except Exception as e:
-                    import traceback
-                    print(f"Error tracking for user {user_id}: {e}")
-                    traceback.print_exc()
+            except Exception as e:
+                import traceback
+                print(f"Error tracking for user {user_id}: {e}")
+                traceback.print_exc()
 
     TIER_CHANNELS = {
         "starter":      ["discord", "email"],
