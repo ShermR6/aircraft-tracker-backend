@@ -310,45 +310,38 @@ class CloudAircraftTracker:
                 await asyncio.sleep(10)
 
     async def track_all_users(self):
-        """Track aircraft for all active users"""
+        """Track aircraft for all active users using a single ICAO-based API call"""
         if not self.user_trackers:
             return
 
-        # Group users by approximate location (rounded to 0.5 deg ~30nm) to share API calls
-        location_groups: dict = {}
-        location_params: dict = {}
-        for user_id, tracker in self.user_trackers.items():
-            cfg = tracker.config['airspace']
-            lat_bucket = round(float(cfg['center_lat']) * 2) / 2
-            lon_bucket = round(float(cfg['center_lon']) * 2) / 2
-            key = (lat_bucket, lon_bucket)
-            if key not in location_groups:
-                location_groups[key] = []
-                location_params[key] = {'lat': cfg['center_lat'], 'lon': cfg['center_lon'], 'radius': float(cfg['query_radius_nm'])}
-            else:
-                location_params[key]['radius'] = max(location_params[key]['radius'], float(cfg['query_radius_nm']))
-            location_groups[key].append(user_id)
+        # Collect all unique ICAOs across every user
+        all_icaos: set = set()
+        for tracker in self.user_trackers.values():
+            all_icaos.update(tracker.aircraft_to_track.keys())
 
+        if not all_icaos:
+            return
+
+        # One API call for all aircraft anywhere on the globe
+        icao_lookup: dict = {}
+        icao_str = ",".join(all_icaos)
+        url = f"https://api.adsb.lol/v2/icao/{icao_str}"
         async with aiohttp.ClientSession() as session:
-            # Fetch once per location bucket, share results across users in that bucket
-            location_aircraft: dict = {}
-            for key, params in location_params.items():
-                url = f"https://api.adsb.lol/v2/lat/{params['lat']}/lon/{params['lon']}/dist/{params['radius']}"
-                try:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            location_aircraft[key] = data.get('ac', [])
-                except Exception as e:
-                    print(f"Error fetching location bucket {key}: {type(e).__name__}: {e}")
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        for ac in data.get('ac', []):
+                            icao = ac.get('hex', '').lower()
+                            if icao:
+                                icao_lookup[icao] = ac
+            except Exception as e:
+                print(f"Error fetching ICAO batch: {type(e).__name__}: {e}")
+                return
 
-            for user_id, tracker in self.user_trackers.items():
-                try:
-                    cfg = tracker.config['airspace']
-                    lat_bucket = round(float(cfg['center_lat']) * 2) / 2
-                    lon_bucket = round(float(cfg['center_lon']) * 2) / 2
-                    key = (lat_bucket, lon_bucket)
-                    aircraft_list = location_aircraft.get(key, [])
+        for user_id, tracker in self.user_trackers.items():
+            try:
+                aircraft_list = [icao_lookup[icao] for icao in tracker.aircraft_to_track if icao in icao_lookup]
 
                     # Filter to only tracked aircraft
                     seen_icao24 = set()
