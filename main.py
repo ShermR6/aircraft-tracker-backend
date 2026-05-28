@@ -101,6 +101,9 @@ LICENSE_GRACE_PERIOD = timedelta(hours=2)
 # In-memory ground station heartbeat tracking { user_id_str: datetime }
 _ground_last_seen: dict = {}
 
+# In-memory SDR range data { user_id_str: {"range_nm": [...36 floats...], "updated_at": str} }
+_ground_range: dict = {}
+
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
@@ -488,6 +491,36 @@ async def ground_status(current_user: User = Depends(get_current_user)):
         "online": online,
         "last_seen": last_seen.isoformat() if last_seen else None,
     }
+
+
+@app.post("/api/ground/range")
+async def ground_range_post(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Receives SDR reception range data (36 buckets, one per 10-degree bearing)."""
+    if not getattr(current_user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    body = await request.json()
+    range_nm = body.get("range_nm", [])
+    if not isinstance(range_nm, list) or len(range_nm) != 36:
+        raise HTTPException(status_code=400, detail="range_nm must be a list of 36 floats")
+    _ground_range[str(current_user.id)] = {
+        "range_nm": range_nm,
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    return {"ok": True}
+
+
+@app.get("/api/ground/range")
+async def ground_range_get(current_user: User = Depends(get_current_user)):
+    """Returns the latest SDR reception range polygon for this user."""
+    if not getattr(current_user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    data = _ground_range.get(str(current_user.id))
+    if not data:
+        return {"range_nm": None, "updated_at": None}
+    return data
 
 
 @app.post("/api/admin/grant-ground-station")
