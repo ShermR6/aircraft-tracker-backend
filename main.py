@@ -98,6 +98,9 @@ LICENSE_DURATION_DAYS = 30
 # webhook time to arrive and extend the license before users go dark.
 LICENSE_GRACE_PERIOD = timedelta(hours=2)
 
+# In-memory ground station heartbeat tracking { user_id_str: datetime }
+_ground_last_seen: dict = {}
+
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
@@ -397,6 +400,8 @@ async def ground_ingest(
 
     db.commit()
 
+    _ground_last_seen[str(current_user.id)] = datetime.utcnow()
+
     return {
         "message": f"Alert processed — {alerts_sent}/{len(integrations)} notifications sent",
         "alert_type": alert_type,
@@ -460,6 +465,28 @@ async def ground_config(
             {"tail": a.tail_number, "icao24": a.icao24 or ""}
             for a in aircraft
         ],
+    }
+
+
+@app.post("/api/ground/heartbeat")
+async def ground_heartbeat(current_user: User = Depends(get_current_user)):
+    """Called by the ground station every minute to signal it is online."""
+    if not getattr(current_user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    _ground_last_seen[str(current_user.id)] = datetime.utcnow()
+    return {"ok": True}
+
+
+@app.get("/api/ground/status")
+async def ground_status(current_user: User = Depends(get_current_user)):
+    """Returns whether this user's ground station is currently online."""
+    if not getattr(current_user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    last_seen = _ground_last_seen.get(str(current_user.id))
+    online = last_seen is not None and (datetime.utcnow() - last_seen).total_seconds() < 120
+    return {
+        "online": online,
+        "last_seen": last_seen.isoformat() if last_seen else None,
     }
 
 
