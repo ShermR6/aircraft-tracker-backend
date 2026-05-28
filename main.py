@@ -427,6 +427,42 @@ async def ground_validate(
     }
 
 
+@app.get("/api/ground/config")
+async def ground_config(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Returns the user's location and tracked aircraft for the ground station.
+    Called on startup so credentials + config are never baked into the script.
+    """
+    from models import AirportConfig, Aircraft
+    if not getattr(current_user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+
+    airport = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
+    if not airport:
+        raise HTTPException(
+            status_code=404,
+            detail="No location configured. Set up your airport location in the FinalPing app first."
+        )
+
+    aircraft = db.query(Aircraft).filter(
+        Aircraft.user_id == current_user.id,
+        Aircraft.active == True
+    ).all()
+
+    return {
+        "lat": float(airport.latitude),
+        "lon": float(airport.longitude),
+        "elevation_ft": airport.elevation_ft_msl,
+        "aircraft": [
+            {"tail": a.tail_number, "icao24": a.icao24 or ""}
+            for a in aircraft
+        ],
+    }
+
+
 @app.post("/api/admin/grant-ground-station")
 async def grant_ground_station(
     request: Request,
