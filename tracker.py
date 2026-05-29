@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from models import User, Aircraft, AirportConfig, AlertSetting, Integration, NotificationLog
 from database import SessionLocal
+import ground_state as _gs
 
 
 class UserTracker:
@@ -341,6 +342,10 @@ class CloudAircraftTracker:
 
         for user_id, tracker in self.user_trackers.items():
             try:
+                # Skip users whose ground station is online — it handles their alerts directly
+                if _gs.is_ground_station_online(str(user_id)):
+                    continue
+
                 aircraft_list = [icao_lookup[icao] for icao in tracker.aircraft_to_track if icao in icao_lookup]
 
                 # Filter to only tracked aircraft

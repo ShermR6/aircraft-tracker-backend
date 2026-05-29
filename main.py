@@ -98,11 +98,7 @@ LICENSE_DURATION_DAYS = 30
 # webhook time to arrive and extend the license before users go dark.
 LICENSE_GRACE_PERIOD = timedelta(hours=2)
 
-# In-memory ground station heartbeat tracking { user_id_str: datetime }
-_ground_last_seen: dict = {}
-
-# In-memory SDR range data { user_id_str: {"range_nm": [...36 floats...], "updated_at": str} }
-_ground_range: dict = {}
+import ground_state as _gs
 
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
@@ -403,7 +399,7 @@ async def ground_ingest(
 
     db.commit()
 
-    _ground_last_seen[str(current_user.id)] = datetime.utcnow()
+    _gs.ground_last_seen[str(current_user.id)] = datetime.utcnow()
 
     return {
         "message": f"Alert processed — {alerts_sent}/{len(integrations)} notifications sent",
@@ -476,7 +472,7 @@ async def ground_heartbeat(current_user: User = Depends(get_current_user)):
     """Called by the ground station every minute to signal it is online."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
-    _ground_last_seen[str(current_user.id)] = datetime.utcnow()
+    _gs.ground_last_seen[str(current_user.id)] = datetime.utcnow()
     return {"ok": True}
 
 
@@ -485,8 +481,8 @@ async def ground_status(current_user: User = Depends(get_current_user)):
     """Returns whether this user's ground station is currently online."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
-    last_seen = _ground_last_seen.get(str(current_user.id))
-    online = last_seen is not None and (datetime.utcnow() - last_seen).total_seconds() < 120
+    last_seen = _gs.ground_last_seen.get(str(current_user.id))
+    online = _gs.is_ground_station_online(str(current_user.id))
     return {
         "online": online,
         "last_seen": last_seen.isoformat() if last_seen else None,
@@ -505,7 +501,7 @@ async def ground_range_post(
     range_nm = body.get("range_nm", [])
     if not isinstance(range_nm, list) or len(range_nm) != 36:
         raise HTTPException(status_code=400, detail="range_nm must be a list of 36 floats")
-    _ground_range[str(current_user.id)] = {
+    _gs.ground_range[str(current_user.id)] = {
         "range_nm": range_nm,
         "updated_at": datetime.utcnow().isoformat(),
     }
@@ -517,7 +513,7 @@ async def ground_range_get(current_user: User = Depends(get_current_user)):
     """Returns the latest SDR reception range polygon for this user."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
-    data = _ground_range.get(str(current_user.id))
+    data = _gs.ground_range.get(str(current_user.id))
     if not data:
         return {"range_nm": None, "updated_at": None}
     return data
