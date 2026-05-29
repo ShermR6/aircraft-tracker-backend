@@ -612,6 +612,9 @@ class CloudAircraftTracker:
                 json={'content': message},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
+                if response.status != 204:
+                    body = await response.text()
+                    print(f"Discord webhook failed: HTTP {response.status} — {body[:200]}")
                 return response.status == 204
 
     async def send_slack(self, config: dict, message: str) -> bool:
