@@ -342,9 +342,8 @@ class CloudAircraftTracker:
 
         for user_id, tracker in self.user_trackers.items():
             try:
-                # Skip users whose ground station is online — it handles their alerts directly
-                if _gs.is_ground_station_online(str(user_id)):
-                    continue
+                # When ground station is online it handles alerts — cloud tracker still tracks positions for live map
+                gs_online = _gs.is_ground_station_online(str(user_id))
 
                 aircraft_list = [icao_lookup[icao] for icao in tracker.aircraft_to_track if icao in icao_lookup]
 
@@ -398,8 +397,8 @@ class CloudAircraftTracker:
                         # Check and get notifications
                         notifications = await tracker.check_and_notify(aircraft_dict)
 
-                        # Send notifications (skip during quiet hours)
-                        if notifications and not tracker.in_quiet_hours():
+                        # Send notifications — skip if ground station is online (it handles alerts)
+                        if notifications and not tracker.in_quiet_hours() and not gs_online:
                             await self.send_notifications(user_id, notifications)
 
                 # Signal loss detection — check tracked aircraft NOT in the API response
@@ -413,7 +412,7 @@ class CloudAircraftTracker:
                         if (state.get('landing_ready', False)
                                 and not state.get('landed', False)
                                 and missing >= 3):
-                            if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours():
+                            if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours() and not gs_online:
                                 notifications = [{
                                     'type': 'landing',
                                     'tail': tail,
