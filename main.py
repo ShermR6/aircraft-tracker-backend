@@ -366,13 +366,17 @@ async def ground_ingest(
         "2nm":     "🔴 **{tail} - 2nm out** ETA ~{eta}min, Alt {altitude}ft MSL",
     }
     template = alert_settings.get(alert_type, default_templates.get(alert_type, "✈️ **{tail}** — {type} alert"))
+    airport_cfg = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
+    airport_code = airport_cfg.airport_code if airport_cfg else ""
+    tail_number = tail
     try:
         message = template.format(
-            tail=tail, distance=f"{float(distance):.1f}",
+            tail=tail, tail_number=tail_number,
+            distance=f"{float(distance):.1f}",
             altitude=f"{float(altitude):.0f}", eta=eta,
             speed=f"{float(speed):.0f}", type=alert_type,
             time=datetime.utcnow().strftime('%H:%M'),
-            airport=current_user.email,
+            airport=airport_code,
         )
     except Exception:
         message = f"✈️ {tail} — {alert_type} (Ground Station)"
