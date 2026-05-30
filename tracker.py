@@ -397,8 +397,10 @@ class CloudAircraftTracker:
                         # Check and get notifications
                         notifications = await tracker.check_and_notify(aircraft_dict)
 
-                        # Send notifications — skip if ground station is online (it handles alerts)
-                        if notifications and not tracker.in_quiet_hours() and not gs_online:
+                        # Cloud always sends distance alerts regardless of GS status.
+                        # GS handles takeoff/landing (local events); cloud is the fallback
+                        # for everything else and the primary for out-of-range distance alerts.
+                        if notifications and not tracker.in_quiet_hours():
                             await self.send_notifications(user_id, notifications)
 
                 # Signal loss detection — check tracked aircraft NOT in the API response
@@ -409,6 +411,7 @@ class CloudAircraftTracker:
                         state['consecutive_missing'] = missing
 
                         # If aircraft was ready for landing and disappeared for 3+ polls (~30 sec)
+                        # Only fire if GS is offline — GS handles landing detection when online
                         if (state.get('landing_ready', False)
                                 and not state.get('landed', False)
                                 and missing >= 3):
