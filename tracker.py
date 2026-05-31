@@ -838,17 +838,21 @@ class CloudAircraftTracker:
         return await self.send_via_integration(integration, test_message)
 
     async def get_live_aircraft(self, user_id: str) -> List[dict]:
-        """Get current aircraft data for a user"""
+        """Get current aircraft data for a user, preferring GS positions when online."""
         tracker = self.user_trackers.get(user_id)
         if not tracker:
             return []
 
-        # Return current state
+        field_elev = float(tracker.config['airspace'].get('field_elevation_ft_msl', 0))
+        center_lat = float(tracker.config['airspace']['center_lat'])
+        center_lon = float(tracker.config['airspace']['center_lon'])
+
         result = []
+        result_by_icao = {}
         for icao24, tail in tracker.aircraft_to_track.items():
             state = tracker.aircraft_state.get(icao24, {})
             if state:
-                result.append({
+                entry = {
                     'tail_number': tail,
                     'icao24': icao24,
                     'status': 'in_airspace' if state.get('in_airspace') else 'outside',
@@ -862,6 +866,61 @@ class CloudAircraftTracker:
                     'last_seen': state.get('last_update', datetime.utcnow()),
                     'latitude': state.get('latitude'),
                     'longitude': state.get('longitude'),
-                })
+                    'source': 'cloud',
+                }
+                result.append(entry)
+                result_by_icao[icao24] = entry
+
+        # Overlay GS positions when ground station is online — higher accuracy, 5s updates,
+        # includes on-ground aircraft that adsb.lol may not have
+        if _gs.is_ground_station_online(user_id):
+            gs_positions = _gs.ground_positions.get(user_id, {})
+            for icao24, gp in gs_positions.items():
+                if icao24 not in tracker.aircraft_to_track:
+                    continue
+                lat = gp.get('lat')
+                lon = gp.get('lon')
+                if lat is None or lon is None:
+                    continue
+                tail = tracker.aircraft_to_track[icao24]
+                alt_baro = gp.get('altitude', field_elev)
+                alt_msl = float(alt_baro) if alt_baro else field_elev
+                alt_agl = max(0, alt_msl - field_elev)
+                distance = tracker.haversine_distance(center_lat, center_lon, lat, lon)
+                on_ground = gp.get('on_ground', False)
+
+                if icao24 in result_by_icao:
+                    # Update existing cloud entry with fresher GS data
+                    e = result_by_icao[icao24]
+                    e.update({
+                        'latitude': lat,
+                        'longitude': lon,
+                        'on_ground': on_ground,
+                        'altitude_ft_agl': alt_agl,
+                        'altitude_ft_msl': alt_msl,
+                        'velocity_kts': gp.get('speed', e['velocity_kts']),
+                        'heading': gp.get('heading', e['heading']),
+                        'distance_nm': distance,
+                        'last_seen': datetime.utcnow(),
+                        'source': 'ground_station',
+                    })
+                else:
+                    # Aircraft only visible to GS (on ground, not in adsb.lol)
+                    result.append({
+                        'tail_number': tail,
+                        'icao24': icao24,
+                        'status': 'on_ground' if on_ground else 'outside',
+                        'on_ground': on_ground,
+                        'distance_nm': distance,
+                        'altitude_ft_agl': alt_agl,
+                        'altitude_ft_msl': alt_msl,
+                        'velocity_kts': gp.get('speed', 0),
+                        'heading': gp.get('heading', 0),
+                        'is_approaching': False,
+                        'last_seen': datetime.utcnow(),
+                        'latitude': lat,
+                        'longitude': lon,
+                        'source': 'ground_station',
+                    })
 
         return result

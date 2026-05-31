@@ -523,6 +523,21 @@ async def ground_range_get(current_user: User = Depends(get_current_user)):
     return data
 
 
+@app.post("/api/ground/positions")
+async def ground_positions_post(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Receives live aircraft positions from the ground station for the live map."""
+    if not getattr(current_user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    body = await request.json()
+    positions = body.get("positions", {})
+    if isinstance(positions, dict):
+        _gs.ground_positions[str(current_user.id)] = positions
+    return {"ok": True}
+
+
 @app.post("/api/admin/grant-ground-station")
 async def grant_ground_station(
     request: Request,

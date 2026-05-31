@@ -10,6 +10,9 @@ ground_last_seen: dict = {}
 # { user_id_str: {"range_nm": [...], "updated_at": str} }
 ground_range: dict = {}
 
+# { user_id_str: { icao24: { lat, lon, altitude, speed, heading, on_ground, updated_at } } }
+ground_positions: dict = {}
+
 GROUND_STATION_TIMEOUT_SECONDS = 180  # 3 minutes
 
 
