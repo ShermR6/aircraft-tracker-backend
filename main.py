@@ -497,6 +497,7 @@ async def ground_status(current_user: User = Depends(get_current_user)):
 async def ground_range_post(
     request: Request,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """Receives SDR reception range data (36 buckets, one per 10-degree bearing)."""
     if not getattr(current_user, 'ground_station_enabled', False):
@@ -505,19 +506,37 @@ async def ground_range_post(
     range_nm = body.get("range_nm", [])
     if not isinstance(range_nm, list) or len(range_nm) != 36:
         raise HTTPException(status_code=400, detail="range_nm must be a list of 36 floats")
+    updated_at = datetime.utcnow()
     _gs.ground_range[str(current_user.id)] = {
         "range_nm": range_nm,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": updated_at.isoformat(),
     }
+    airport_cfg = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
+    if airport_cfg:
+        airport_cfg.sdr_range_nm = range_nm
+        airport_cfg.sdr_range_updated_at = updated_at
+        db.commit()
     return {"ok": True}
 
 
 @app.get("/api/ground/range")
-async def ground_range_get(current_user: User = Depends(get_current_user)):
+async def ground_range_get(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Returns the latest SDR reception range polygon for this user."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     data = _gs.ground_range.get(str(current_user.id))
+    if not data:
+        # Fall back to DB (survives backend restarts)
+        airport_cfg = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
+        if airport_cfg and airport_cfg.sdr_range_nm:
+            data = {
+                "range_nm": airport_cfg.sdr_range_nm,
+                "updated_at": airport_cfg.sdr_range_updated_at.isoformat() if airport_cfg.sdr_range_updated_at else None,
+            }
+            _gs.ground_range[str(current_user.id)] = data
     if not data:
         return {"range_nm": None, "updated_at": None}
     return data

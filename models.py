@@ -90,6 +90,10 @@ class AirportConfig(Base):
     query_radius_nm = Column(String(10), default="100.0")
     alert_distances_nm = Column(JSON, default=["10.0", "5.0", "2.0"])
     
+    # SDR reception range (36 buckets, one per 10-degree bearing, in nm)
+    sdr_range_nm = Column(JSON, nullable=True)
+    sdr_range_updated_at = Column(DateTime, nullable=True)
+
     # Approach corridor
     runway_info = Column(JSON, nullable=True)          # [{ident, leHdg, heHdg, lengthFt}, ...]
     approach_corridor_enabled = Column(Boolean, default=False)
