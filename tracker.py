@@ -183,11 +183,38 @@ class UserTracker:
                 self.distance_alerts_sent[aircraft_id] = set()
                 if aircraft_id in self.aircraft_state:
                     self.aircraft_state[aircraft_id]['max_distance'] = distance_nm
+                    self.aircraft_state[aircraft_id]['landed'] = False
 
             if aircraft_id not in self.aircraft_state:
                 self.aircraft_state[aircraft_id] = {}
             self.aircraft_state[aircraft_id]['last_distance'] = distance_nm
             self.aircraft_state[aircraft_id]['max_distance'] = max_distance
+
+            # Takeoff: was on ground, now airborne and climbing
+            if was_on_ground is True and altitude_agl_ft > 200:
+                if self.should_notify('takeoff', aircraft_id):
+                    notifications.append({
+                        'type': 'takeoff',
+                        'tail': callsign,
+                        'distance': distance_nm,
+                        'altitude': altitude_msl_ft,
+                        'time': datetime.now(),
+                    })
+                self.aircraft_state[aircraft_id]['landed'] = False
+
+        # Landing: was airborne, now on ground, within 15nm
+        if was_on_ground is False and on_ground and distance_nm < 15.0:
+            if self.should_notify('landing', aircraft_id):
+                notifications.append({
+                    'type': 'landing',
+                    'tail': callsign,
+                    'distance': distance_nm,
+                    'altitude': altitude_msl_ft,
+                    'time': datetime.now(),
+                })
+                if aircraft_id not in self.aircraft_state:
+                    self.aircraft_state[aircraft_id] = {}
+                self.aircraft_state[aircraft_id]['landed'] = True
 
         # Update state
         if aircraft_id not in self.aircraft_state:
