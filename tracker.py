@@ -411,11 +411,23 @@ class CloudAircraftTracker:
                         state['consecutive_missing'] = missing
 
                         # If aircraft was ready for landing and disappeared for 3+ polls (~30 sec)
-                        # Only fire if GS is offline — GS handles landing detection when online
+                        # Cloud fires as fallback even when GS is online; dedup via NotificationLog
                         if (state.get('landing_ready', False)
                                 and not state.get('landed', False)
                                 and missing >= 3):
-                            if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours() and not gs_online:
+                            # Check NotificationLog to avoid double-firing if GS already sent
+                            from models import NotificationLog
+                            _db = SessionLocal()
+                            try:
+                                recent = _db.query(NotificationLog).filter(
+                                    NotificationLog.user_id == user_id,
+                                    NotificationLog.aircraft_tail == tail,
+                                    NotificationLog.alert_type == 'landing',
+                                    NotificationLog.sent_at >= datetime.utcnow() - timedelta(minutes=5),
+                                ).first()
+                            finally:
+                                _db.close()
+                            if tracker.should_notify('landing', icao24) and not tracker.in_quiet_hours() and not recent:
                                 notifications = [{
                                     'type': 'landing',
                                     'tail': tail,
