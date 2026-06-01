@@ -2155,6 +2155,19 @@ async def root():
 async def startup_event():
     """Start the global aircraft tracker on startup"""
     logger.info("Starting FinalPing Cloud Backend...")
+
+    # Auto-migrate: add SDR range columns if missing
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                ALTER TABLE airport_configs
+                ADD COLUMN IF NOT EXISTS sdr_range_nm JSONB,
+                ADD COLUMN IF NOT EXISTS sdr_range_updated_at TIMESTAMP;
+            """))
+            conn.commit()
+    except Exception as e:
+        logger.warning("SDR range migration skipped: %s", e)
+
     logger.info("Initializing global aircraft tracker...")
     await tracker.start()
 
