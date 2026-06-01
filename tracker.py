@@ -410,9 +410,11 @@ class CloudAircraftTracker:
                         missing = state.get('consecutive_missing', 0) + 1
                         state['consecutive_missing'] = missing
 
-                        # If aircraft was ready for landing and disappeared for 3+ polls (~30 sec)
+                        # If aircraft was close to airport and disappeared for 3+ polls (~30 sec)
+                        # Use last_distance instead of landing_ready so restarts don't break detection
                         # Cloud fires as fallback even when GS is online; dedup via NotificationLog
-                        if (state.get('landing_ready', False)
+                        if (state.get('last_distance', 999) < 5.0
+                                and not state.get('on_ground', False)
                                 and not state.get('landed', False)
                                 and missing >= 3):
                             # Check NotificationLog to avoid double-firing if GS already sent
