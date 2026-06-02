@@ -199,6 +199,7 @@ class UserTracker:
                     'tail': callsign,
                     'distance': distance_nm,
                     'altitude': altitude_msl_ft,
+                    'speed': aircraft_data.get('velocity') or 0,
                     'time': datetime.now(),
                 })
             self.aircraft_state[aircraft_id]['landed'] = False
@@ -613,6 +614,7 @@ class CloudAircraftTracker:
             distance=threshold,
             altitude=f"{notification.get('altitude', 0):.0f}",
             eta=notification.get('eta', 'N/A'),
+            speed=f"{notification.get('speed', 0):.0f}",
             time=notification.get('time', datetime.now()).strftime('%H:%M'),
             airport=notification.get('airport', ''),
         )
