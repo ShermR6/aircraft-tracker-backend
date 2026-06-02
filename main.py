@@ -512,11 +512,15 @@ async def ground_range_post(
         "range_nm": range_nm,
         "updated_at": updated_at.isoformat(),
     }
-    airport_cfg = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
-    if airport_cfg:
-        airport_cfg.sdr_range_nm = range_nm
-        airport_cfg.sdr_range_updated_at = updated_at
-        db.commit()
+    try:
+        airport_cfg = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
+        if airport_cfg:
+            airport_cfg.sdr_range_nm = range_nm
+            airport_cfg.sdr_range_updated_at = updated_at
+            db.commit()
+    except Exception as e:
+        logger.warning("Failed to persist range to DB: %s", e)
+        db.rollback()
     return {"ok": True}
 
 
