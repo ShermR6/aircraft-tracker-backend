@@ -106,9 +106,9 @@ WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
 # Tier feature limits (None = unlimited)
 TIER_LIMITS = {
-    "starter":      {"aircraft": 3,    "locations": 1,    "integrations": 2,    "channels": ["discord", "email"]},
-    "premium":      {"aircraft": 7,    "locations": 5,    "integrations": 4,    "channels": ["discord", "email", "slack", "teams", "google_chat"]},
-    "pro":          {"aircraft": 15,   "locations": None, "integrations": 5,    "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
+    "starter":      {"aircraft": 3,    "zones": 2,  "locations": 1,    "integrations": 1,    "channels": ["discord", "email"]},
+    "premium":      {"aircraft": 7,    "zones": 5,  "locations": 5,    "integrations": 3,    "channels": ["discord", "email", "slack", "teams", "google_chat"]},
+    "pro":          {"aircraft": 15,   "zones": 7,  "locations": None, "integrations": 5,    "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
     "team-starter": {"aircraft": 25,   "locations": 3,    "integrations": 3,    "channels": ["discord", "email"]},
     "team-premium": {"aircraft": 75,   "locations": 10,   "integrations": 10,   "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
     "team-pro":     {"aircraft": None, "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
@@ -1169,6 +1169,13 @@ async def save_airport_config(
     db: Session = Depends(get_db)
 ):
     """Create or update airport configuration"""
+    # Enforce approach zone limit
+    if "alert_distances_nm" in config_data:
+        tier = get_user_tier(current_user, db)
+        zone_limit = get_tier_limit(tier, "zones")
+        if zone_limit is not None and len(config_data["alert_distances_nm"]) > zone_limit:
+            raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {zone_limit} approach zones. Upgrade to add more.")
+
     # Auto-lookup elevation from coordinates if not provided
     lat = config_data.get("latitude")
     lon = config_data.get("longitude")
