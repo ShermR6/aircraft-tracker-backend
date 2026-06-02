@@ -395,8 +395,8 @@ class CloudAircraftTracker:
                             field_elev = float(tracker.config['airspace'].get('field_elevation_ft_msl', 0))
                             alt_agl = float(alt_baro) - field_elev if isinstance(alt_baro, (int, float)) else 999
 
-                            # On ground if: altitude within 150ft of field AND ground speed under 30kts
-                            if alt_agl < 150 and gs is not None and gs < 30:
+                            # On ground if: altitude within 150ft of field AND speed under 50kts (or no speed reported)
+                            if alt_agl < 150 and (gs is None or gs < 50):
                                 is_on_ground = True
 
                             # On ground if: very close to airport, low altitude, and stale position data (>30s)
