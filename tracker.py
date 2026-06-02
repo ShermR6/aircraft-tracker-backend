@@ -191,8 +191,8 @@ class UserTracker:
             self.aircraft_state[aircraft_id]['max_distance'] = max_distance
 
 
-        # Takeoff: was on ground, now airborne and climbing
-        if was_on_ground is True and on_ground is False and altitude_agl_ft > 200:
+        # Takeoff: was on ground, now airborne
+        if was_on_ground is True and on_ground is False:
             if self.should_notify('takeoff', aircraft_id):
                 notifications.append({
                     'type': 'takeoff',
