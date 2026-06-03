@@ -19,9 +19,9 @@ Setup:
 """
 
 import json
+import os
 import sys
 import time
-import os
 import requests
 from datetime import datetime
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
@@ -86,33 +86,46 @@ def api_post(endpoint, token, body):
     return r.json()
 
 
+DUMP1090_HTTP_URLS = [
+    DUMP1090_URL,
+    'http://localhost:8080/skyaware/data/aircraft.json',
+    'http://localhost/skyaware/data/aircraft.json',
+    'http://localhost:8888/data/aircraft.json',
+    'http://127.0.0.1:8080/data/aircraft.json',
+]
+
 DUMP1090_FILE_PATHS = [
     '/run/dump1090-fa/aircraft.json',
     '/run/readsb/aircraft.json',
     '/run/dump1090/aircraft.json',
+    '/var/run/dump1090-fa/aircraft.json',
     '/tmp/dump1090-fa/aircraft.json',
     '/tmp/dump1090/aircraft.json',
+    '/home/pi/dump1090/aircraft.json',
+    '/opt/dump1090-fa/data/aircraft.json',
 ]
 
+def _parse_aircraft_json(data):
+    return data.get('aircraft', data.get('ac', []))
+
 def fetch_dump1090():
-    # Try HTTP first
-    try:
-        r = requests.get(DUMP1090_URL, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        return data.get('aircraft', data.get('ac', []))
-    except Exception:
-        pass
+    # Try all known HTTP endpoints
+    for url in DUMP1090_HTTP_URLS:
+        try:
+            r = requests.get(url, timeout=3)
+            r.raise_for_status()
+            return _parse_aircraft_json(r.json())
+        except Exception:
+            continue
 
     # Fall back to reading aircraft.json directly from filesystem
-    import os
     for path in DUMP1090_FILE_PATHS:
         if os.path.exists(path):
             with open(path) as f:
                 data = json.load(f)
-            return data.get('aircraft', data.get('ac', []))
+            return _parse_aircraft_json(data)
 
-    raise RuntimeError(f"dump1090 not reachable at {DUMP1090_URL} and no aircraft.json found at known paths")
+    raise RuntimeError("dump1090 not reachable — checked HTTP ports and filesystem paths")
 
 
 def run():
@@ -153,14 +166,18 @@ def run():
 
     log(f"[OK] Location: {center_lat:.4f}, {center_lon:.4f} | Elevation: {field_elevation:.0f}ft MSL")
     log(f"[OK] Tracking {len(tracked)} aircraft: {', '.join(tracked.values()) or 'none configured'}")
-    # Detect which dump1090 source is available
-    import os
-    source_label = DUMP1090_URL
-    try:
-        requests.get(DUMP1090_URL, timeout=3).raise_for_status()
-    except Exception:
+    # Detect which dump1090 source is available and log it
+    source_label = "unknown"
+    for url in DUMP1090_HTTP_URLS:
+        try:
+            requests.get(url, timeout=2).raise_for_status()
+            source_label = url
+            break
+        except Exception:
+            continue
+    if source_label == "unknown":
         found = next((p for p in DUMP1090_FILE_PATHS if os.path.exists(p)), None)
-        source_label = found if found else f"{DUMP1090_URL} (not found — will retry)"
+        source_label = found if found else "not found yet — will keep retrying"
     log(f"[OK] Dump1090 source: {source_label}")
     log("Ground station running...")
 
