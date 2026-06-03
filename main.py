@@ -318,6 +318,74 @@ async def login(
     )
 
 
+@app.post("/api/auth/google-desktop", response_model=TokenResponse)
+@limiter.limit("10/minute")
+async def google_desktop_login(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Desktop Google OAuth login. Verifies the short-lived desktop token
+    issued by the website OAuth callback, then issues a Railway JWT.
+    """
+    import aiohttp
+    import os
+
+    body = await request.json()
+    token = body.get("token", "").strip()
+    email = body.get("email", "").strip().lower()
+
+    if not token or not email:
+        raise HTTPException(status_code=400, detail="Missing token or email")
+
+    website_url = os.environ.get("WEBSITE_URL", "https://finalpingapp.com")
+    internal_secret = os.environ.get("WEBHOOK_INTERNAL_SECRET", "")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{website_url}/api/auth/google/desktop-verify",
+                json={"token": token, "email": email},
+                headers={"x-internal-secret": internal_secret},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    raise HTTPException(status_code=401, detail="Invalid or expired OAuth token")
+                verified = await resp.json()
+    except aiohttp.ClientError:
+        raise HTTPException(status_code=502, detail="Could not reach verification service.")
+
+    if not verified.get("valid"):
+        raise HTTPException(status_code=401, detail="Invalid or expired OAuth token")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(email=email)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logger.info("Auto-created account for Google OAuth user %s", email)
+
+    license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
+    tier = "free"
+    expires_at = None
+    if license:
+        if license.status == "expired" or (license.expires_at and license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow()):
+            raise HTTPException(status_code=401, detail="license_expired")
+        tier = license.tier
+        expires_at = license.expires_at
+
+    access_token = create_access_token(str(user.id))
+    return TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        user_id=str(user.id),
+        email=user.email,
+        license_tier=tier,
+        expires_at=expires_at,
+    )
+
+
 @app.post("/api/ground/ingest")
 async def ground_ingest(
     request: Request,
