@@ -157,9 +157,9 @@ class UserTracker:
                         if self.should_notify(f'distance_{alert_distance}', aircraft_id):
                             speed_kts = aircraft_data.get('velocity')
                             if speed_kts and speed_kts > 30:
-                                eta_minutes = max(1, int((distance_nm / speed_kts) * 60))
+                                eta_minutes = max(1, int((distance_nm / speed_kts) * 60)) + 2
                             else:
-                                eta_minutes = max(1, int(distance_nm / 1.5))
+                                eta_minutes = max(1, int(distance_nm / 1.5)) + 2
                             notifications.append({
                                 'type': alert_key,
                                 'tail': callsign,
