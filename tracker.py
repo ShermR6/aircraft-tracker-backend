@@ -608,16 +608,19 @@ class CloudAircraftTracker:
             threshold = alert_type.replace('nm', '')
         else:
             threshold = f"{notification.get('distance', 0):.1f}"
-        return template.format(
-            tail=tail,
-            tail_number=tail,
-            distance=threshold,
-            altitude=f"{notification.get('altitude', 0):.0f}",
-            eta=notification.get('eta', 'N/A'),
-            speed=f"{notification.get('speed', 0):.0f}",
-            time=notification.get('time', datetime.now()).strftime('%H:%M'),
-            airport=notification.get('airport', ''),
-        )
+        try:
+            return template.format(
+                tail=tail,
+                tail_number=tail,
+                distance=threshold,
+                altitude=f"{notification.get('altitude', 0):.0f}",
+                eta=notification.get('eta', 'N/A'),
+                speed=f"{notification.get('speed', 0):.0f}",
+                time=notification.get('time', datetime.now()).strftime('%H:%M'),
+                airport=notification.get('airport', ''),
+            )
+        except (KeyError, ValueError):
+            return self.format_message(self.get_default_template(alert_type), notification)
 
     async def send_via_integration(self, integration: Integration, message: str) -> bool:
         """Send notification via specific integration"""
