@@ -86,11 +86,33 @@ def api_post(endpoint, token, body):
     return r.json()
 
 
+DUMP1090_FILE_PATHS = [
+    '/run/dump1090-fa/aircraft.json',
+    '/run/readsb/aircraft.json',
+    '/run/dump1090/aircraft.json',
+    '/tmp/dump1090-fa/aircraft.json',
+    '/tmp/dump1090/aircraft.json',
+]
+
 def fetch_dump1090():
-    r = requests.get(DUMP1090_URL, timeout=5)
-    r.raise_for_status()
-    data = r.json()
-    return data.get('aircraft', data.get('ac', []))
+    # Try HTTP first
+    try:
+        r = requests.get(DUMP1090_URL, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        return data.get('aircraft', data.get('ac', []))
+    except Exception:
+        pass
+
+    # Fall back to reading aircraft.json directly from filesystem
+    import os
+    for path in DUMP1090_FILE_PATHS:
+        if os.path.exists(path):
+            with open(path) as f:
+                data = json.load(f)
+            return data.get('aircraft', data.get('ac', []))
+
+    raise RuntimeError(f"dump1090 not reachable at {DUMP1090_URL} and no aircraft.json found at known paths")
 
 
 def run():
@@ -131,7 +153,15 @@ def run():
 
     log(f"[OK] Location: {center_lat:.4f}, {center_lon:.4f} | Elevation: {field_elevation:.0f}ft MSL")
     log(f"[OK] Tracking {len(tracked)} aircraft: {', '.join(tracked.values()) or 'none configured'}")
-    log(f"[OK] Dump1090 URL: {DUMP1090_URL}")
+    # Detect which dump1090 source is available
+    import os
+    source_label = DUMP1090_URL
+    try:
+        requests.get(DUMP1090_URL, timeout=3).raise_for_status()
+    except Exception:
+        found = next((p for p in DUMP1090_FILE_PATHS if os.path.exists(p)), None)
+        source_label = found if found else f"{DUMP1090_URL} (not found — will retry)"
+    log(f"[OK] Dump1090 source: {source_label}")
     log("Ground station running...")
 
     # SDR range: 36 buckets, one per 10-degree bearing
