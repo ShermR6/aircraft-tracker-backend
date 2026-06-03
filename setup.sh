@@ -42,11 +42,8 @@ fi
 
 # Install Python dependency
 echo "[4/5] Installing dependencies..."
-if apt-get install -y python3-requests 2>/dev/null; then
-  echo "  installed via apt"
-else
-  pip3 install --quiet requests --break-system-packages 2>/dev/null || pip3 install --quiet requests
-fi
+apt-get update -qq
+apt-get install -y python3-requests
 
 # Install systemd service
 echo "[5/5] Installing service..."
