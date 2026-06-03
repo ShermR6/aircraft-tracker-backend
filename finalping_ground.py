@@ -9,18 +9,19 @@ Setup:
      OR set the FINALPING_TOKEN environment variable.
 
   2. Install dependencies:
-       pip3 install requests
+       sudo apt-get install -y python3-requests
 
   3. Run:
        python3 finalping_ground.py
 
-  Dump1090 URL defaults to http://localhost:8080/data/aircraft.json
-  Override with DUMP1090_URL environment variable.
+  Data source priority: HTTP JSON API → filesystem aircraft.json → SBS TCP stream (port 30003)
 """
 
 import json
 import os
+import socket
 import sys
+import threading
 import time
 import requests
 from datetime import datetime
@@ -28,11 +29,38 @@ from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
 API_BASE = 'https://aircraft-tracker-backend-production.up.railway.app'
 DUMP1090_URL = os.environ.get('DUMP1090_URL', 'http://localhost:8080/data/aircraft.json')
+SBS_HOST = os.environ.get('SBS_HOST', 'localhost')
+SBS_PORT = int(os.environ.get('SBS_PORT', '30003'))
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 
-POLL_INTERVAL = 5        # seconds between position pushes
-HEARTBEAT_INTERVAL = 60  # seconds between heartbeats
-RANGE_PUSH_INTERVAL = 300  # seconds between SDR range updates
+POLL_INTERVAL = 5
+HEARTBEAT_INTERVAL = 60
+RANGE_PUSH_INTERVAL = 300
+
+DUMP1090_HTTP_URLS = [
+    DUMP1090_URL,
+    'http://localhost:8080/skyaware/data/aircraft.json',
+    'http://localhost/skyaware/data/aircraft.json',
+    'http://localhost:8888/data/aircraft.json',
+    'http://127.0.0.1:8080/data/aircraft.json',
+]
+
+DUMP1090_FILE_PATHS = [
+    '/run/dump1090-fa/aircraft.json',
+    '/run/readsb/aircraft.json',
+    '/run/dump1090/aircraft.json',
+    '/var/run/dump1090-fa/aircraft.json',
+    '/tmp/dump1090-fa/aircraft.json',
+    '/tmp/dump1090/aircraft.json',
+    '/home/pi/dump1090/aircraft.json',
+    '/opt/dump1090-fa/data/aircraft.json',
+]
+
+# ── SBS stream state ──────────────────────────────────────────────────────────
+_sbs_aircraft = {}   # { hex: { hex, lat, lon, alt_baro, gs, track, on_ground } }
+_sbs_lock = threading.Lock()
+_sbs_connected = False
+_sbs_use = False     # set True once we confirm SBS is the chosen source
 
 
 def log(msg):
@@ -66,67 +94,115 @@ def load_token():
 
 
 def api_get(endpoint, token):
-    r = requests.get(
-        f"{API_BASE}{endpoint}",
-        headers={'Authorization': f'Bearer {token}'},
-        timeout=10,
-    )
+    r = requests.get(f"{API_BASE}{endpoint}", headers={'Authorization': f'Bearer {token}'}, timeout=10)
     r.raise_for_status()
     return r.json()
 
 
 def api_post(endpoint, token, body):
-    r = requests.post(
-        f"{API_BASE}{endpoint}",
-        json=body,
-        headers={'Authorization': f'Bearer {token}'},
-        timeout=10,
-    )
+    r = requests.post(f"{API_BASE}{endpoint}", json=body, headers={'Authorization': f'Bearer {token}'}, timeout=10)
     r.raise_for_status()
     return r.json()
 
 
-DUMP1090_HTTP_URLS = [
-    DUMP1090_URL,
-    'http://localhost:8080/skyaware/data/aircraft.json',
-    'http://localhost/skyaware/data/aircraft.json',
-    'http://localhost:8888/data/aircraft.json',
-    'http://127.0.0.1:8080/data/aircraft.json',
-]
+# ── SBS reader (background thread) ───────────────────────────────────────────
 
-DUMP1090_FILE_PATHS = [
-    '/run/dump1090-fa/aircraft.json',
-    '/run/readsb/aircraft.json',
-    '/run/dump1090/aircraft.json',
-    '/var/run/dump1090-fa/aircraft.json',
-    '/tmp/dump1090-fa/aircraft.json',
-    '/tmp/dump1090/aircraft.json',
-    '/home/pi/dump1090/aircraft.json',
-    '/opt/dump1090-fa/data/aircraft.json',
-]
+def _parse_sbs_line(line):
+    if not line.startswith('MSG'):
+        return
+    parts = line.split(',')
+    if len(parts) < 16:
+        return
+    msg_type = parts[1].strip()
+    hex_id = parts[4].strip().lower()
+    if not hex_id:
+        return
 
-def _parse_aircraft_json(data):
-    return data.get('aircraft', data.get('ac', []))
+    def field(i):
+        return parts[i].strip() if i < len(parts) and parts[i].strip() else None
+
+    with _sbs_lock:
+        if hex_id not in _sbs_aircraft:
+            _sbs_aircraft[hex_id] = {'hex': hex_id}
+        ac = _sbs_aircraft[hex_id]
+        ac['last_seen'] = time.time()
+
+        if msg_type == '1':
+            cs = field(10)
+            if cs:
+                ac['flight'] = cs
+
+        elif msg_type == '2':  # surface position — always on ground
+            if field(14): ac['lat'] = float(parts[14])
+            if field(15): ac['lon'] = float(parts[15])
+            if field(12): ac['gs'] = float(parts[12])
+            if field(13): ac['track'] = float(parts[13])
+            ac['alt_baro'] = 'ground'
+            ac['on_ground'] = True
+
+        elif msg_type == '3':  # airborne position
+            if field(11): ac['alt_baro'] = int(parts[11])
+            if field(14): ac['lat'] = float(parts[14])
+            if field(15): ac['lon'] = float(parts[15])
+            on_g = field(21) if len(parts) > 21 else None
+            ac['on_ground'] = (on_g == '-1')
+
+        elif msg_type == '4':  # velocity
+            if field(12): ac['gs'] = float(parts[12])
+            if field(13): ac['track'] = float(parts[13])
+
+
+def _sbs_reader_thread():
+    global _sbs_connected
+    while True:
+        try:
+            with socket.create_connection((SBS_HOST, SBS_PORT), timeout=10) as sock:
+                _sbs_connected = True
+                log(f"[OK] SBS stream connected on port {SBS_PORT}")
+                sock.settimeout(30)
+                buf = ''
+                while True:
+                    chunk = sock.recv(4096).decode('utf-8', errors='replace')
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while '\n' in buf:
+                        line, buf = buf.split('\n', 1)
+                        _parse_sbs_line(line.strip())
+        except Exception:
+            pass
+        _sbs_connected = False
+        time.sleep(5)
+
 
 def fetch_dump1090():
-    # Try all known HTTP endpoints
+    # 1. HTTP JSON API
     for url in DUMP1090_HTTP_URLS:
         try:
             r = requests.get(url, timeout=3)
             r.raise_for_status()
-            return _parse_aircraft_json(r.json())
+            data = r.json()
+            return data.get('aircraft', data.get('ac', []))
         except Exception:
             continue
 
-    # Fall back to reading aircraft.json directly from filesystem
+    # 2. Filesystem aircraft.json
     for path in DUMP1090_FILE_PATHS:
         if os.path.exists(path):
             with open(path) as f:
                 data = json.load(f)
-            return _parse_aircraft_json(data)
+            return data.get('aircraft', data.get('ac', []))
 
-    raise RuntimeError("dump1090 not reachable — checked HTTP ports and filesystem paths")
+    # 3. SBS stream state
+    if _sbs_connected:
+        cutoff = time.time() - 30  # drop aircraft not seen in 30s
+        with _sbs_lock:
+            return [dict(ac) for ac in _sbs_aircraft.values() if ac.get('last_seen', 0) > cutoff]
 
+    raise RuntimeError("dump1090 not reachable via HTTP, filesystem, or SBS stream")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
     token = load_token()
@@ -166,8 +242,13 @@ def run():
 
     log(f"[OK] Location: {center_lat:.4f}, {center_lon:.4f} | Elevation: {field_elevation:.0f}ft MSL")
     log(f"[OK] Tracking {len(tracked)} aircraft: {', '.join(tracked.values()) or 'none configured'}")
-    # Detect which dump1090 source is available and log it
-    source_label = "unknown"
+
+    # Start SBS background thread — connects regardless, used as fallback
+    t = threading.Thread(target=_sbs_reader_thread, daemon=True)
+    t.start()
+
+    # Detect which source will be used
+    source_label = None
     for url in DUMP1090_HTTP_URLS:
         try:
             requests.get(url, timeout=2).raise_for_status()
@@ -175,13 +256,13 @@ def run():
             break
         except Exception:
             continue
-    if source_label == "unknown":
-        found = next((p for p in DUMP1090_FILE_PATHS if os.path.exists(p)), None)
-        source_label = found if found else "not found yet — will keep retrying"
+    if not source_label:
+        source_label = next((p for p in DUMP1090_FILE_PATHS if os.path.exists(p)), None)
+    if not source_label:
+        source_label = f"SBS stream port {SBS_PORT} (waiting for connection...)"
     log(f"[OK] Dump1090 source: {source_label}")
     log("Ground station running...")
 
-    # SDR range: 36 buckets, one per 10-degree bearing
     range_nm = [0.0] * 36
     last_heartbeat = 0.0
     last_range_push = 0.0
@@ -216,7 +297,6 @@ def run():
             icao24 = ac.get('hex', '').lower()
             if icao24 not in tracked:
                 continue
-
             lat = ac.get('lat')
             lon = ac.get('lon')
             if lat is None or lon is None:
@@ -224,7 +304,7 @@ def run():
 
             gs = ac.get('gs')
             alt_baro = ac.get('alt_baro')
-            on_ground = (alt_baro == 'ground') or (gs is not None and gs < 50)
+            on_ground = ac.get('on_ground', False) or (alt_baro == 'ground') or (gs is not None and gs < 50)
             altitude = field_elevation if on_ground else (float(alt_baro) if alt_baro and alt_baro != 'ground' else field_elevation)
             speed_kts = float(gs) if gs is not None else 0.0
             heading = float(ac.get('track') or 0)
