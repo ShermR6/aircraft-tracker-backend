@@ -44,12 +44,40 @@ fi
 # Install dependencies
 echo "[4/6] Installing dependencies..."
 apt-get update -qq
-apt-get install -y python3-requests hostapd dnsmasq
+apt-get install -y python3-requests hostapd dnsmasq mlat-client
 
 # Disable hostapd/dnsmasq auto-start (only used by portal when needed)
 systemctl disable hostapd 2>/dev/null || true
 systemctl disable dnsmasq 2>/dev/null || true
 systemctl stop hostapd   2>/dev/null || true
+
+# Install adsb.lol feeder service (feeds Beast data from dump1090 port 30005)
+cat > /etc/systemd/system/adsblol-feed.service <<EOF
+[Unit]
+Description=adsb.lol ADS-B Feeder
+After=network.target dump1090-fa.service
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/usr/bin/mlat-client \
+  --input-type dump1090 \
+  --input-connect localhost:30005 \
+  --server feed.adsb.lol:31090 \
+  --no-udp \
+  --results beast,connect,localhost:30104
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable adsblol-feed
+systemctl restart adsblol-feed 2>/dev/null || true
 
 # Install systemd service
 echo "[5/6] Installing service..."
