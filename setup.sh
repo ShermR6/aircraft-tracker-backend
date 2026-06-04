@@ -79,6 +79,63 @@ systemctl daemon-reload
 systemctl enable adsblol-feed
 systemctl restart adsblol-feed 2>/dev/null || true
 
+# Install hourly auto-updater
+cat > /usr/local/bin/finalping-update.sh <<'UPDATESCRIPT'
+#!/bin/bash
+DIR="/home/pi/finalping-ground"
+BASE_URL="https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
+CHANGED=0
+
+for script in finalping_boot.sh finalping_ground.py setup_portal.py; do
+  if curl -fsSL --max-time 15 "$BASE_URL/$script" -o "$DIR/$script.tmp" 2>/dev/null; then
+    if ! cmp -s "$DIR/$script.tmp" "$DIR/$script" 2>/dev/null; then
+      mv "$DIR/$script.tmp" "$DIR/$script"
+      chmod +x "$DIR/$script"
+      echo "$(date '+%H:%M:%S') [UPDATE] $script updated"
+      CHANGED=1
+    else
+      rm -f "$DIR/$script.tmp"
+    fi
+  else
+    rm -f "$DIR/$script.tmp"
+  fi
+done
+
+if [ "$CHANGED" = "1" ]; then
+  echo "$(date '+%H:%M:%S') [UPDATE] Restarting ground station..."
+  systemctl restart finalping-ground
+fi
+UPDATESCRIPT
+chmod +x /usr/local/bin/finalping-update.sh
+
+cat > /etc/systemd/system/finalping-update.service <<EOF
+[Unit]
+Description=FinalPing Ground Station Updater
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/finalping-update.sh
+StandardOutput=journal
+StandardError=journal
+EOF
+
+cat > /etc/systemd/system/finalping-update.timer <<EOF
+[Unit]
+Description=FinalPing Ground Station Hourly Update Check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+Unit=finalping-update.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable finalping-update.timer
+systemctl start finalping-update.timer
+
 # Install systemd service
 echo "[5/6] Installing service..."
 cat > "$SERVICE_FILE" <<EOF
