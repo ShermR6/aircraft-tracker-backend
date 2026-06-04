@@ -22,7 +22,7 @@ import requests
 from datetime import datetime
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "3.0"
+VERSION    = "3.1"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -266,11 +266,14 @@ def run():
     t = threading.Thread(target=_sbs_reader_thread, daemon=True)
     t.start()
 
-    source_label = next((u for u in DUMP1090_HTTP_URLS if requests.get(u, timeout=2).status_code == 200), None) if True else None
-    try:
-        source_label = next((u for u in DUMP1090_HTTP_URLS if requests.get(u, timeout=2).status_code == 200), None)
-    except Exception:
-        source_label = None
+    source_label = None
+    for u in DUMP1090_HTTP_URLS:
+        try:
+            if requests.get(u, timeout=2).status_code == 200:
+                source_label = u
+                break
+        except Exception:
+            continue
     if not source_label:
         source_label = next((p for p in DUMP1090_FILE_PATHS if os.path.exists(p)), None)
     if not source_label:
