@@ -860,6 +860,15 @@ async def activate_license(
                 db.add(TeamMember(team_id=team.id, user_id=user.id, role="member"))
                 db.commit()
 
+    # Auto-enable Ground Station for Pro license holders
+    if license.tier == "pro":
+        if not getattr(user, 'ground_station_enabled', False):
+            user.ground_station_enabled = True
+        if not user.gs_device_key:
+            import secrets
+            user.gs_device_key = secrets.token_hex(32)
+        db.commit()
+
     # Create access token
     access_token = create_access_token(str(user.id))
 
@@ -2015,11 +2024,14 @@ async def expire_license(
     license.expires_at = datetime.utcnow()
     db.commit()
 
-    # Stop tracking for any user currently using this license
+    # Stop tracking and revoke GS access for any user on this license
     try:
         user = db.query(User).filter(User.license_id == license.id).first()
         if user:
             tracker.remove_user(str(user.id))
+            if getattr(user, 'ground_station_enabled', False):
+                user.ground_station_enabled = False
+                db.commit()
     except Exception as e:
         logger.error("Failed to stop tracker for expired license %s: %s", license_key, e)
 
@@ -2046,8 +2058,26 @@ async def update_license_tier(
     if not license:
         raise HTTPException(status_code=404, detail="License not found")
 
+    old_tier = license.tier
     license.tier = new_tier
     db.commit()
+
+    # Sync GS access with tier change
+    try:
+        user = db.query(User).filter(User.license_id == license.id).first()
+        if user:
+            if new_tier == "pro" and not getattr(user, 'ground_station_enabled', False):
+                user.ground_station_enabled = True
+                if not user.gs_device_key:
+                    import secrets
+                    user.gs_device_key = secrets.token_hex(32)
+                db.commit()
+            elif old_tier == "pro" and new_tier != "pro":
+                user.ground_station_enabled = False
+                db.commit()
+    except Exception as e:
+        logger.error("Failed to sync GS access on tier change %s: %s", license_key, e)
+
     return {"message": "Tier updated", "tier": new_tier}
 
 
