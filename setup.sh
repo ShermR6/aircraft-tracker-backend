@@ -1,52 +1,58 @@
 #!/usr/bin/env bash
 # FinalPing Ground Station Setup
 # Usage: curl -sSL https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main/setup.sh | sudo bash -s -- "YOUR_TOKEN"
+# Omit token to install in hotspot-portal mode (for pre-flashed SD cards).
 
 set -e
 
 TOKEN="$1"
-
-if [ -z "$TOKEN" ]; then
-  echo "[ERR] No token provided."
-  echo "Usage: curl -sSL .../setup.sh | sudo bash -s -- \"YOUR_TOKEN\""
-  exit 1
-fi
-
+BASE_URL="https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 INSTALL_DIR="/home/pi/finalping-ground"
 SERVICE_FILE="/etc/systemd/system/finalping-ground.service"
-SCRIPT_URL="https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main/finalping_ground.py"
 
-echo "=============================="
+echo "================================"
 echo " FinalPing Ground Station"
-echo "=============================="
+echo "================================"
 
 # Install dir
 mkdir -p "$INSTALL_DIR"
-echo "[1/5] Created $INSTALL_DIR"
+echo "[1/6] Created $INSTALL_DIR"
 
-# Download ground station script
-echo "[2/5] Downloading finalping_ground.py..."
-curl -sSL "$SCRIPT_URL" -o "$INSTALL_DIR/finalping_ground.py"
-chmod +x "$INSTALL_DIR/finalping_ground.py"
+# Download scripts
+echo "[2/6] Downloading scripts..."
+curl -sSL "$BASE_URL/finalping_ground.py" -o "$INSTALL_DIR/finalping_ground.py"
+curl -sSL "$BASE_URL/setup_portal.py"    -o "$INSTALL_DIR/setup_portal.py"
+curl -sSL "$BASE_URL/finalping_boot.sh"  -o "$INSTALL_DIR/finalping_boot.sh"
+chmod +x "$INSTALL_DIR/finalping_boot.sh"
 
-# Write config
-echo "[3/5] Writing config..."
-cat > "$INSTALL_DIR/config.json" <<EOF
+# Write config if token provided
+if [ -n "$TOKEN" ]; then
+  echo "[3/6] Writing config..."
+  cat > "$INSTALL_DIR/config.json" <<EOF
 {"token": "$TOKEN"}
 EOF
+else
+  echo "[3/6] No token provided — will use setup portal on first boot"
+  rm -f "$INSTALL_DIR/config.json"
+fi
 
-# Set ownership (in case running as sudo)
+# Set ownership
 if id "pi" &>/dev/null; then
   chown -R pi:pi "$INSTALL_DIR"
 fi
 
-# Install Python dependency
-echo "[4/5] Installing dependencies..."
+# Install dependencies
+echo "[4/6] Installing dependencies..."
 apt-get update -qq
-apt-get install -y python3-requests
+apt-get install -y python3-requests hostapd dnsmasq
+
+# Disable hostapd/dnsmasq auto-start (only used by portal when needed)
+systemctl disable hostapd 2>/dev/null || true
+systemctl disable dnsmasq 2>/dev/null || true
+systemctl stop hostapd   2>/dev/null || true
 
 # Install systemd service
-echo "[5/5] Installing service..."
+echo "[5/6] Installing service..."
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=FinalPing Ground Station
@@ -54,9 +60,9 @@ After=network.target dump1090-fa.service
 
 [Service]
 Type=simple
-User=pi
+User=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/python3 $INSTALL_DIR/finalping_ground.py
+ExecStart=/bin/bash $INSTALL_DIR/finalping_boot.sh
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -71,8 +77,13 @@ systemctl enable finalping-ground
 systemctl restart finalping-ground
 
 echo ""
-echo "=============================="
-echo " Done! Ground station running."
-echo " Check status: sudo systemctl status finalping-ground"
-echo " View logs:    sudo journalctl -u finalping-ground -f"
-echo "=============================="
+echo "================================"
+if [ -n "$TOKEN" ]; then
+  echo " Done! Ground station running."
+else
+  echo " Done! On next boot, connect to"
+  echo " WiFi: FinalPing_Setup"
+  echo " Then open http://192.168.4.1"
+fi
+echo " Logs: sudo journalctl -u finalping-ground -f"
+echo "================================"
