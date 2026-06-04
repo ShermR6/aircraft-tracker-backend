@@ -106,6 +106,7 @@ class LiveAircraftResponse(BaseModel):
     last_seen: datetime
     latitude: Optional[float]
     longitude: Optional[float]
+    source: Optional[str] = 'cloud'
 
 
 # ============================================================================
