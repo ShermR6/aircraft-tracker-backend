@@ -10,6 +10,7 @@ is_configured() {
 import json, sys
 try:
     d = json.load(open("/home/pi/finalping-ground/config.json"))
+    # Has a valid token — ready to run
     sys.exit(0 if d.get("token") else 1)
 except:
     sys.exit(1)

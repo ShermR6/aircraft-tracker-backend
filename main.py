@@ -641,6 +641,34 @@ async def ground_positions_post(
     return {"ok": True}
 
 
+@app.post("/api/ground/claim")
+@limiter.limit("10/minute")
+async def ground_claim(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """
+    Called by a Pi on first boot after connecting to WiFi.
+    Takes the user's email and returns their GS device key if GS is enabled.
+    No auth required — the device key is the credential returned, not input.
+    """
+    body = await request.json()
+    email = body.get("email", "").lower().strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not getattr(user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="Ground station not enabled for this account")
+
+    if not user.gs_device_key:
+        import secrets
+        user.gs_device_key = secrets.token_hex(32)
+        db.commit()
+
+    return {"gs_device_key": user.gs_device_key}
+
+
 @app.post("/api/admin/grant-ground-station")
 async def grant_ground_station(
     request: Request,

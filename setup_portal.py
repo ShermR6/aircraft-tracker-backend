@@ -72,8 +72,8 @@ button{width:100%;background:#0ea5e9;border:none;border-radius:10px;padding:12px
     <label>WiFi Password</label>
     <input type="password" name="wifi_password" placeholder="WiFi password" autocomplete="off">
     <div class="divider"></div>
-    <label>FinalPing Token</label>
-    <input type="text" name="token" placeholder="Paste your token from the FinalPing app" required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
+    <label>FinalPing Account Email</label>
+    <input type="email" name="email" placeholder="Email used to log into FinalPing" required autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false">
     <button type="submit">Save &amp; Connect</button>
   </form>
   <div class="note">The ground station will reboot and join your network.<br>This page will go offline.</div>
@@ -130,11 +130,11 @@ class PortalHandler(BaseHTTPRequestHandler):
 
         ssid          = params.get("ssid",          [""])[0].strip()
         wifi_password = params.get("wifi_password", [""])[0]
-        token         = params.get("token",         [""])[0].strip()
+        email         = params.get("email",         [""])[0].strip().lower()
 
         self._serve(200, HTML_DONE)
 
-        t = threading.Thread(target=save_and_reboot, args=(ssid, wifi_password, token), daemon=True)
+        t = threading.Thread(target=save_and_reboot, args=(ssid, wifi_password, email), daemon=True)
         t.start()
 
     def _serve(self, code, html):
@@ -190,15 +190,12 @@ server=8.8.8.8
     log(f"[OK] Setup portal at http://{AP_IP}")
 
 
-def save_and_reboot(ssid, wifi_password, token):
+def save_and_reboot(ssid, wifi_password, email):
+    import urllib.request
     time.sleep(1)
-    log("Saving config...")
+    log("Saving WiFi config...")
 
-    # Save token
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({"token": token}, f)
-
-    # Stop AP
+    # Stop AP first so WiFi interface is free
     if _hostapd_proc:
         _hostapd_proc.terminate()
     if _dnsmasq_proc:
@@ -208,7 +205,7 @@ def save_and_reboot(ssid, wifi_password, token):
     nm = subprocess.run(["which", "nmcli"], capture_output=True)
     if nm.returncode == 0:
         subprocess.run(["nmcli", "radio", "wifi", "on"], capture_output=True)
-        time.sleep(2)
+        time.sleep(3)
         subprocess.run(["nmcli", "dev", "wifi", "connect", ssid, "password", wifi_password,
                         "ifname", INTERFACE], capture_output=True)
     else:
@@ -217,6 +214,39 @@ def save_and_reboot(ssid, wifi_password, token):
                f'network={{\n    ssid="{ssid}"\n    psk="{wifi_password}"\n}}\n')
         with open("/etc/wpa_supplicant/wpa_supplicant.conf", "w") as f:
             f.write(wpa)
+        subprocess.run(["wpa_cli", "-i", INTERFACE, "reconfigure"], capture_output=True)
+
+    # Wait for internet connection then claim device key from backend
+    log("Waiting for internet connection...")
+    token = None
+    for attempt in range(12):  # up to 60s
+        time.sleep(5)
+        try:
+            data = json.dumps({"email": email}).encode()
+            req = urllib.request.Request(
+                "https://aircraft-tracker-backend-production.up.railway.app/api/ground/claim",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read())
+                token = result.get("gs_device_key")
+            if token:
+                log("[OK] Device key claimed from backend")
+                break
+        except Exception as e:
+            log(f"Claim attempt {attempt + 1}/12: {e}")
+
+    if not token:
+        log("[ERR] Could not claim device key — check email and GS access, then reboot")
+        # Save email so we can retry on next boot
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"pending_email": email}, f)
+        return
+
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"token": token}, f)
 
     log("[OK] Config saved — rebooting...")
     time.sleep(1)
