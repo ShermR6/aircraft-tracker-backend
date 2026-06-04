@@ -177,9 +177,19 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
-    """Verify JWT token and return current user"""
+    """Verify JWT token or GS device key and return current user"""
+    token = credentials.credentials
+
+    # GS device keys are 64-char hex strings — try that path first (no JWT decode needed)
+    if len(token) == 64 and all(c in '0123456789abcdef' for c in token.lower()):
+        user = db.query(User).filter(User.gs_device_key == token).first()
+        if user is None:
+            raise HTTPException(status_code=401, detail="Invalid device key")
+        if not getattr(user, 'ground_station_enabled', False):
+            raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+        return user
+
     try:
-        token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         if user_id is None:
@@ -188,7 +198,7 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    
+
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
@@ -559,6 +569,7 @@ async def ground_status(current_user: User = Depends(get_current_user)):
     return {
         "online": online,
         "last_seen": last_seen.isoformat() if last_seen else None,
+        "gs_device_key": getattr(current_user, 'gs_device_key', None),
     }
 
 
@@ -649,11 +660,18 @@ async def grant_ground_station(
         raise HTTPException(status_code=404, detail="User not found")
 
     user.ground_station_enabled = enabled
+
+    # Generate a permanent device key when enabling GS for the first time
+    if enabled and not user.gs_device_key:
+        import secrets
+        user.gs_device_key = secrets.token_hex(32)
+
     db.commit()
 
     return {
         "email": email,
         "ground_station_enabled": enabled,
+        "gs_device_key": user.gs_device_key if enabled else None,
         "message": f"Ground station {'enabled' if enabled else 'disabled'} for {email}",
     }
 
