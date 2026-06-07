@@ -328,6 +328,64 @@ class CloudAircraftTracker:
         # Create or update tracker
         self.user_trackers[user_id] = UserTracker(user_id, config, aircraft_list)
 
+    async def update_team_aircraft(self, team_id: str, db: Session):
+        """Update tracked aircraft for a team (reads TeamAirportConfig + TeamAircraft)."""
+        from models import Team, TeamAirportConfig, TeamAircraft
+        import uuid as _uuid
+        try:
+            team_uuid = _uuid.UUID(team_id)
+        except ValueError:
+            return
+
+        config_row = db.query(TeamAirportConfig).filter(TeamAirportConfig.team_id == team_uuid).first()
+        if not config_row:
+            return
+
+        aircraft_rows = db.query(TeamAircraft).filter(
+            TeamAircraft.team_id == team_uuid,
+            TeamAircraft.active == True
+        ).all()
+
+        tracker_key = f"team:{team_id}"
+
+        if not aircraft_rows:
+            self.user_trackers.pop(tracker_key, None)
+            return
+
+        config = {
+            'airspace': {
+                'center_lat': config_row.latitude,
+                'center_lon': config_row.longitude,
+                'field_elevation_ft_msl': config_row.elevation_ft_msl,
+                'radius_nm': config_row.radius_nm,
+                'floor_ft_agl': config_row.floor_ft_agl,
+                'ceiling_ft_agl': config_row.ceiling_ft_agl,
+                'query_radius_nm': config_row.query_radius_nm,
+                'alert_distances_nm': [float(d) for d in config_row.alert_distances_nm],
+                'approach_corridor_enabled': config_row.approach_corridor_enabled or False,
+                'approach_runway_heading': config_row.approach_runway_heading,
+            },
+            'airport_code': config_row.airport_code or '',
+            'notification_cooldown_minutes': 1,
+            'quiet_hours': {
+                'enabled': config_row.quiet_hours_enabled,
+                'start': config_row.quiet_hours_start,
+                'end': config_row.quiet_hours_end,
+            }
+        }
+
+        aircraft_list = [
+            {
+                'tail_number': a.tail_number,
+                'icao24': a.icao24,
+                'friendly_name': a.friendly_name,
+                'alert_distances': [float(d) for d in a.alert_distances] if a.alert_distances else None,
+            }
+            for a in aircraft_rows
+        ]
+
+        self.user_trackers[tracker_key] = UserTracker(tracker_key, config, aircraft_list)
+
     async def tracking_loop(self):
         """Main tracking loop - runs every 10 seconds"""
         while self.running:

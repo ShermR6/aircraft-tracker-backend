@@ -2405,6 +2405,16 @@ async def startup_event():
             except Exception as e:
                 logger.error("Failed to load tracker for user %s: %s", user.id, e)
         logger.info("Loaded %d users into tracker", len(users))
+
+        # Load team trackers
+        from models import Team as TeamModel
+        teams = db.query(TeamModel).all()
+        for team in teams:
+            try:
+                await tracker.update_team_aircraft(str(team.id), db)
+            except Exception as e:
+                logger.error("Failed to load tracker for team %s: %s", team.id, e)
+        logger.info("Loaded %d teams into tracker", len(teams))
     except Exception as e:
         logger.error("Error loading users on startup: %s", e)
     finally:
@@ -2962,6 +2972,7 @@ async def add_team_aircraft(
     db.add(aircraft)
     db.commit()
     db.refresh(aircraft)
+    await tracker.update_team_aircraft(str(team.id), db)
     return AircraftResponse(
         id=str(aircraft.id), tail_number=aircraft.tail_number, icao24=aircraft.icao24,
         friendly_name=aircraft.friendly_name, aircraft_type=aircraft.aircraft_type,
@@ -2996,6 +3007,7 @@ async def update_team_aircraft(
         aircraft.alert_distances = aircraft_data.alert_distances
     db.commit()
     db.refresh(aircraft)
+    await tracker.update_team_aircraft(str(team.id), db)
     return AircraftResponse(
         id=str(aircraft.id), tail_number=aircraft.tail_number, icao24=aircraft.icao24,
         friendly_name=aircraft.friendly_name, aircraft_type=aircraft.aircraft_type,
@@ -3018,6 +3030,7 @@ async def delete_team_aircraft(
         raise HTTPException(status_code=404, detail="Aircraft not found")
     db.delete(aircraft)
     db.commit()
+    await tracker.update_team_aircraft(str(team.id), db)
     return {"message": "Aircraft deleted"}
 
 
@@ -3148,6 +3161,7 @@ async def save_team_airport_config(
         except Exception as e:
             logger.warning("Failed to clean up orphaned team alert settings: %s", e)
 
+    await tracker.update_team_aircraft(str(team.id), db)
     return {"message": "Configuration saved successfully", "id": str(config.id)}
 
 
