@@ -550,11 +550,14 @@ async def ground_config(
 
 
 @app.post("/api/ground/heartbeat")
-async def ground_heartbeat(current_user: User = Depends(get_current_user)):
+async def ground_heartbeat(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """Called by the ground station every minute to signal it is online."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
-    _gs.ground_last_seen[str(current_user.id)] = datetime.utcnow()
+    now = datetime.utcnow()
+    _gs.ground_last_seen[str(current_user.id)] = now
+    current_user.gs_last_heartbeat = now
+    db.commit()
     return {"ok": True}
 
 
@@ -2222,6 +2225,31 @@ async def merge_accounts(
     }
 
 
+@app.get("/api/internal/ground-devices")
+async def list_ground_devices(request: Request, db: Session = Depends(get_db)):
+    """Returns all users with ground station enabled — for admin panel."""
+    secret = request.headers.get("x-internal-secret")
+    if secret != WEBHOOK_INTERNAL_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    users = db.query(User).filter(User.ground_station_enabled == True).all()
+    now = datetime.utcnow()
+    result = []
+    for u in users:
+        last_seen_mem = _gs.ground_last_seen.get(str(u.id))
+        last_seen_db = getattr(u, 'gs_last_heartbeat', None)
+        last_seen = last_seen_mem or last_seen_db
+        online = last_seen is not None and (now - last_seen).total_seconds() < 90
+        result.append({
+            "email": u.email,
+            "gs_device_key": u.gs_device_key,
+            "online": online,
+            "last_seen": last_seen.isoformat() if last_seen else None,
+        })
+
+    return {"devices": result}
+
+
 @app.delete("/api/internal/user")
 async def delete_user_account(
     request: Request,
@@ -2380,6 +2408,8 @@ async def startup_event():
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS sdr_range_updated_at TIMESTAMP",
             # TeamMember — added for custom roles
             "ALTER TABLE team_members ADD COLUMN IF NOT EXISTS custom_role_id UUID REFERENCES team_roles(id) ON DELETE SET NULL",
+            # Users — ground station heartbeat persistence
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_last_heartbeat TIMESTAMP",
             # TeamChannel — value column (legacy channels stored config without top-level value)
         ]
         for sql in migrations:

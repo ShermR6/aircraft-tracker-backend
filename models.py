@@ -22,6 +22,7 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     ground_station_enabled = Column(Boolean, default=False)
     gs_device_key = Column(String(64), unique=True, nullable=True, index=True)
+    gs_last_heartbeat = Column(DateTime, nullable=True)
     
     # Relationships
     license = relationship("License", back_populates="users")
