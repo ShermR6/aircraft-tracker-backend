@@ -3,7 +3,7 @@ FinalPing Cloud Backend
 Main FastAPI application
 """
 
-from fastapi import FastAPI, Depends, HTTPException, Request, status, Header
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, status, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -2300,6 +2300,39 @@ async def root():
         "version": "1.0.0",
         "docs": "/docs"
     }
+
+
+# ── Twilio STOP webhook ───────────────────────────────────────────────────────
+
+TWILIO_STOP_WORDS = {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}
+
+@app.post("/api/webhooks/twilio/sms")
+async def twilio_sms_webhook(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    from_number = (form.get("From") or "").strip()
+    body = (form.get("Body") or "").strip().lower()
+
+    if not from_number:
+        return {"message": "ok"}
+
+    if body in TWILIO_STOP_WORDS:
+        # Find all SMS integrations with this phone number and disable them
+        integrations = db.query(Integration).filter(
+            Integration.type == "sms",
+            Integration.enabled == True,
+        ).all()
+        disabled = 0
+        for integration in integrations:
+            config = integration.config or {}
+            if config.get("to_phone", "").replace(" ", "") == from_number.replace(" ", ""):
+                integration.enabled = False
+                disabled += 1
+        if disabled:
+            db.commit()
+            logger.info(f"Disabled {disabled} SMS integration(s) for {from_number} via STOP")
+
+    # Return empty TwiML response — required by Twilio
+    return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
 
 
 # ============================================================================
