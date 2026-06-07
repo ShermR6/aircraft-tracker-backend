@@ -791,7 +791,7 @@ class CloudAircraftTracker:
                 json={
                     'from': 'FinalPing <noreply@finalpingapp.com>',
                     'to': [to_email],
-                    'subject': f'✈️ FinalPing: {message[:60].strip()}',
+                    'subject': f'✈️ FinalPing: {message.split(chr(10))[0][:60].strip()}',
                     'html': html,
                 },
                 timeout=aiohttp.ClientTimeout(total=10)
