@@ -460,11 +460,10 @@ async def ground_ingest(
     except Exception:
         message = f"✈️ {tail} — {alert_type} (Ground Station)"
 
-    from tracker import cloud_tracker
     alerts_sent = 0
     for integration in integrations:
         try:
-            success = await cloud_tracker.send_via_integration(integration, message)
+            success = await tracker.send_via_integration(integration, message)
             log_entry = NotificationLog(
                 user_id=current_user.id,
                 aircraft_tail=tail,
