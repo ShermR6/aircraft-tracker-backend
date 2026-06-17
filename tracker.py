@@ -135,13 +135,13 @@ class UserTracker:
             # Smallest configured distance triggers landing detection
             min_distance = min(alert_distances) if alert_distances else 2.0
 
-            if prev_distance is not None:
-                for alert_distance in alert_distances:
-                    alert_key = dist_key(alert_distance)
+            ALERT_BUFFER_NM = 0.9
+            for alert_distance in alert_distances:
+                alert_key = dist_key(alert_distance)
 
-                    crossed_boundary = (prev_distance > alert_distance and distance_nm <= alert_distance)
+                in_zone = distance_nm <= (alert_distance + ALERT_BUFFER_NM)
 
-                    if crossed_boundary and alert_key not in self.distance_alerts_sent[aircraft_id]:
+                if in_zone and alert_key not in self.distance_alerts_sent[aircraft_id]:
                         # Approach corridor filter — skip if aircraft heading is not aligned with runway
                         if airspace.get('approach_corridor_enabled') and airspace.get('approach_runway_heading') is not None:
                             track = aircraft_data.get('track') or aircraft_data.get('heading')
@@ -389,14 +389,14 @@ class CloudAircraftTracker:
         self.user_trackers[tracker_key] = UserTracker(tracker_key, config, aircraft_list)
 
     async def tracking_loop(self):
-        """Main tracking loop - runs every 10 seconds"""
+        """Main tracking loop - runs every 30 seconds"""
         while self.running:
             try:
                 await self.track_all_users()
-                await asyncio.sleep(10)  # 10-second polling
+                await asyncio.sleep(30)
             except Exception as e:
                 print(f"Error in tracking loop: {type(e).__name__}: {e}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
 
     async def track_all_users(self):
         """Track aircraft for all active users using a single ICAO-based API call"""
@@ -498,13 +498,13 @@ class CloudAircraftTracker:
                         missing = state.get('consecutive_missing', 0) + 1
                         state['consecutive_missing'] = missing
 
-                        # If aircraft was close to airport and disappeared for 3+ polls (~30 sec)
+                        # If aircraft was close to airport and disappeared for 2+ polls (~60 sec)
                         # Use last_distance instead of landing_ready so restarts don't break detection
                         # Cloud fires as fallback even when GS is online; dedup via NotificationLog
                         if (state.get('last_distance', 999) < 5.0
                                 and not state.get('on_ground', False)
                                 and not state.get('landed', False)
-                                and missing >= 3):
+                                and missing >= 2):
                             # Check NotificationLog to avoid double-firing if GS already sent
                             from models import NotificationLog
                             _db = SessionLocal()
