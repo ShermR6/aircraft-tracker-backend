@@ -136,12 +136,13 @@ class UserTracker:
             min_distance = min(alert_distances) if alert_distances else 2.0
 
             ALERT_BUFFER_NM = 0.9
-            for alert_distance in alert_distances:
-                alert_key = dist_key(alert_distance)
+            if prev_distance is not None:
+                for alert_distance in alert_distances:
+                    alert_key = dist_key(alert_distance)
 
-                in_zone = distance_nm <= (alert_distance + ALERT_BUFFER_NM)
+                    in_zone = distance_nm <= (alert_distance + ALERT_BUFFER_NM)
 
-                if in_zone and alert_key not in self.distance_alerts_sent[aircraft_id]:
+                    if in_zone and alert_key not in self.distance_alerts_sent[aircraft_id]:
                         # Approach corridor filter — skip if aircraft heading is not aligned with runway
                         if airspace.get('approach_corridor_enabled') and airspace.get('approach_runway_heading') is not None:
                             track = aircraft_data.get('track') or aircraft_data.get('heading')
