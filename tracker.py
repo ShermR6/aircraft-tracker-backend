@@ -140,9 +140,14 @@ class UserTracker:
                 for alert_distance in alert_distances:
                     alert_key = dist_key(alert_distance)
 
-                    in_zone = distance_nm <= (alert_distance + ALERT_BUFFER_NM)
+                    # Fire when crossing INTO this alert's zone (threshold extended by buffer).
+                    # Each alert only fires for its own crossing — inner alerts don't fire for outer zones.
+                    crossed_with_buffer = (
+                        prev_distance > (alert_distance + ALERT_BUFFER_NM) and
+                        distance_nm <= (alert_distance + ALERT_BUFFER_NM)
+                    )
 
-                    if in_zone and alert_key not in self.distance_alerts_sent[aircraft_id]:
+                    if crossed_with_buffer and alert_key not in self.distance_alerts_sent[aircraft_id]:
                         # Approach corridor filter — skip if aircraft heading is not aligned with runway
                         if airspace.get('approach_corridor_enabled') and airspace.get('approach_runway_heading') is not None:
                             track = aircraft_data.get('track') or aircraft_data.get('heading')
