@@ -977,6 +977,9 @@ class CloudAircraftTracker:
         for icao24, tail in tracker.aircraft_to_track.items():
             state = tracker.aircraft_state.get(icao24, {})
             if state:
+                last_update = state.get('last_update')
+                if last_update and (datetime.utcnow() - last_update).total_seconds() > 1800:
+                    continue  # stale — not seen in 30+ min, show as Not Detected
                 entry = {
                     'tail_number': tail,
                     'icao24': icao24,
