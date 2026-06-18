@@ -2278,17 +2278,7 @@ async def delete_user_account(
     db.query(NotificationLog).filter(NotificationLog.user_id == user.id).delete()
     db.query(SavedLocation).filter(SavedLocation.user_id == user.id).delete()
 
-    # Find teams this user owns — must be deleted before the license to avoid FK violation
-    owned_team_ids = [
-        m.team_id for m in
-        db.query(TeamMember).filter(TeamMember.user_id == user.id, TeamMember.role == "owner").all()
-    ]
-    if owned_team_ids:
-        for team in db.query(Team).filter(Team.id.in_(owned_team_ids)).all():
-            db.delete(team)  # cascades: channels, aircraft, airport_config, alert_settings, invite_tokens, roles, members
-        db.flush()
-
-    # Remove user from any teams they were a member of (non-owner)
+    # Remove user from any teams they were a member of
     db.query(TeamMember).filter(TeamMember.user_id == user.id).delete()
     db.query(TeamInviteToken).filter(TeamInviteToken.created_by == user.id).delete()
 
@@ -2297,8 +2287,13 @@ async def delete_user_account(
     user.license_id = None
     db.flush()
 
-    # Delete the license so the key can never be reused or reactivated
+    # Delete the license — must delete any team referencing it first to avoid FK violation.
+    # Query by license_id directly rather than relying on TeamMember ownership records.
     if license_id:
+        for team in db.query(Team).filter(Team.license_id == license_id).all():
+            db.delete(team)  # cascades: channels, aircraft, airport_config, alert_settings, invite_tokens, roles, members
+        db.flush()
+
         license = db.query(License).filter(License.id == license_id).first()
         if license:
             db.delete(license)
@@ -2396,6 +2391,8 @@ async def startup_event():
         migrations = [
             # Licenses
             "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS stripe_subscription_id VARCHAR(255)",
+            # Widen stripe_subscription_id if it was created as VARCHAR(20) in older schema
+            "ALTER TABLE licenses ALTER COLUMN stripe_subscription_id TYPE VARCHAR(255)",
             # Aircraft — added v1.0.6
             "ALTER TABLE aircraft ADD COLUMN IF NOT EXISTS aircraft_type VARCHAR(100)",
             "ALTER TABLE aircraft ADD COLUMN IF NOT EXISTS alert_distances JSON",
@@ -2408,16 +2405,17 @@ async def startup_event():
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS sdr_range_updated_at TIMESTAMP",
             # TeamMember — added for custom roles
             "ALTER TABLE team_members ADD COLUMN IF NOT EXISTS custom_role_id UUID REFERENCES team_roles(id) ON DELETE SET NULL",
-            # Users — ground station heartbeat persistence
+            # Users — ground station columns
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_last_heartbeat TIMESTAMP",
-            # TeamChannel — value column (legacy channels stored config without top-level value)
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_device_key VARCHAR(64)",
         ]
         for sql in migrations:
             try:
                 db.execute(text(sql))
+                db.commit()
             except Exception as mig_err:
+                db.rollback()
                 logger.warning("Migration skipped (%s): %s", sql[:60], mig_err)
-        db.commit()
 
         # Normalize legacy alert type labels
         db.execute(text("UPDATE notification_logs SET alert_type = '2nm' WHERE alert_type = '2.0nm'"))
