@@ -197,8 +197,10 @@ class UserTracker:
             self.aircraft_state[aircraft_id]['max_distance'] = max_distance
 
 
-        # Takeoff: was on ground, now airborne
-        if was_on_ground is True and on_ground is False:
+        # Takeoff: was on ground, now airborne.
+        # Guard against stale on_ground flags from the API — if the flag flips while
+        # the aircraft is already well above field elevation, it's not a real takeoff event.
+        if was_on_ground is True and on_ground is False and altitude_agl_ft <= 1500:
             if self.should_notify('takeoff', aircraft_id):
                 notifications.append({
                     'type': 'takeoff',
