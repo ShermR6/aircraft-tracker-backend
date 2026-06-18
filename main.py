@@ -793,13 +793,16 @@ async def activate_license(
             except Exception as e:
                 logger.error("Stripe error during activation: %s", e)
     elif not license.expires_at:
-        # Already activated but expires_at is missing — set it from activated_at
-        license.expires_at = license.activated_at + timedelta(days=LICENSE_DURATION_DAYS)
+        # Already activated but expires_at is missing — always set to at least now+30d
+        from_activated = license.activated_at + timedelta(days=LICENSE_DURATION_DAYS)
+        license.expires_at = max(from_activated, datetime.utcnow() + timedelta(days=LICENSE_DURATION_DAYS))
         license.status = "active"
         db.commit()
         db.refresh(license)
     elif license.status != "active":
-        # Was provisioned but not yet marked active (edge case)
+        # Was provisioned but not yet marked active — also renew if expiry is stale
+        if license.expires_at < datetime.utcnow() + timedelta(days=1):
+            license.expires_at = datetime.utcnow() + timedelta(days=LICENSE_DURATION_DAYS)
         license.status = "active"
         db.commit()
     
