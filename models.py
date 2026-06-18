@@ -3,7 +3,7 @@ Database Models
 SQLAlchemy ORM models for PostgreSQL
 """
 
-from sqlalchemy import Column, String, Boolean, Integer, Float, DateTime, ForeignKey, JSON, Text
+from sqlalchemy import Column, String, Boolean, Integer, Float, DateTime, ForeignKey, JSON, Text, BigInteger
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 import uuid
@@ -262,6 +262,7 @@ class TeamAirportConfig(Base):
     quiet_hours_enabled = Column(Boolean, default=True)
     quiet_hours_start = Column(String(5), default="23:00")
     quiet_hours_end = Column(String(5), default="06:00")
+    is_active = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -311,3 +312,119 @@ class TeamRole(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     team = relationship("Team", back_populates="roles")
+
+
+class AircraftClaim(Base):
+    """A team member's claim on an incoming aircraft"""
+    __tablename__ = "aircraft_claims"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    icao24 = Column(String(10), nullable=False)
+    tail_number = Column(String(10), nullable=True)
+    claimed_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    claimed_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    released_at = Column(DateTime, nullable=True)
+    flight_note = Column(Text, nullable=True)
+
+    team = relationship("Team")
+    claimed_by = relationship("User")
+
+
+class TeamShift(Base):
+    """A recurring shift definition for a team"""
+    __tablename__ = "team_shifts"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    name = Column(String(100), nullable=False)
+    days_of_week = Column(JSON, nullable=False)  # [0,1,2,3,4] = Mon-Fri
+    start_time = Column(String(5), nullable=False)  # "06:00"
+    end_time = Column(String(5), nullable=False)    # "14:00"
+    timezone = Column(String(50), default="UTC")
+    color = Column(String(7), default="#22d3a3")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team")
+    shift_members = relationship("TeamShiftMember", back_populates="shift", cascade="all, delete-orphan")
+
+
+class TeamShiftMember(Base):
+    """Assignment of a user to a shift"""
+    __tablename__ = "team_shift_members"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    shift_id = Column(UUID(as_uuid=True), ForeignKey("team_shifts.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+
+    shift = relationship("TeamShift", back_populates="shift_members")
+    user = relationship("User")
+
+
+class TeamDutyOverride(Base):
+    """Manual on/off duty override for a team member"""
+    __tablename__ = "team_duty_overrides"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    on_duty = Column(Boolean, nullable=False)
+    override_until = Column(DateTime, nullable=True)  # None = indefinite
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team")
+    user = relationship("User")
+
+
+class ExpectedArrival(Base):
+    """A pre-logged expected aircraft arrival"""
+    __tablename__ = "expected_arrivals"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    tail_number = Column(String(10), nullable=False)
+    icao24 = Column(String(10), nullable=True)
+    expected_at = Column(DateTime, nullable=False)
+    notes = Column(Text, nullable=True)
+    reminder_minutes = Column(Integer, default=30)
+    status = Column(String(20), default="pending")  # pending/arrived/cancelled/late
+    linked_icao24 = Column(String(10), nullable=True)  # set when ADS-B match found
+    reminder_sent = Column(Boolean, default=False)
+    created_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    team = relationship("Team")
+    created_by = relationship("User")
+
+
+class EscalationConfig(Base):
+    """Escalation settings for a team"""
+    __tablename__ = "escalation_configs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), unique=True, nullable=False)
+    enabled = Column(Boolean, default=False)
+    first_escalation_minutes = Column(Integer, default=5)
+    first_escalation_target = Column(String(20), default="all_admins")  # all_admins/owner/all_members
+    second_escalation_minutes = Column(Integer, default=10)
+    second_escalation_target = Column(String(20), default="owner")
+
+    team = relationship("Team")
+
+
+class AlertEscalation(Base):
+    """Record of a fired escalation"""
+    __tablename__ = "alert_escalations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.id"), nullable=False)
+    aircraft_tail = Column(String(10), nullable=False)
+    alert_type = Column(String(50), nullable=False)
+    original_fired_at = Column(DateTime, nullable=False)
+    escalation_level = Column(Integer, nullable=False)  # 1 or 2
+    escalated_at = Column(DateTime, default=datetime.utcnow)
+    acked_by_user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    acked_at = Column(DateTime, nullable=True)
+
+    team = relationship("Team")

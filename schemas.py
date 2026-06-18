@@ -52,6 +52,11 @@ class UserResponse(BaseModel):
     created_at: datetime
     activated_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
+    has_team: bool = False
+    team_id: Optional[str] = None
+    team_name: Optional[str] = None
+    team_role: Optional[str] = None
+    team_license_valid: bool = False
 
 
 # ============================================================================

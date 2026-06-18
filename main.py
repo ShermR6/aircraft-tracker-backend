@@ -41,7 +41,7 @@ sentry_sdk.init(
 )
 
 from database import get_db, engine, Base, SessionLocal
-from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation, Team, TeamMember, TeamChannel, TeamAircraft, TeamAirportConfig, TeamAlertSetting, TeamInviteToken, TeamRole
+from models import User, License, Aircraft, AlertSetting, Integration, AirportConfig, SavedLocation, Team, TeamMember, TeamChannel, TeamAircraft, TeamAirportConfig, TeamAlertSetting, TeamInviteToken, TeamRole, AircraftClaim, TeamShift, TeamShiftMember, TeamDutyOverride, ExpectedArrival, EscalationConfig, AlertEscalation
 from schemas import (
     LicenseActivation, LicenseResponse,
     UserLogin, UserResponse, TokenResponse,
@@ -97,7 +97,7 @@ LICENSE_DURATION_DAYS = 30
 
 # Grace period after expiry before blocking access — gives the Stripe renewal
 # webhook time to arrive and extend the license before users go dark.
-LICENSE_GRACE_PERIOD = timedelta(hours=2)
+LICENSE_GRACE_PERIOD = timedelta(hours=48)
 
 import ground_state as _gs
 
@@ -924,13 +924,36 @@ async def get_current_user_info(
         else:
             display_tier = license.tier
 
+    # Team membership info — independent of personal license
+    team_membership = db.query(TeamMember).filter(TeamMember.user_id == current_user.id).first()
+    has_team = team_membership is not None
+    team_id = None
+    team_name = None
+    team_role = None
+    team_license_valid = False
+    if team_membership:
+        team_obj = db.query(Team).filter(Team.id == team_membership.team_id).first()
+        if team_obj:
+            team_id = str(team_obj.id)
+            team_name = team_obj.name
+            team_role = team_membership.role
+            if team_obj.license_id:
+                tl = db.query(License).filter(License.id == team_obj.license_id).first()
+                if tl and (not tl.expires_at or tl.expires_at + LICENSE_GRACE_PERIOD > datetime.utcnow()):
+                    team_license_valid = True
+
     return UserResponse(
         id=str(current_user.id),
         email=current_user.email,
         license_tier=display_tier,
         activated_at=license.activated_at if license else None,
         expires_at=license.expires_at if license and not license.tier.startswith("team-") else None,
-        created_at=current_user.created_at
+        created_at=current_user.created_at,
+        has_team=has_team,
+        team_id=team_id,
+        team_name=team_name,
+        team_role=team_role,
+        team_license_valid=team_license_valid,
     )
 
 
@@ -1014,7 +1037,14 @@ async def renew_license(
     if not license:
         raise HTTPException(status_code=404, detail="License not found")
 
-    license.expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
+    new_expires_at = datetime.fromisoformat(expires_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
+
+    # Out-of-order webhook protection — never shorten an existing expiry
+    if license.expires_at and new_expires_at <= license.expires_at:
+        logger.warning("Renewal ignored (out-of-order): %s new=%s existing=%s", license_key, new_expires_at, license.expires_at)
+        return {"message": "Renewal ignored (out-of-order)", "license_key": license_key}
+
+    license.expires_at = new_expires_at
     license.status = "active"
     db.commit()
 
@@ -2325,37 +2355,221 @@ async def root():
     }
 
 
-# ── Twilio STOP webhook ───────────────────────────────────────────────────────
+# ── Twilio SMS webhook — STOP + command handler ───────────────────────────────
 
 TWILIO_STOP_WORDS = {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}
+
+def _twiml_reply(msg: str) -> Response:
+    safe = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return Response(
+        content=f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe}</Message></Response>',
+        media_type="application/xml",
+    )
+
+def _twiml_empty() -> Response:
+    return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
+
+def _phone_norm(p: str) -> str:
+    return "".join(c for c in p if c.isdigit() or c == "+")
+
+def _find_user_by_phone(phone: str, db: Session):
+    """Find a user whose personal SMS integration matches this phone."""
+    norm = _phone_norm(phone)
+    integrations = db.query(Integration).filter(Integration.type == "sms", Integration.enabled == True).all()
+    for intg in integrations:
+        cfg = intg.config or {}
+        if _phone_norm(cfg.get("to_phone", "")) == norm:
+            return db.query(User).filter(User.id == intg.user_id).first()
+    return None
+
+def _find_team_by_phone(phone: str, db: Session):
+    """Find the team whose SMS channel matches this phone."""
+    from models import TeamChannel as TC
+    norm = _phone_norm(phone)
+    channels = db.query(TC).filter(TC.integration_type == "sms", TC.enabled == True).all()
+    for ch in channels:
+        cfg = ch.config or {}
+        if _phone_norm(cfg.get("to_phone", "")) == norm:
+            return db.query(Team).filter(Team.id == ch.team_id).first(), ch
+    return None, None
+
+SMS_HELP = (
+    "FinalPing commands:\n"
+    "STATUS — aircraft summary\n"
+    "CLAIM [tail] — claim aircraft\n"
+    "UNCLAIM — release your claim\n"
+    "DUTY ON/OFF — toggle duty status\n"
+    "WHOSON — see who is on duty\n"
+    "ARRIVALS — upcoming expected arrivals\n"
+    "ACK — acknowledge last alert\n"
+    "HELP — show this message"
+)
 
 @app.post("/api/webhooks/twilio/sms")
 async def twilio_sms_webhook(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
     from_number = (form.get("From") or "").strip()
-    body = (form.get("Body") or "").strip().lower()
+    raw_body = (form.get("Body") or "").strip()
+    body_lower = raw_body.lower()
 
     if not from_number:
-        return {"message": "ok"}
+        return _twiml_empty()
 
-    if body in TWILIO_STOP_WORDS:
-        # Find all SMS integrations with this phone number and disable them
-        integrations = db.query(Integration).filter(
-            Integration.type == "sms",
-            Integration.enabled == True,
-        ).all()
+    # Handle carrier STOP words first — disable integrations, no reply needed
+    if body_lower in TWILIO_STOP_WORDS:
+        integrations = db.query(Integration).filter(Integration.type == "sms", Integration.enabled == True).all()
         disabled = 0
+        norm = _phone_norm(from_number)
         for integration in integrations:
-            config = integration.config or {}
-            if config.get("to_phone", "").replace(" ", "") == from_number.replace(" ", ""):
+            cfg = integration.config or {}
+            if _phone_norm(cfg.get("to_phone", "")) == norm:
                 integration.enabled = False
                 disabled += 1
         if disabled:
             db.commit()
             logger.info(f"Disabled {disabled} SMS integration(s) for {from_number} via STOP")
+        return _twiml_empty()
 
-    # Return empty TwiML response — required by Twilio
-    return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
+    # Identify sender
+    user = _find_user_by_phone(from_number, db)
+    team, team_channel = _find_team_by_phone(from_number, db)
+
+    if not user and not team:
+        return _twiml_reply("Number not linked to a FinalPing account.")
+
+    parts = raw_body.strip().split()
+    cmd = parts[0].upper() if parts else ""
+    args = parts[1:] if len(parts) > 1 else []
+
+    # --- Personal commands (work regardless of team context) ---
+    if cmd == "HELP":
+        return _twiml_reply(SMS_HELP)
+
+    if cmd == "STATUS":
+        # Return aircraft currently in airspace for this user or team
+        if team:
+            live = await tracker.get_live_aircraft(f"team:{team.id}") or []
+            if not live:
+                return _twiml_reply("No aircraft tracked for your team right now.")
+            lines = [f"{a.get('tail_number','?')} {a.get('status','?')} {a.get('distance_nm',0):.1f}nm" for a in live[:5]]
+            return _twiml_reply("Team aircraft:\n" + "\n".join(lines))
+        if user:
+            live = await tracker.get_live_aircraft(str(user.id)) or []
+            if not live:
+                return _twiml_reply("No aircraft tracked right now.")
+            lines = [f"{a.get('tail_number','?')} {a.get('status','?')} {a.get('distance_nm',0):.1f}nm" for a in live[:5]]
+            return _twiml_reply("Your aircraft:\n" + "\n".join(lines))
+
+    if cmd == "ACK" and user:
+        from models import NotificationLog
+        logs = (
+            db.query(NotificationLog)
+            .filter(NotificationLog.user_id == user.id)
+            .order_by(NotificationLog.sent_at.desc())
+            .limit(1)
+            .all()
+        )
+        if logs:
+            logs[0].status = f"acked_sms"
+            db.commit()
+            return _twiml_reply("Alert acknowledged.")
+        return _twiml_reply("No recent alerts to acknowledge.")
+
+    # --- Team commands ---
+    if not team:
+        return _twiml_reply(f"Unknown command '{cmd}'. Reply HELP for commands.")
+
+    # Find the member record
+    member = None
+    if user:
+        member = db.query(TeamMember).filter(TeamMember.user_id == user.id, TeamMember.team_id == team.id).first()
+
+    if cmd == "WHOSON":
+        on_duty_members = []
+        for m in team.members:
+            if _is_member_on_duty(team.id, m.user_id, db):
+                u = db.query(User).filter(User.id == m.user_id).first()
+                on_duty_members.append(u.email.split("@")[0] if u else "?")
+        if not on_duty_members:
+            return _twiml_reply("Nobody is currently on duty.")
+        return _twiml_reply("On duty: " + ", ".join(on_duty_members))
+
+    if cmd == "ARRIVALS":
+        now = datetime.utcnow()
+        arrivals = db.query(ExpectedArrival).filter(
+            ExpectedArrival.team_id == team.id,
+            ExpectedArrival.status == "pending",
+            ExpectedArrival.expected_at >= now,
+        ).order_by(ExpectedArrival.expected_at.asc()).limit(5).all()
+        if not arrivals:
+            return _twiml_reply("No upcoming expected arrivals.")
+        lines = []
+        for a in arrivals:
+            diff = a.expected_at - now
+            mins = int(diff.total_seconds() / 60)
+            lines.append(f"{a.tail_number} in {mins}min" + (f" — {a.notes}" if a.notes else ""))
+        return _twiml_reply("Arrivals:\n" + "\n".join(lines))
+
+    if cmd in ("DUTY",) and args:
+        toggle = args[0].upper()
+        if toggle == "ON":
+            on_duty = True
+        elif toggle == "OFF":
+            on_duty = False
+        else:
+            return _twiml_reply("Usage: DUTY ON or DUTY OFF")
+        if not user or not member:
+            return _twiml_reply("Cannot find your team membership.")
+        override = TeamDutyOverride(team_id=team.id, user_id=user.id, on_duty=on_duty, override_until=None)
+        db.add(override)
+        db.commit()
+        return _twiml_reply(f"Duty status set to {'ON' if on_duty else 'OFF'}.")
+
+    if cmd == "CLAIM":
+        if not args:
+            return _twiml_reply("Usage: CLAIM [tail number]")
+        if not user or not member:
+            return _twiml_reply("Cannot find your team membership.")
+        tail = args[0].upper()
+        now = datetime.utcnow()
+        existing = db.query(AircraftClaim).filter(
+            AircraftClaim.team_id == team.id,
+            AircraftClaim.tail_number == tail,
+            AircraftClaim.released_at.is_(None),
+            AircraftClaim.expires_at > now,
+        ).first()
+        if existing and str(existing.claimed_by_user_id) != str(user.id):
+            claimer = db.query(User).filter(User.id == existing.claimed_by_user_id).first()
+            return _twiml_reply(f"{tail} already claimed by {claimer.email.split('@')[0] if claimer else '?'}.")
+        claim = AircraftClaim(
+            team_id=team.id,
+            icao24="unknown",
+            tail_number=tail,
+            claimed_by_user_id=user.id,
+            expires_at=now + timedelta(hours=2),
+        )
+        db.add(claim)
+        db.commit()
+        return _twiml_reply(f"You claimed {tail} for 2 hours.")
+
+    if cmd == "UNCLAIM":
+        if not user or not member:
+            return _twiml_reply("Cannot find your team membership.")
+        now = datetime.utcnow()
+        claims = db.query(AircraftClaim).filter(
+            AircraftClaim.team_id == team.id,
+            AircraftClaim.claimed_by_user_id == user.id,
+            AircraftClaim.released_at.is_(None),
+            AircraftClaim.expires_at > now,
+        ).all()
+        for c in claims:
+            c.released_at = now
+        db.commit()
+        if claims:
+            return _twiml_reply(f"Released {len(claims)} claim(s).")
+        return _twiml_reply("No active claims to release.")
+
+    return _twiml_reply(f"Unknown command '{cmd}'. Reply HELP for commands.")
 
 
 # ============================================================================
@@ -2408,6 +2622,78 @@ async def startup_event():
             # Users — ground station columns
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_last_heartbeat TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_device_key VARCHAR(64)",
+            # TeamAirportConfig — multi-airport support
+            "ALTER TABLE team_airport_configs ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE",
+            # New tables for teams v2
+            """CREATE TABLE IF NOT EXISTS aircraft_claims (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                icao24 VARCHAR(10) NOT NULL,
+                tail_number VARCHAR(10),
+                claimed_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                claimed_at TIMESTAMP DEFAULT NOW(),
+                expires_at TIMESTAMP NOT NULL,
+                released_at TIMESTAMP,
+                flight_note TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS team_shifts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                name VARCHAR(100) NOT NULL,
+                days_of_week JSON NOT NULL,
+                start_time VARCHAR(5) NOT NULL,
+                end_time VARCHAR(5) NOT NULL,
+                timezone VARCHAR(50) DEFAULT 'UTC',
+                color VARCHAR(7) DEFAULT '#22d3a3',
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS team_shift_members (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                shift_id UUID NOT NULL REFERENCES team_shifts(id) ON DELETE CASCADE,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE
+            )""",
+            """CREATE TABLE IF NOT EXISTS team_duty_overrides (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                on_duty BOOLEAN NOT NULL,
+                override_until TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS expected_arrivals (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                tail_number VARCHAR(10) NOT NULL,
+                icao24 VARCHAR(10),
+                expected_at TIMESTAMP NOT NULL,
+                notes TEXT,
+                reminder_minutes INTEGER DEFAULT 30,
+                status VARCHAR(20) DEFAULT 'pending',
+                linked_icao24 VARCHAR(10),
+                reminder_sent BOOLEAN DEFAULT FALSE,
+                created_by_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )""",
+            """CREATE TABLE IF NOT EXISTS escalation_configs (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                team_id UUID UNIQUE NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                enabled BOOLEAN DEFAULT FALSE,
+                first_escalation_minutes INTEGER DEFAULT 5,
+                first_escalation_target VARCHAR(20) DEFAULT 'all_admins',
+                second_escalation_minutes INTEGER DEFAULT 10,
+                second_escalation_target VARCHAR(20) DEFAULT 'owner'
+            )""",
+            """CREATE TABLE IF NOT EXISTS alert_escalations (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                aircraft_tail VARCHAR(10) NOT NULL,
+                alert_type VARCHAR(50) NOT NULL,
+                original_fired_at TIMESTAMP NOT NULL,
+                escalation_level INTEGER NOT NULL,
+                escalated_at TIMESTAMP DEFAULT NOW(),
+                acked_by_user_id UUID REFERENCES users(id),
+                acked_at TIMESTAMP
+            )""",
         ]
         for sql in migrations:
             try:
@@ -3259,6 +3545,520 @@ async def save_team_alert_setting(
         id=str(setting.id), alert_type=setting.alert_type, enabled=setting.enabled,
         message_template=setting.message_template, created_at=setting.created_at
     )
+
+
+# ============================================================================
+# TEAM MULTI-AIRPORT
+# ============================================================================
+
+@app.get("/api/teams/airports")
+async def get_team_airports(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    configs = db.query(TeamAirportConfig).filter(TeamAirportConfig.team_id == team.id).all()
+    return [_serialize_team_airport(c) for c in configs]
+
+
+@app.post("/api/teams/airports", status_code=201)
+async def add_team_airport(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_airport")
+    body = await request.json()
+    existing_count = db.query(TeamAirportConfig).filter(TeamAirportConfig.team_id == team.id).count()
+    config = TeamAirportConfig(
+        team_id=team.id,
+        airport_code=body.get("airport_code"),
+        airport_name=body.get("airport_name"),
+        latitude=str(body.get("latitude", "0")),
+        longitude=str(body.get("longitude", "0")),
+        elevation_ft_msl=int(body.get("elevation_ft_msl", 0)),
+        radius_nm=str(body.get("radius_nm", "4.0")),
+        floor_ft_agl=int(body.get("floor_ft_agl", 0)),
+        ceiling_ft_agl=int(body.get("ceiling_ft_agl", 2500)),
+        query_radius_nm=str(body.get("query_radius_nm", "100.0")),
+        alert_distances_nm=body.get("alert_distances_nm", ["10.0", "5.0", "2.0"]),
+        quiet_hours_enabled=body.get("quiet_hours_enabled", True),
+        quiet_hours_start=body.get("quiet_hours_start", "23:00"),
+        quiet_hours_end=body.get("quiet_hours_end", "06:00"),
+        is_active=existing_count == 0,  # first airport auto-activates
+    )
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+    return _serialize_team_airport(config)
+
+
+@app.put("/api/teams/airports/{airport_id}")
+async def update_team_airport(airport_id: str, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_airport")
+    config = db.query(TeamAirportConfig).filter(TeamAirportConfig.id == airport_id, TeamAirportConfig.team_id == team.id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Airport not found")
+    body = await request.json()
+    for field in ["airport_code", "airport_name", "latitude", "longitude", "elevation_ft_msl",
+                  "radius_nm", "floor_ft_agl", "ceiling_ft_agl", "query_radius_nm",
+                  "alert_distances_nm", "quiet_hours_enabled", "quiet_hours_start", "quiet_hours_end"]:
+        if field in body:
+            setattr(config, field, body[field])
+    db.commit()
+    db.refresh(config)
+    return _serialize_team_airport(config)
+
+
+@app.put("/api/teams/airports/{airport_id}/active", status_code=204)
+async def set_active_team_airport(airport_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_airport")
+    configs = db.query(TeamAirportConfig).filter(TeamAirportConfig.team_id == team.id).all()
+    for c in configs:
+        c.is_active = (str(c.id) == airport_id)
+    db.commit()
+    await tracker.update_team_aircraft(str(team.id), db)
+
+
+@app.delete("/api/teams/airports/{airport_id}", status_code=204)
+async def delete_team_airport(airport_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_airport")
+    config = db.query(TeamAirportConfig).filter(TeamAirportConfig.id == airport_id, TeamAirportConfig.team_id == team.id).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Airport not found")
+    db.delete(config)
+    db.commit()
+
+
+def _serialize_team_airport(c: TeamAirportConfig) -> dict:
+    return {
+        "id": str(c.id),
+        "airport_code": c.airport_code,
+        "airport_name": c.airport_name,
+        "latitude": c.latitude,
+        "longitude": c.longitude,
+        "elevation_ft_msl": c.elevation_ft_msl,
+        "radius_nm": c.radius_nm,
+        "floor_ft_agl": c.floor_ft_agl,
+        "ceiling_ft_agl": c.ceiling_ft_agl,
+        "query_radius_nm": c.query_radius_nm,
+        "alert_distances_nm": c.alert_distances_nm or ["10.0", "5.0", "2.0"],
+        "quiet_hours_enabled": c.quiet_hours_enabled,
+        "quiet_hours_start": c.quiet_hours_start,
+        "quiet_hours_end": c.quiet_hours_end,
+        "is_active": c.is_active or False,
+        "created_at": c.created_at,
+    }
+
+
+def _require_team_permission(user: User, team: Team, db: Session, permission: str):
+    member = db.query(TeamMember).filter(TeamMember.user_id == user.id, TeamMember.team_id == team.id).first()
+    if not member:
+        raise HTTPException(status_code=403, detail="Not a team member")
+    if member.role == "owner":
+        return  # owners always have all permissions
+    # Check custom role permissions
+    if member.custom_role_id:
+        role = db.query(TeamRole).filter(TeamRole.id == member.custom_role_id).first()
+        if role and permission in (role.permissions or []):
+            return
+    # Default admin permissions
+    admin_permissions = ["manage_channels", "manage_routing", "manage_aircraft", "manage_airport",
+                         "manage_alerts", "manage_shifts", "claim_aircraft", "ack_alerts",
+                         "view_activity", "manage_arrivals"]
+    if member.role == "admin" and permission in admin_permissions:
+        return
+    # Default member permissions
+    member_permissions = ["claim_aircraft", "ack_alerts", "view_activity", "manage_arrivals"]
+    if member.role == "member" and permission in member_permissions:
+        return
+    raise HTTPException(status_code=403, detail=f"Missing permission: {permission}")
+
+
+# ============================================================================
+# TEAM CLAIMS
+# ============================================================================
+
+@app.get("/api/teams/claims")
+async def get_team_claims(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    now = datetime.utcnow()
+    claims = db.query(AircraftClaim).filter(
+        AircraftClaim.team_id == team.id,
+        AircraftClaim.released_at.is_(None),
+        AircraftClaim.expires_at > now,
+    ).all()
+    result = []
+    for c in claims:
+        user = db.query(User).filter(User.id == c.claimed_by_user_id).first()
+        result.append({
+            "id": str(c.id),
+            "icao24": c.icao24,
+            "tail_number": c.tail_number,
+            "claimed_by_user_id": str(c.claimed_by_user_id),
+            "claimed_by_email": user.email if user else "",
+            "claimed_at": c.claimed_at,
+            "expires_at": c.expires_at,
+            "flight_note": c.flight_note,
+        })
+    return result
+
+
+@app.post("/api/teams/claims", status_code=201)
+async def claim_aircraft(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "claim_aircraft")
+    body = await request.json()
+    icao24 = body.get("icao24", "").lower().strip()
+    if not icao24:
+        raise HTTPException(status_code=400, detail="icao24 required")
+    # Release any existing claim on this aircraft from this team
+    now = datetime.utcnow()
+    existing = db.query(AircraftClaim).filter(
+        AircraftClaim.team_id == team.id,
+        AircraftClaim.icao24 == icao24,
+        AircraftClaim.released_at.is_(None),
+        AircraftClaim.expires_at > now,
+    ).first()
+    if existing:
+        if str(existing.claimed_by_user_id) != str(current_user.id):
+            user = db.query(User).filter(User.id == existing.claimed_by_user_id).first()
+            raise HTTPException(status_code=409, detail=f"Already claimed by {user.email if user else 'another member'}")
+        return {"message": "Already claimed by you"}
+    claim = AircraftClaim(
+        team_id=team.id,
+        icao24=icao24,
+        tail_number=body.get("tail_number"),
+        claimed_by_user_id=current_user.id,
+        expires_at=now + timedelta(hours=2),
+        flight_note=body.get("note"),
+    )
+    db.add(claim)
+    db.commit()
+    db.refresh(claim)
+    return {"id": str(claim.id), "icao24": icao24, "claimed_at": claim.claimed_at, "expires_at": claim.expires_at}
+
+
+@app.delete("/api/teams/claims/{icao24}", status_code=204)
+async def release_claim(icao24: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    now = datetime.utcnow()
+    claim = db.query(AircraftClaim).filter(
+        AircraftClaim.team_id == team.id,
+        AircraftClaim.icao24 == icao24.lower(),
+        AircraftClaim.released_at.is_(None),
+        AircraftClaim.expires_at > now,
+    ).first()
+    if claim:
+        claim.released_at = now
+        db.commit()
+
+
+# ============================================================================
+# TEAM SHIFTS & ON-DUTY
+# ============================================================================
+
+def _is_member_on_duty(team_id, user_id: str, db: Session) -> bool:
+    now = datetime.utcnow()
+    # Check manual override first (most recent wins)
+    override = db.query(TeamDutyOverride).filter(
+        TeamDutyOverride.team_id == team_id,
+        TeamDutyOverride.user_id == user_id,
+    ).order_by(TeamDutyOverride.created_at.desc()).first()
+    if override:
+        if override.override_until is None or override.override_until > now:
+            return override.on_duty
+    # Check shift schedule
+    import pytz
+    weekday = now.weekday()  # 0=Mon
+    shifts = db.query(TeamShift).filter(TeamShift.team_id == team_id).all()
+    for shift in shifts:
+        if weekday not in (shift.days_of_week or []):
+            continue
+        try:
+            tz = pytz.timezone(shift.timezone or "UTC")
+            local_now = now.replace(tzinfo=pytz.utc).astimezone(tz)
+            local_time = local_now.strftime("%H:%M")
+            if shift.start_time <= local_time <= shift.end_time:
+                assigned = db.query(TeamShiftMember).filter(
+                    TeamShiftMember.shift_id == shift.id,
+                    TeamShiftMember.user_id == user_id,
+                ).first()
+                if assigned:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+@app.get("/api/teams/on-duty")
+async def get_on_duty_members(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    result = []
+    for m in team.members:
+        on_duty = _is_member_on_duty(team.id, m.user_id, db)
+        user = db.query(User).filter(User.id == m.user_id).first()
+        result.append({
+            "member_id": str(m.id),
+            "user_id": str(m.user_id),
+            "email": user.email if user else "",
+            "role": m.role,
+            "on_duty": on_duty,
+        })
+    return result
+
+
+@app.put("/api/teams/members/{member_id}/duty", status_code=204)
+async def set_member_duty(member_id: str, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    member = db.query(TeamMember).filter(TeamMember.id == member_id, TeamMember.team_id == team.id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    # Members can only toggle themselves; admins/owners can toggle anyone
+    cm = db.query(TeamMember).filter(TeamMember.user_id == current_user.id, TeamMember.team_id == team.id).first()
+    if str(member.user_id) != str(current_user.id) and cm and cm.role not in ("owner", "admin"):
+        raise HTTPException(status_code=403, detail="Cannot change duty status for other members")
+    body = await request.json()
+    on_duty = body.get("on_duty", True)
+    until_str = body.get("until")
+    until = datetime.fromisoformat(until_str) if until_str else None
+    override = TeamDutyOverride(
+        team_id=team.id,
+        user_id=member.user_id,
+        on_duty=on_duty,
+        override_until=until,
+    )
+    db.add(override)
+    db.commit()
+
+
+@app.get("/api/teams/shifts")
+async def get_team_shifts(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    shifts = db.query(TeamShift).filter(TeamShift.team_id == team.id).all()
+    result = []
+    for s in shifts:
+        members = db.query(TeamShiftMember).filter(TeamShiftMember.shift_id == s.id).all()
+        member_info = []
+        for sm in members:
+            user = db.query(User).filter(User.id == sm.user_id).first()
+            member_info.append({"user_id": str(sm.user_id), "email": user.email if user else ""})
+        result.append({
+            "id": str(s.id),
+            "name": s.name,
+            "days_of_week": s.days_of_week,
+            "start_time": s.start_time,
+            "end_time": s.end_time,
+            "timezone": s.timezone,
+            "color": s.color,
+            "members": member_info,
+            "created_at": s.created_at,
+        })
+    return result
+
+
+@app.post("/api/teams/shifts", status_code=201)
+async def create_team_shift(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_shifts")
+    body = await request.json()
+    shift = TeamShift(
+        team_id=team.id,
+        name=body["name"],
+        days_of_week=body.get("days_of_week", [0, 1, 2, 3, 4]),
+        start_time=body.get("start_time", "08:00"),
+        end_time=body.get("end_time", "17:00"),
+        timezone=body.get("timezone", "UTC"),
+        color=body.get("color", "#22d3a3"),
+    )
+    db.add(shift)
+    db.flush()
+    for uid in body.get("user_ids", []):
+        db.add(TeamShiftMember(shift_id=shift.id, user_id=uid))
+    db.commit()
+    db.refresh(shift)
+    return {"id": str(shift.id), "name": shift.name, "days_of_week": shift.days_of_week,
+            "start_time": shift.start_time, "end_time": shift.end_time,
+            "timezone": shift.timezone, "color": shift.color}
+
+
+@app.put("/api/teams/shifts/{shift_id}")
+async def update_team_shift(shift_id: str, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_shifts")
+    shift = db.query(TeamShift).filter(TeamShift.id == shift_id, TeamShift.team_id == team.id).first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift not found")
+    body = await request.json()
+    for field in ["name", "days_of_week", "start_time", "end_time", "timezone", "color"]:
+        if field in body:
+            setattr(shift, field, body[field])
+    db.commit()
+    return {"id": str(shift.id)}
+
+
+@app.put("/api/teams/shifts/{shift_id}/members", status_code=204)
+async def set_shift_members(shift_id: str, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_shifts")
+    shift = db.query(TeamShift).filter(TeamShift.id == shift_id, TeamShift.team_id == team.id).first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Shift not found")
+    body = await request.json()
+    db.query(TeamShiftMember).filter(TeamShiftMember.shift_id == shift.id).delete()
+    for uid in body.get("user_ids", []):
+        db.add(TeamShiftMember(shift_id=shift.id, user_id=uid))
+    db.commit()
+
+
+@app.delete("/api/teams/shifts/{shift_id}", status_code=204)
+async def delete_team_shift(shift_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_shifts")
+    shift = db.query(TeamShift).filter(TeamShift.id == shift_id, TeamShift.team_id == team.id).first()
+    if shift:
+        db.delete(shift)
+        db.commit()
+
+
+# ============================================================================
+# EXPECTED ARRIVALS
+# ============================================================================
+
+@app.get("/api/teams/arrivals")
+async def get_expected_arrivals(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    now = datetime.utcnow()
+    cutoff = now - timedelta(hours=24)
+    arrivals = db.query(ExpectedArrival).filter(
+        ExpectedArrival.team_id == team.id,
+        ExpectedArrival.status != "cancelled",
+        ExpectedArrival.expected_at >= cutoff,
+    ).order_by(ExpectedArrival.expected_at.asc()).all()
+    result = []
+    for a in arrivals:
+        # Auto-mark late
+        if a.status == "pending" and a.expected_at < now - timedelta(minutes=15):
+            a.status = "late"
+        result.append({
+            "id": str(a.id),
+            "tail_number": a.tail_number,
+            "icao24": a.icao24,
+            "expected_at": a.expected_at,
+            "notes": a.notes,
+            "reminder_minutes": a.reminder_minutes,
+            "status": a.status,
+            "linked_icao24": a.linked_icao24,
+            "created_at": a.created_at,
+        })
+    db.commit()
+    return result
+
+
+@app.post("/api/teams/arrivals", status_code=201)
+async def create_expected_arrival(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_arrivals")
+    body = await request.json()
+    arrival = ExpectedArrival(
+        team_id=team.id,
+        tail_number=body["tail_number"].upper().strip(),
+        icao24=body.get("icao24", "").lower().strip() or None,
+        expected_at=datetime.fromisoformat(body["expected_at"]),
+        notes=body.get("notes"),
+        reminder_minutes=int(body.get("reminder_minutes", 30)),
+        created_by_user_id=current_user.id,
+    )
+    db.add(arrival)
+    db.commit()
+    db.refresh(arrival)
+    return {"id": str(arrival.id), "tail_number": arrival.tail_number, "expected_at": arrival.expected_at}
+
+
+@app.put("/api/teams/arrivals/{arrival_id}")
+async def update_expected_arrival(arrival_id: str, request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_arrivals")
+    arrival = db.query(ExpectedArrival).filter(ExpectedArrival.id == arrival_id, ExpectedArrival.team_id == team.id).first()
+    if not arrival:
+        raise HTTPException(status_code=404, detail="Arrival not found")
+    body = await request.json()
+    for field in ["tail_number", "icao24", "notes", "reminder_minutes", "status"]:
+        if field in body:
+            setattr(arrival, field, body[field])
+    if "expected_at" in body:
+        arrival.expected_at = datetime.fromisoformat(body["expected_at"])
+    db.commit()
+    return {"id": str(arrival.id)}
+
+
+@app.delete("/api/teams/arrivals/{arrival_id}", status_code=204)
+async def delete_expected_arrival(arrival_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    arrival = db.query(ExpectedArrival).filter(ExpectedArrival.id == arrival_id, ExpectedArrival.team_id == team.id).first()
+    if arrival:
+        arrival.status = "cancelled"
+        db.commit()
+
+
+# ============================================================================
+# ESCALATION CONFIG
+# ============================================================================
+
+@app.get("/api/teams/escalation-config")
+async def get_escalation_config(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    config = db.query(EscalationConfig).filter(EscalationConfig.team_id == team.id).first()
+    if not config:
+        return {"enabled": False, "first_escalation_minutes": 5, "first_escalation_target": "all_admins",
+                "second_escalation_minutes": 10, "second_escalation_target": "owner"}
+    return {
+        "id": str(config.id),
+        "enabled": config.enabled,
+        "first_escalation_minutes": config.first_escalation_minutes,
+        "first_escalation_target": config.first_escalation_target,
+        "second_escalation_minutes": config.second_escalation_minutes,
+        "second_escalation_target": config.second_escalation_target,
+    }
+
+
+@app.put("/api/teams/escalation-config")
+async def update_escalation_config(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "manage_routing")
+    body = await request.json()
+    config = db.query(EscalationConfig).filter(EscalationConfig.team_id == team.id).first()
+    if not config:
+        config = EscalationConfig(team_id=team.id)
+        db.add(config)
+    for field in ["enabled", "first_escalation_minutes", "first_escalation_target",
+                  "second_escalation_minutes", "second_escalation_target"]:
+        if field in body:
+            setattr(config, field, body[field])
+    db.commit()
+    return {"message": "Escalation config updated"}
+
+
+# ============================================================================
+# ACTIVITY ACK
+# ============================================================================
+
+@app.post("/api/teams/activity/{log_id}/ack", status_code=204)
+async def ack_activity(log_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    from models import NotificationLog
+    team = _get_user_team(current_user, db)
+    _require_team_permission(current_user, team, db, "ack_alerts")
+    log = db.query(NotificationLog).filter(NotificationLog.id == log_id).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Log not found")
+    log.status = f"acked_by_{current_user.email}"
+    db.commit()
+    # Also ack any pending escalation for this alert
+    escalation = db.query(AlertEscalation).filter(
+        AlertEscalation.team_id == team.id,
+        AlertEscalation.acked_at.is_(None),
+    ).order_by(AlertEscalation.escalated_at.desc()).first()
+    if escalation:
+        escalation.acked_by_user_id = current_user.id
+        escalation.acked_at = datetime.utcnow()
+        db.commit()
 
 
 @app.on_event("shutdown")
