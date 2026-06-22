@@ -34,6 +34,7 @@ class TokenResponse(BaseModel):
     token_type: str
     user_id: str
     email: str
+    display_name: Optional[str] = None
     license_tier: str
     expires_at: Optional[datetime]
 

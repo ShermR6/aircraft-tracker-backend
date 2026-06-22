@@ -18,6 +18,7 @@ class User(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email = Column(String(255), unique=True, nullable=False, index=True)
+    display_name = Column(String(255), nullable=True)
     license_id = Column(UUID(as_uuid=True), ForeignKey("licenses.id"))
     created_at = Column(DateTime, default=datetime.utcnow)
     ground_station_enabled = Column(Boolean, default=False)

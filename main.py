@@ -291,17 +291,21 @@ async def login(
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     email = credentials.email.lower().strip()
+    website_name = verified.get("name") or None
 
     # Step 2 — Find user in Railway DB by email
     user = db.query(User).filter(User.email == email).first()
 
     # If no Railway account exists, auto-create a free-tier account
     if not user:
-        user = User(email=email)
+        user = User(email=email, display_name=website_name)
         db.add(user)
         db.commit()
         db.refresh(user)
         logger.info("Auto-created free account for %s", email)
+    elif website_name and user.display_name != website_name:
+        user.display_name = website_name
+        db.commit()
 
     # Step 3 — Get license info (may not exist for free accounts)
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
@@ -323,6 +327,7 @@ async def login(
         token_type="bearer",
         user_id=str(user.id),
         email=user.email,
+        display_name=user.display_name,
         license_tier=tier,
         expires_at=expires_at,
     )
@@ -368,13 +373,18 @@ async def google_desktop_login(
     if not verified.get("valid"):
         raise HTTPException(status_code=401, detail="Invalid or expired OAuth token")
 
+    website_name = verified.get("name") or None
+
     user = db.query(User).filter(User.email == email).first()
     if not user:
-        user = User(email=email)
+        user = User(email=email, display_name=website_name)
         db.add(user)
         db.commit()
         db.refresh(user)
         logger.info("Auto-created account for Google OAuth user %s", email)
+    elif website_name and user.display_name != website_name:
+        user.display_name = website_name
+        db.commit()
 
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
     tier = "free"
@@ -391,6 +401,7 @@ async def google_desktop_login(
         token_type="bearer",
         user_id=str(user.id),
         email=user.email,
+        display_name=user.display_name,
         license_tier=tier,
         expires_at=expires_at,
     )
@@ -2625,6 +2636,8 @@ async def startup_event():
             # Users — ground station columns
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_last_heartbeat TIMESTAMP",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_device_key VARCHAR(64)",
+            # Users — display name synced from website
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)",
             # TeamAirportConfig — multi-airport support
             "ALTER TABLE team_airport_configs ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE",
             # New tables for teams v2
