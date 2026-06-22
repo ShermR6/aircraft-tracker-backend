@@ -49,6 +49,7 @@ class UserResponse(BaseModel):
     """User information"""
     id: str
     email: str
+    display_name: Optional[str] = None
     license_tier: str
     created_at: datetime
     activated_at: Optional[datetime] = None

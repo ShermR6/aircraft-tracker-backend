@@ -959,6 +959,7 @@ async def get_current_user_info(
     return UserResponse(
         id=str(current_user.id),
         email=current_user.email,
+        display_name=current_user.display_name,
         license_tier=display_tier,
         activated_at=license.activated_at if license else None,
         expires_at=license.expires_at if license and not license.tier.startswith("team-") else None,
@@ -2292,6 +2293,23 @@ async def list_ground_devices(request: Request, db: Session = Depends(get_db)):
         })
 
     return {"devices": result}
+
+
+@app.post("/api/internal/push-display-name", status_code=204)
+async def push_display_name(request: Request, db: Session = Depends(get_db)):
+    """Called by the website when a user changes their display name."""
+    secret = request.headers.get("X-Internal-Secret", "")
+    if not secret or secret != os.getenv("INTERNAL_API_SECRET", ""):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    body = await request.json()
+    email = (body.get("email") or "").lower().strip()
+    new_name = body.get("display_name")
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+    user = db.query(User).filter(User.email == email).first()
+    if user:
+        user.display_name = new_name or None
+        db.commit()
 
 
 @app.delete("/api/internal/user")
