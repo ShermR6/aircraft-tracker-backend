@@ -259,6 +259,7 @@ class CloudAircraftTracker:
         self.task = None
         self.sms_stop_last_sent_date = None
         self.whatsapp_stop_last_sent_date = None
+        self._discord_last_sent: Dict[str, float] = {}  # webhook_url → last send timestamp
 
     async def start(self):
         """Start the global tracker"""
@@ -950,6 +951,14 @@ class CloudAircraftTracker:
         webhook_url = config.get('webhook_url')
         if not webhook_url:
             return False
+
+        # Enforce 5-second cooldown per webhook so Discord sends a push for each alert
+        now = asyncio.get_event_loop().time()
+        last = self._discord_last_sent.get(webhook_url, 0)
+        wait = 5.0 - (now - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._discord_last_sent[webhook_url] = asyncio.get_event_loop().time()
 
         async with aiohttp.ClientSession() as session:
             async with session.post(
