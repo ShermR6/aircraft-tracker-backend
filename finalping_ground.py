@@ -22,7 +22,7 @@ import requests
 from datetime import datetime
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "3.1"
+VERSION    = "3.2"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -226,24 +226,34 @@ def run():
     log(f"  FinalPing Ground Station v{VERSION}")
     log("=" * 56)
 
-    token = load_token()
-    if not token:
-        log("[ERR] No token found. Run setup or set FINALPING_TOKEN.")
-        sys.exit(1)
-
     log("Validating ground station access...")
-    try:
-        api_post("/api/ground/validate", token, {})
-        log("[OK] Ground station access confirmed")
-    except requests.HTTPError as e:
-        if e.response is not None and e.response.status_code == 403:
-            log("[ERR] Ground station not enabled for this account.")
+    # Retry with backoff instead of exiting on failure. Exiting made the service
+    # manager restart us every few seconds (a log flood on the backend); this
+    # waits calmly and self-heals the moment the token/account is fixed — no
+    # manual restart needed. check_for_update() runs each cycle so future
+    # updates still land while we wait.
+    token = None
+    backoff = 30
+    while True:
+        token = load_token()
+        if token:
+            try:
+                api_post("/api/ground/validate", token, {})
+                log("[OK] Ground station access confirmed")
+                break
+            except requests.HTTPError as e:
+                code = e.response.status_code if e.response is not None else None
+                if code == 403:
+                    log(f"[ERR] Ground station not enabled for this account. Retrying in {backoff}s...")
+                else:
+                    log(f"[ERR] Validation failed (HTTP {code}) — check the device token. Retrying in {backoff}s...")
+            except Exception as e:
+                log(f"[ERR] Could not reach backend: {e}. Retrying in {backoff}s...")
         else:
-            log(f"[ERR] Validation failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        log(f"[ERR] Could not reach backend: {e}")
-        sys.exit(1)
+            log(f"[ERR] No token found. Run setup or set FINALPING_TOKEN. Retrying in {backoff}s...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+        check_for_update()
 
     log("Fetching config from backend...")
     try:
