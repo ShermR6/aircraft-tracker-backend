@@ -15,6 +15,9 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 import jwt
 import os
+import hmac
+import base64
+import hashlib
 import httpx
 import secrets
 import string
@@ -90,7 +93,19 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not SECRET_KEY:
     raise RuntimeError("JWT_SECRET_KEY environment variable is not set")
 ALGORITHM = "HS256"
-WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET", "finalping-internal-secret")
+# Internal/admin API secret. Fail closed: require it to be set (no hardcoded
+# default). Accept either env name so a deployment configured with the
+# documented INTERNAL_API_SECRET still boots.
+WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET") or os.getenv("INTERNAL_API_SECRET")
+if not WEBHOOK_INTERNAL_SECRET:
+    raise RuntimeError("WEBHOOK_INTERNAL_SECRET (or INTERNAL_API_SECRET) environment variable is not set")
+
+
+def _valid_internal_secret(provided: str) -> bool:
+    """Constant-time check of an internal/admin request secret."""
+    if not provided:
+        return False
+    return hmac.compare_digest(provided, WEBHOOK_INTERNAL_SECRET)
 
 # License duration
 LICENSE_DURATION_DAYS = 30
@@ -173,22 +188,22 @@ def create_access_token(user_id: str, expires_delta: timedelta = timedelta(days=
     return encoded_jwt
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-) -> User:
-    """Verify JWT token or GS device key and return current user"""
-    token = credentials.credentials
+def _looks_like_device_key(token: str) -> bool:
+    return len(token) == 64 and all(c in '0123456789abcdef' for c in token.lower())
 
-    # GS device keys are 64-char hex strings — try that path first (no JWT decode needed)
-    if len(token) == 64 and all(c in '0123456789abcdef' for c in token.lower()):
-        user = db.query(User).filter(User.gs_device_key == token).first()
-        if user is None:
-            raise HTTPException(status_code=401, detail="Invalid device key")
-        if not getattr(user, 'ground_station_enabled', False):
-            raise HTTPException(status_code=403, detail="ground_station_not_enabled")
-        return user
 
+def _authenticate_device_key(token: str, db: Session) -> User:
+    """Resolve a GS device key to its user. Assumes the token is device-key shaped."""
+    user = db.query(User).filter(User.gs_device_key == token).first()
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid device key")
+    if not getattr(user, 'ground_station_enabled', False):
+        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    return user
+
+
+def _authenticate_jwt(token: str, db: Session) -> User:
+    """Decode a JWT and return the user, enforcing license expiry."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
@@ -210,6 +225,34 @@ async def get_current_user(
             raise HTTPException(status_code=401, detail="license_expired")
 
     return user
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """Verify a JWT and return the current user.
+
+    Device keys are intentionally NOT accepted here — they are scoped to the
+    /api/ground/* endpoints via get_ground_user, so a leaked device key cannot
+    authenticate the full API (billing, integrations, account management)."""
+    token = credentials.credentials
+    if _looks_like_device_key(token):
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return _authenticate_jwt(token, db)
+
+
+async def get_ground_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+) -> User:
+    """Auth for /api/ground/* endpoints. Accepts either the ground station's
+    GS device key (used by the Pi client) or a normal JWT (so the desktop app
+    can read ground-station status)."""
+    token = credentials.credentials
+    if _looks_like_device_key(token):
+        return _authenticate_device_key(token, db)
+    return _authenticate_jwt(token, db)
 
 
 @app.post("/api/auth/refresh")
@@ -268,7 +311,7 @@ async def login(
     import os
 
     website_url = os.environ.get("WEBSITE_URL", "https://finalpingapp.com")
-    internal_secret = os.environ.get("WEBHOOK_INTERNAL_SECRET", "")
+    internal_secret = WEBHOOK_INTERNAL_SECRET
 
     # Step 1 — Verify credentials with Vercel
     try:
@@ -354,7 +397,7 @@ async def google_desktop_login(
         raise HTTPException(status_code=400, detail="Missing token or email")
 
     website_url = os.environ.get("WEBSITE_URL", "https://finalpingapp.com")
-    internal_secret = os.environ.get("WEBHOOK_INTERNAL_SECRET", "")
+    internal_secret = WEBHOOK_INTERNAL_SECRET
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -410,7 +453,7 @@ async def google_desktop_login(
 @app.post("/api/ground/ingest")
 async def ground_ingest(
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_ground_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -504,7 +547,7 @@ async def ground_ingest(
 
 @app.post("/api/ground/validate")
 async def ground_validate(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_ground_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -526,7 +569,7 @@ async def ground_validate(
 
 @app.get("/api/ground/config")
 async def ground_config(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_ground_user),
     db: Session = Depends(get_db)
 ):
     """
@@ -561,7 +604,7 @@ async def ground_config(
 
 
 @app.post("/api/ground/heartbeat")
-async def ground_heartbeat(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def ground_heartbeat(current_user: User = Depends(get_ground_user), db: Session = Depends(get_db)):
     """Called by the ground station every minute to signal it is online."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
@@ -573,7 +616,7 @@ async def ground_heartbeat(current_user: User = Depends(get_current_user), db: S
 
 
 @app.get("/api/ground/status")
-async def ground_status(current_user: User = Depends(get_current_user)):
+async def ground_status(current_user: User = Depends(get_ground_user)):
     """Returns whether this user's ground station is currently online."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
@@ -589,7 +632,7 @@ async def ground_status(current_user: User = Depends(get_current_user)):
 @app.post("/api/ground/range")
 async def ground_range_post(
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_ground_user),
     db: Session = Depends(get_db),
 ):
     """Receives SDR reception range data (36 buckets, one per 10-degree bearing)."""
@@ -618,7 +661,7 @@ async def ground_range_post(
 
 @app.get("/api/ground/range")
 async def ground_range_get(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_ground_user),
     db: Session = Depends(get_db),
 ):
     """Returns the latest SDR reception range polygon for this user."""
@@ -642,7 +685,7 @@ async def ground_range_get(
 @app.post("/api/ground/positions")
 async def ground_positions_post(
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_ground_user),
 ):
     """Receives live aircraft positions from the ground station for the live map."""
     if not getattr(current_user, 'ground_station_enabled', False):
@@ -689,7 +732,7 @@ async def grant_ground_station(
 ):
     """Admin endpoint to manually grant ground station access to a user"""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -988,7 +1031,7 @@ async def provision_license(
     """
     # Verify internal secret
     secret = request.headers.get("X-Webhook-Secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     # Check if license already exists
@@ -1038,7 +1081,7 @@ async def renew_license(
     Updates expires_at on the existing active license.
     """
     secret = request.headers.get("X-Webhook-Secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Unauthorized")
 
     body = await request.json()
@@ -1721,7 +1764,7 @@ async def get_notifications_for_website(
     db: Session = Depends(get_db)
 ):
     """Fetch notification logs for a user by email — for website use only"""
-    if x_internal_secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(x_internal_secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     from models import NotificationLog
@@ -1984,7 +2027,7 @@ async def admin_get_user_logs(
 ):
     """Return all notification logs for a user by email — used by website dashboard"""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -2017,7 +2060,7 @@ async def admin_get_user_aircraft(
 ):
     """Return all aircraft for a user by email — used by website dashboard filters"""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -2038,7 +2081,7 @@ async def admin_get_user_integrations(
 ):
     """Return all integrations for a user by email — used by website dashboard filters"""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -2060,7 +2103,7 @@ async def expire_license(
 ):
     """Deactivate a license — called when a Stripe subscription is cancelled or a trial ends."""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     license = db.query(License).filter(License.license_key == license_key).first()
@@ -2093,7 +2136,7 @@ async def update_license_tier(
 ):
     """Update a license's tier — called by the web dashboard after a plan upgrade."""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -2135,7 +2178,7 @@ async def generate_license(
 ):
     """Admin endpoint to generate a license key for any tier"""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -2213,7 +2256,7 @@ async def merge_accounts(
 ):
     """Merge two user accounts into one — admin only"""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -2274,7 +2317,7 @@ async def merge_accounts(
 async def list_ground_devices(request: Request, db: Session = Depends(get_db)):
     """Returns all users with ground station enabled — for admin panel."""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     users = db.query(User).filter(User.ground_station_enabled == True).all()
@@ -2299,7 +2342,7 @@ async def list_ground_devices(request: Request, db: Session = Depends(get_db)):
 async def push_display_name(request: Request, db: Session = Depends(get_db)):
     """Called by the website when a user changes their display name."""
     secret = request.headers.get("X-Internal-Secret", "")
-    if not secret or secret != os.getenv("INTERNAL_API_SECRET", ""):
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
     body = await request.json()
     email = (body.get("email") or "").lower().strip()
@@ -2319,7 +2362,7 @@ async def delete_user_account(
 ):
     """Delete a user account and all associated data — called by web dashboard on account deletion"""
     secret = request.headers.get("x-internal-secret")
-    if secret != WEBHOOK_INTERNAL_SECRET:
+    if not _valid_internal_secret(secret):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     body = await request.json()
@@ -2401,6 +2444,31 @@ def _twiml_reply(msg: str) -> Response:
 def _twiml_empty() -> Response:
     return Response(content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>', media_type="application/xml")
 
+def _twilio_request_url(request: Request) -> str:
+    """Reconstruct the public URL Twilio signed against (honours the proxy)."""
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("host") or request.url.netloc
+    url = f"{proto}://{host}{request.url.path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+    return url
+
+def _verify_twilio_signature(request: Request, form) -> bool:
+    """Validate the X-Twilio-Signature HMAC so only genuine Twilio requests are
+    processed. Implements Twilio's documented algorithm with stdlib (no SDK)."""
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not auth_token:
+        return False
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not signature:
+        return False
+    data = _twilio_request_url(request)
+    for key in sorted(form.keys()):
+        data += key + str(form.get(key))
+    digest = hmac.new(auth_token.encode("utf-8"), data.encode("utf-8"), hashlib.sha1).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
 def _phone_norm(p: str) -> str:
     return "".join(c for c in p if c.isdigit() or c == "+")
 
@@ -2440,6 +2508,10 @@ SMS_HELP = (
 @app.post("/api/webhooks/twilio/sms")
 async def twilio_sms_webhook(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
+    # Reject anything not signed by Twilio — the From/Body fields drive
+    # integration STOP and team commands, so they must be authenticated.
+    if not _verify_twilio_signature(request, form):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
     from_number = (form.get("From") or "").strip()
     raw_body = (form.get("Body") or "").strip()
     body_lower = raw_body.lower()
