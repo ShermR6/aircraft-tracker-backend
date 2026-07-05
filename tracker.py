@@ -6,6 +6,9 @@ Adapted from your working KDTO tracker code
 
 import asyncio
 import aiohttp
+import ipaddress
+import socket
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from math import radians, sin, cos, sqrt, asin
 from typing import Dict, List, Optional
@@ -14,6 +17,34 @@ from sqlalchemy.orm import Session
 from models import User, Aircraft, AirportConfig, AlertSetting, Integration, NotificationLog, Team, TeamChannel, TeamAlertSetting, TeamMember, TeamAirportConfig, AircraftClaim, EscalationConfig, AlertEscalation, TeamShift, TeamShiftMember, TeamDutyOverride, ExpectedArrival
 from database import SessionLocal
 import ground_state as _gs
+
+
+def _is_safe_public_url(url: str) -> bool:
+    """SSRF guard for user-supplied webhook URLs. Requires http(s) and rejects
+    any host that resolves to a private/loopback/link-local/reserved address
+    (e.g. 169.254.169.254 cloud metadata, 10.x/192.168.x internal services)."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ('http', 'https'):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
 
 
 class UserTracker:
@@ -447,7 +478,10 @@ class CloudAircraftTracker:
                 print(f"Error fetching ICAO batch: {type(e).__name__}: {e}")
                 return
 
-        for user_id, tracker in self.user_trackers.items():
+        # Iterate a snapshot — request handlers mutate user_trackers across the
+        # awaits below, which would otherwise raise "dictionary changed size
+        # during iteration" and drop the whole polling cycle.
+        for user_id, tracker in list(self.user_trackers.items()):
             try:
                 # When ground station is online it handles alerts — cloud tracker still tracks positions for live map
                 gs_online = _gs.is_ground_station_online(str(user_id))
@@ -949,7 +983,7 @@ class CloudAircraftTracker:
     async def send_discord(self, config: dict, message: str) -> bool:
         """Send Discord webhook"""
         webhook_url = config.get('webhook_url')
-        if not webhook_url:
+        if not webhook_url or not _is_safe_public_url(webhook_url):
             return False
 
         # Enforce 5-second cooldown per webhook so Discord sends a push for each alert
@@ -974,7 +1008,7 @@ class CloudAircraftTracker:
     async def send_slack(self, config: dict, message: str) -> bool:
         """Send Slack webhook"""
         webhook_url = config.get('webhook_url')
-        if not webhook_url:
+        if not webhook_url or not _is_safe_public_url(webhook_url):
             return False
 
         async with aiohttp.ClientSession() as session:
@@ -988,7 +1022,7 @@ class CloudAircraftTracker:
     async def send_teams(self, config: dict, message: str) -> bool:
         """Send Microsoft Teams webhook"""
         webhook_url = config.get('webhook_url')
-        if not webhook_url:
+        if not webhook_url or not _is_safe_public_url(webhook_url):
             return False
 
         async with aiohttp.ClientSession() as session:
@@ -1135,7 +1169,7 @@ class CloudAircraftTracker:
     async def send_google_chat(self, config: dict, message: str) -> bool:
         """Send Google Chat webhook"""
         webhook_url = config.get('webhook_url')
-        if not webhook_url:
+        if not webhook_url or not _is_safe_public_url(webhook_url):
             return False
         plain = message.replace('**', '*')
         async with aiohttp.ClientSession() as session:
@@ -1164,7 +1198,7 @@ class CloudAircraftTracker:
     async def send_webhook(self, config: dict, message: str) -> bool:
         """Send generic webhook POST"""
         url = config.get('webhook_url') or config.get('url')
-        if not url:
+        if not url or not _is_safe_public_url(url):
             return False
         headers = {'Content-Type': 'application/json'}
         secret = config.get('secret')
@@ -1175,6 +1209,7 @@ class CloudAircraftTracker:
                 url,
                 json={'message': message, 'source': 'finalpingapp'},
                 headers=headers,
+                allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 return 200 <= response.status < 300
