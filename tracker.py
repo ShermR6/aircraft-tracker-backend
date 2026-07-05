@@ -47,6 +47,26 @@ def _is_safe_public_url(url: str) -> bool:
     return True
 
 
+from functools import lru_cache
+try:
+    from timezonefinder import TimezoneFinder
+    _tf = TimezoneFinder()
+except Exception:
+    _tf = None
+
+
+@lru_cache(maxsize=1024)
+def _tz_name_for(lat, lon):
+    """IANA timezone name for a coordinate (cached). Used so quiet hours are
+    evaluated in the location's local time rather than the server's UTC."""
+    if _tf is None or lat is None or lon is None:
+        return None
+    try:
+        return _tf.timezone_at(lat=float(lat), lng=float(lon))
+    except Exception:
+        return None
+
+
 class UserTracker:
     """Tracks aircraft for a single user"""
 
@@ -80,7 +100,16 @@ class UserTracker:
             return False
         start_str = qh.get('start', '23:00')
         end_str = qh.get('end', '06:00')
-        now_str = datetime.now().strftime('%H:%M')
+        tz_name = self.config.get('timezone')
+        if tz_name:
+            try:
+                from zoneinfo import ZoneInfo
+                from datetime import timezone as _utc
+                now_str = datetime.now(_utc.utc).astimezone(ZoneInfo(tz_name)).strftime('%H:%M')
+            except Exception:
+                now_str = datetime.utcnow().strftime('%H:%M')
+        else:
+            now_str = datetime.utcnow().strftime('%H:%M')
         if start_str <= end_str:
             return start_str <= now_str <= end_str
         else:
@@ -354,7 +383,8 @@ class CloudAircraftTracker:
                 'enabled': airport_config.quiet_hours_enabled,
                 'start': airport_config.quiet_hours_start,
                 'end': airport_config.quiet_hours_end
-            }
+            },
+            'timezone': getattr(airport_config, 'timezone', None) or _tz_name_for(airport_config.latitude, airport_config.longitude),
         }
 
         aircraft_list = [

@@ -2800,6 +2800,28 @@ async def startup_event():
                 acked_by_user_id UUID REFERENCES users(id),
                 acked_at TIMESTAMP
             )""",
+            # ── Performance indexes on hot foreign keys (B10) — Postgres does
+            # not auto-index FKs; these back the per-user / per-team queries.
+            "CREATE INDEX IF NOT EXISTS idx_notiflog_user_sent ON notification_logs(user_id, sent_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_notiflog_sent ON notification_logs(sent_at)",
+            "CREATE INDEX IF NOT EXISTS idx_aircraft_user ON aircraft(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_integrations_user ON integrations(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_alert_settings_user ON alert_settings(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_airport_configs_user ON airport_configs(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_saved_locations_user ON saved_locations(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_team_members_team ON team_members(team_id)",
+            "CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_team_channels_team ON team_channels(team_id)",
+            "CREATE INDEX IF NOT EXISTS idx_team_aircraft_team ON team_aircraft(team_id)",
+            "CREATE INDEX IF NOT EXISTS idx_team_alert_settings_team ON team_alert_settings(team_id)",
+            "CREATE INDEX IF NOT EXISTS idx_aircraft_claims_team_icao ON aircraft_claims(team_id, icao24)",
+            "CREATE INDEX IF NOT EXISTS idx_expected_arrivals_team ON expected_arrivals(team_id)",
+            "CREATE INDEX IF NOT EXISTS idx_alert_escalations_team ON alert_escalations(team_id)",
+            # ── Quiet-hours timezone (B9) — per-location IANA tz name when known.
+            "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS timezone VARCHAR(64)",
+            # ── Retention (B12): prune notification logs older than 90 days so
+            # the hottest table stays bounded.
+            "DELETE FROM notification_logs WHERE sent_at < NOW() - INTERVAL '90 days'",
         ]
         for sql in migrations:
             try:
