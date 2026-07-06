@@ -37,7 +37,7 @@ from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 
 sentry_sdk.init(
-    dsn="https://671a1631ac770069f122a26298e33a6c@o4511365849874432.ingest.us.sentry.io/4511365869928448",
+    dsn=os.getenv("SENTRY_DSN", "https://671a1631ac770069f122a26298e33a6c@o4511365849874432.ingest.us.sentry.io/4511365869928448"),
     integrations=[FastApiIntegration(), SqlalchemyIntegration()],
     traces_sample_rate=0.2,
     send_default_pii=False,
@@ -65,10 +65,14 @@ Base.metadata.create_all(bind=engine)
 limiter = Limiter(key_func=get_remote_address)
 
 # Initialize FastAPI app
+_docs_enabled = os.getenv("ENABLE_DOCS", "").lower() == "true"
 app = FastAPI(
     title="FinalPing Cloud API",
     description="Real-time aircraft tracking and notifications",
-    version="1.0.6"
+    version="1.0.6",
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
