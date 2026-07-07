@@ -19,9 +19,9 @@ DATABASE_URL = os.getenv(
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-    pool_recycle=300,
+    pool_size=10,      # keep more connections warm so the app's parallel
+    max_overflow=5,    # per-tab requests reuse them instead of paying the
+    pool_recycle=600,  # ~550ms cost of establishing fresh overflow connections
     pool_timeout=30,
     connect_args={
         "connect_timeout": 10,
