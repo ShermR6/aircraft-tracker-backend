@@ -40,9 +40,12 @@ class TokenResponse(BaseModel):
 
 
 class UserLogin(BaseModel):
-    """User login request"""
+    """User login request. `code`/`method` carry the second factor when the
+    account has 2FA enabled (supplied on the follow-up request)."""
     email: EmailStr
     password: str
+    code: Optional[str] = None
+    method: Optional[str] = None
 
 
 class UserResponse(BaseModel):
