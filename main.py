@@ -295,7 +295,7 @@ async def refresh_token(
     return {"access_token": new_token, "token_type": "bearer"}
 
 
-@app.post("/api/auth/login", response_model=TokenResponse)
+@app.post("/api/auth/login")
 @limiter.limit("10/minute")
 async def login(
     request: Request,
@@ -303,37 +303,64 @@ async def login(
     db: Session = Depends(get_db)
 ):
     """
-    Login with website email + password.
-    Verifies credentials against Vercel/Prisma via internal API call,
-    then issues a JWT token for the desktop app.
+    Login with website email + password (+ optional 2FA code).
+
+    Verifies credentials against Vercel/Prisma via internal API call. If the
+    account has 2FA enabled, the first call (no code) returns requires_2fa and —
+    for email/SMS — dispatches a one-time code; the client then re-submits with
+    the code. A JWT is issued only after the second factor passes.
     """
     import aiohttp
     import os
 
     website_url = os.environ.get("WEBSITE_URL", "https://finalpingapp.com")
     internal_secret = WEBHOOK_INTERNAL_SECRET
+    email = credentials.email.lower().strip()
 
-    # Step 1 — Verify credentials with Vercel
+    verify_body = {"email": email, "password": credentials.password}
+    if credentials.code:
+        verify_body["code"] = credentials.code
+        verify_body["method"] = credentials.method
+
+    # Step 1 — Verify credentials (and 2FA code, if supplied) with Vercel
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{website_url}/api/auth/verify",
-                json={"email": credentials.email.lower(), "password": credentials.password},
+                json=verify_body,
                 headers={"x-internal-secret": internal_secret},
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                if resp.status == 401:
-                    raise HTTPException(status_code=401, detail="Invalid email or password")
-                if resp.status != 200:
+                if resp.status not in (200, 401, 429):
                     raise HTTPException(status_code=502, detail="Could not verify credentials. Please try again.")
-                verified = await resp.json()
+                try:
+                    verified = await resp.json()
+                except Exception:
+                    verified = {}
+
+            # Password correct but a second factor is required. Dispatch the code
+            # for email/SMS (TOTP needs none) and ask the client to supply it.
+            if verified.get("requires2FA"):
+                methods = verified.get("methods") or []
+                chosen = "totp" if "totp" in methods else (
+                    "email" if "email" in methods else ("sms" if "sms" in methods else None))
+                if chosen in ("email", "sms"):
+                    try:
+                        async with session.post(
+                            f"{website_url}/api/auth/send-2fa-login",
+                            json={"email": email, "password": credentials.password, "method": chosen},
+                            timeout=aiohttp.ClientTimeout(total=10)
+                        ) as _send:
+                            pass
+                    except aiohttp.ClientError:
+                        pass
+                return {"requires_2fa": True, "methods": methods, "method": chosen}
     except aiohttp.ClientError:
         raise HTTPException(status_code=502, detail="Could not reach verification service. Please check your connection.")
 
     if not verified.get("valid"):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail=verified.get("error") or "Invalid email or password")
 
-    email = credentials.email.lower().strip()
     website_name = verified.get("name") or None
 
     # Step 2 — Find user in Railway DB by email
