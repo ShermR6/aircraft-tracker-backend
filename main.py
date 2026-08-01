@@ -11,6 +11,8 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import jwt
@@ -76,6 +78,18 @@ app = FastAPI(
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(OperationalError)
+async def _db_unavailable_handler(request: Request, exc: OperationalError):
+    """Transient DB connectivity blips (e.g. a Railway Postgres restart) return a
+    retryable 503 instead of surfacing as an unhandled 500 that pages Sentry.
+    Covers both request-body commits and the auth-dependency lookups."""
+    logger.warning("Database temporarily unavailable: %s", str(exc).splitlines()[0] if str(exc) else exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Service temporarily unavailable. Please retry shortly."},
+    )
 
 # CORS middleware (allow desktop app and web app to connect)
 app.add_middleware(
