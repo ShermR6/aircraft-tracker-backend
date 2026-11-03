@@ -128,9 +128,12 @@ TIER_LIMITS = {
     "starter":      {"aircraft": 3,    "zones": 2,  "locations": 1,    "integrations": 1,    "channels": ["discord", "email"]},
     "premium":      {"aircraft": 7,    "zones": 5,  "locations": 5,    "integrations": 3,    "channels": ["discord", "email", "slack", "teams", "google_chat"]},
     "pro":          {"aircraft": 15,   "zones": 7,  "locations": None, "integrations": 5,    "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
-    "team-starter": {"aircraft": 25,   "locations": 3,    "integrations": 3,    "channels": ["discord", "email"]},
-    "team-premium": {"aircraft": 75,   "locations": 10,   "integrations": 10,   "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
-    "team-pro":     {"aircraft": None, "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
+    "team-starter": {"aircraft": 25,   "zones": 2,     "locations": 3,    "integrations": 3,    "channels": ["discord", "email"]},
+    "team-premium": {"aircraft": 75,   "zones": 5,     "locations": 10,   "integrations": 10,   "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
+    "team-pro":     {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
+    # Internal, never sold. Every limit unlimited; paired with activations_max -1
+    # so one key works on any machine.
+    "owner":        {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
 }
 
 
@@ -1051,6 +1054,7 @@ async def provision_license(
         "team-starter": 100,
         "team-premium": 100,
         "team-pro": -1,
+        "owner": -1,
     }
 
     # Create the license — status is "inactive" until desktop activation
@@ -2192,7 +2196,7 @@ async def generate_license(
     duration_days = body.get("duration_days", LICENSE_DURATION_DAYS)
     activate_immediately = body.get("activate_immediately", False)
 
-    if tier not in ["starter", "premium", "pro", "team-starter", "team-premium", "team-pro"]:
+    if tier not in ["starter", "premium", "pro", "team-starter", "team-premium", "team-pro", "owner"]:
         raise HTTPException(status_code=400, detail="Invalid tier")
 
     # Generate prefixed license key: FPT-XXXX-XXXX-XXXX-XXXX for teams, FP-XXXX-XXXX-XXXX-XXXX for personal
