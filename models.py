@@ -24,6 +24,11 @@ class User(Base):
     ground_station_enabled = Column(Boolean, default=False)
     gs_device_key = Column(String(64), unique=True, nullable=True, index=True)
     gs_last_heartbeat = Column(DateTime, nullable=True)
+    # Where the receiver physically is. Distinct from AirportConfig, which is
+    # the field being watched -- an SDR at home monitoring a field 7 nm away
+    # is the normal case, not an error.
+    gs_lat = Column(Float, nullable=True)
+    gs_lon = Column(Float, nullable=True)
     
     # Relationships
     license = relationship("License", back_populates="users")

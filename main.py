@@ -801,9 +801,28 @@ async def ground_range_post(
     if not isinstance(range_nm, list) or len(range_nm) != 36:
         raise HTTPException(status_code=400, detail="range_nm must be a list of 36 floats")
     updated_at = datetime.utcnow()
+
+    # The receiver reports where it actually is. Range is measured from the
+    # antenna, not from the airport being watched, and those are routinely
+    # different places.
+    try:
+        r_lat = body.get("receiver_lat")
+        r_lon = body.get("receiver_lon")
+        if r_lat is not None and r_lon is not None:
+            r_lat, r_lon = float(r_lat), float(r_lon)
+            if -90 <= r_lat <= 90 and -180 <= r_lon <= 180:
+                if current_user.gs_lat != r_lat or current_user.gs_lon != r_lon:
+                    current_user.gs_lat = r_lat
+                    current_user.gs_lon = r_lon
+                    db.commit()
+    except (TypeError, ValueError):
+        pass
+
     _gs.ground_range[str(current_user.id)] = {
         "range_nm": range_nm,
         "updated_at": updated_at.isoformat(),
+        "receiver_lat": current_user.gs_lat,
+        "receiver_lon": current_user.gs_lon,
     }
     try:
         airport_cfg = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
@@ -836,7 +855,13 @@ async def ground_range_get(
             }
             _gs.ground_range[str(current_user.id)] = data
     if not data:
-        return {"range_nm": None, "updated_at": None}
+        return {"range_nm": None, "updated_at": None,
+                "receiver_lat": current_user.gs_lat, "receiver_lon": current_user.gs_lon}
+    # Answer with the live receiver position even for a cached polygon, so the
+    # app never draws the outline around the wrong point.
+    data = dict(data)
+    data["receiver_lat"] = current_user.gs_lat
+    data["receiver_lon"] = current_user.gs_lon
     return data
 
 
