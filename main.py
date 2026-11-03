@@ -338,7 +338,10 @@ async def login(
     internal_secret = WEBHOOK_INTERNAL_SECRET
     email = credentials.email.lower().strip()
 
-    verify_body = {"email": email, "password": credentials.password}
+    # Which app is asking. Personal and teams are separate services with
+    # separate databases, so the website scopes the entitlement it returns.
+    verify_body = {"email": email, "password": credentials.password,
+                   "product": "personal"}
     if credentials.code:
         verify_body["code"] = credentials.code
         verify_body["method"] = credentials.method
