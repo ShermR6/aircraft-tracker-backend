@@ -1184,7 +1184,11 @@ async def get_current_user_info(
             team_id = str(team_obj.id)
             team_name = team_obj.name
             team_role = team_membership.role
-            if team_obj.license_id:
+            if display_tier == "owner":
+                # Matches the bypass in _get_user_team, so the app is not told
+                # the license is invalid while every endpoint still answers.
+                team_license_valid = True
+            elif team_obj.license_id:
                 tl = db.query(License).filter(License.id == team_obj.license_id).first()
                 if tl and (not tl.expires_at or tl.expires_at + LICENSE_GRACE_PERIOD > datetime.utcnow()):
                     team_license_valid = True
@@ -3095,6 +3099,23 @@ def _channel_config(integration_type: str, value: str) -> dict:
     return {"webhook_url": value}
 
 
+def _user_is_owner(user: User, db: Session) -> bool:
+    """Is this the internal owner tier?
+
+    Tier lives on License, not User, and an account can own several License
+    rows across duplicate User rows sharing one email, so check them all.
+    """
+    license_ids = [u.license_id for u in db.query(User).filter(
+        User.email == user.email
+    ).all() if u.license_id]
+    if not license_ids:
+        return False
+    return db.query(License).filter(
+        License.id.in_(license_ids),
+        License.tier == "owner",
+    ).first() is not None
+
+
 def _get_user_team(user: User, db: Session) -> Team:
     # Use TeamMember as the source of truth — removing a member immediately revokes access
     member = db.query(TeamMember).filter(TeamMember.user_id == user.id).first()
@@ -3103,10 +3124,13 @@ def _get_user_team(user: User, db: Session) -> Team:
     team = db.query(Team).filter(Team.id == member.team_id).first()
     if not team:
         raise HTTPException(status_code=404, detail="Team not found")
-    # Validate the team's license hasn't expired
-    team_license = db.query(License).filter(License.id == team.license_id).first()
-    if team_license and team_license.expires_at and team_license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow():
-        raise HTTPException(status_code=403, detail="team_license_expired")
+    # Validate the team's license hasn't expired. The owner tier is internal and
+    # never sold, so there is no subscription behind its team and nothing to
+    # expire -- enforcing it here 403'd the owner out of every team endpoint.
+    if not _user_is_owner(user, db):
+        team_license = db.query(License).filter(License.id == team.license_id).first()
+        if team_license and team_license.expires_at and team_license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow():
+            raise HTTPException(status_code=403, detail="team_license_expired")
     return team
 
 
