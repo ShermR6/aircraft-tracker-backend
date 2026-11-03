@@ -22,7 +22,7 @@ import requests
 from datetime import datetime
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "3.2"
+VERSION    = "3.3"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -34,6 +34,9 @@ CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.
 POLL_INTERVAL      = 5
 HEARTBEAT_INTERVAL = 60
 RANGE_PUSH_INTERVAL = 300
+# Consecutive heartbeat failures before we stop assuming it is the network
+# and go re-check our credentials.
+REVALIDATE_AFTER_FAILURES = 5
 
 DUMP1090_HTTP_URLS = [
     DUMP1090_URL,
@@ -219,20 +222,22 @@ def fetch_dump1090():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run():
-    check_for_update()
+def _is_auth_error(exc):
+    """True when the backend actively rejected our credentials, as opposed to
+    the network being down."""
+    resp = getattr(exc, "response", None)
+    return resp is not None and resp.status_code in (401, 403)
 
-    log("=" * 56)
-    log(f"  FinalPing Ground Station v{VERSION}")
-    log("=" * 56)
 
-    log("Validating ground station access...")
-    # Retry with backoff instead of exiting on failure. Exiting made the service
-    # manager restart us every few seconds (a log flood on the backend); this
-    # waits calmly and self-heals the moment the token/account is fixed — no
-    # manual restart needed. check_for_update() runs each cycle so future
-    # updates still land while we wait.
-    token = None
+def wait_for_valid_token():
+    """Block until the backend accepts our token, returning it.
+
+    Retries with backoff rather than exiting: exiting made the service manager
+    restart us every few seconds (a log flood on the backend). The token is
+    re-read from disk every attempt, so repairing config.json is enough to
+    recover, and check_for_update() runs each cycle so a fixed agent still
+    lands while we wait.
+    """
     backoff = 30
     while True:
         token = load_token()
@@ -240,7 +245,7 @@ def run():
             try:
                 api_post("/api/ground/validate", token, {})
                 log("[OK] Ground station access confirmed")
-                break
+                return token
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else None
                 if code == 403:
@@ -254,6 +259,17 @@ def run():
         time.sleep(backoff)
         backoff = min(backoff * 2, 300)
         check_for_update()
+
+
+def run():
+    check_for_update()
+
+    log("=" * 56)
+    log(f"  FinalPing Ground Station v{VERSION}")
+    log("=" * 56)
+
+    log("Validating ground station access...")
+    token = wait_for_valid_token()
 
     log("Fetching config from backend...")
     try:
@@ -293,6 +309,7 @@ def run():
 
     range_nm          = [0.0] * 36
     last_heartbeat    = 0.0
+    heartbeat_failures = 0
     last_range_push   = 0.0
     last_update_check = time.time()
     last_config_refresh = time.time()
@@ -320,8 +337,23 @@ def run():
             try:
                 api_post("/api/ground/heartbeat", token, {})
                 last_heartbeat = now
+                heartbeat_failures = 0
             except Exception as e:
-                log(f"[WARN] Heartbeat failed: {e}")
+                heartbeat_failures += 1
+                log(f"[WARN] Heartbeat failed ({heartbeat_failures}): {e}")
+                # Validation only ever ran at startup, so a token that expired
+                # or was rotated while we were running produced this warning
+                # once a minute forever: the Pi stayed up, dump1090 kept
+                # streaming, and nothing ever reached the backend again. The
+                # station just went quiet one day and only a reboot brought it
+                # back. A rejected token will go on being rejected, so stop
+                # guessing and re-validate — which also re-reads config.json,
+                # so a repaired key recovers on its own.
+                if _is_auth_error(e) or heartbeat_failures >= REVALIDATE_AFTER_FAILURES:
+                    log("[WARN] Re-validating ground station access...")
+                    token = wait_for_valid_token()
+                    heartbeat_failures = 0
+                    last_heartbeat = 0.0
 
         if now - last_range_push >= RANGE_PUSH_INTERVAL and any(v > 0 for v in range_nm):
             try:

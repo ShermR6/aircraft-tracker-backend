@@ -765,11 +765,24 @@ async def ground_status(current_user: User = Depends(get_ground_user)):
     """Returns whether this user's ground station is currently online."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
-    last_seen = _gs.ground_last_seen.get(str(current_user.id))
-    online = _gs.is_ground_station_online(str(current_user.id))
+    # The in-memory map is the fast path, but it lives in this process and is
+    # empty after every redeploy, crash or container move — which made a
+    # perfectly healthy ground station report Offline until its next heartbeat,
+    # indistinguishable from unplugged hardware. The same heartbeat already
+    # writes gs_last_heartbeat, which survives restarts, so trust whichever of
+    # the two is newer.
+    mem_seen = _gs.ground_last_seen.get(str(current_user.id))
+    db_seen = getattr(current_user, 'gs_last_heartbeat', None)
+    last_seen = max([t for t in (mem_seen, db_seen) if t is not None], default=None)
+    age = (datetime.utcnow() - last_seen).total_seconds() if last_seen else None
+    online = age is not None and age < _gs.GROUND_STATION_TIMEOUT_SECONDS
     return {
         "online": online,
         "last_seen": last_seen.isoformat() if last_seen else None,
+        # Lets the app say "last seen 3 days ago" rather than a bare Offline,
+        # which is the difference between "it just restarted" and "this has
+        # been dead for a week and nobody noticed".
+        "last_seen_seconds": int(age) if age is not None else None,
         "gs_device_key": getattr(current_user, 'gs_device_key', None),
     }
 
