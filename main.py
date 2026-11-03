@@ -398,6 +398,60 @@ async def login(
         user.display_name = website_name
         db.commit()
 
+    # Step 2.5 — Adopt the entitlement the website reported.
+    #
+    # The website (Stripe + Prisma) is the source of truth for what an account
+    # has bought. Mirroring it here is what lets someone buy a plan and simply
+    # log in: no licence key to find, type or keep. /api/activate still works
+    # for offline and gifted keys, it is just no longer the only way in.
+    #
+    # A payload with no "entitlement" key is an older website deploy, and means
+    # "leave it alone" rather than "revoke".
+    ent = verified.get("entitlement")
+    if isinstance(ent, dict):
+        ent_tier = ent.get("tier") or "free"
+        ent_key = ent.get("license_key")
+
+        if ent_tier != "free" and ent_key:
+            lic = db.query(License).filter(License.license_key == ent_key).first()
+            if not lic:
+                lic = License(
+                    license_key=ent_key,
+                    tier=ent_tier,
+                    status="active",
+                    activations_used=0,
+                    activations_max=-1,   # entitlement follows the account, not the device
+                    created_at=datetime.utcnow(),
+                )
+                db.add(lic)
+                db.flush()
+            else:
+                lic.tier = ent_tier
+                lic.status = "active"
+
+            exp = ent.get("expires_at")
+            if exp:
+                try:
+                    lic.expires_at = datetime.fromisoformat(
+                        exp.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except (ValueError, AttributeError):
+                    pass
+
+            if lic.activated_at is None:
+                lic.activated_at = datetime.utcnow()
+            if user.license_id != lic.id:
+                user.license_id = lic.id
+            db.commit()
+            db.refresh(user)
+
+        elif ent_tier == "free" and user.license_id:
+            # Cancelled, refunded or lapsed — drop to free instead of leaving a
+            # paid tier attached to the account forever.
+            user.license_id = None
+            db.commit()
+            db.refresh(user)
+
     # Step 3 — Get license info (may not exist for free accounts)
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
 
@@ -1113,10 +1167,25 @@ async def provision_license(
     db.commit()
     db.refresh(license)
 
+    # Attach it to the buyer straight away, using the email the webhook already
+    # sends. Without this the licence sits unowned until someone types the key
+    # into the desktop app, which is the step this removes: buy, log in, done.
+    linked_email = (data.email or "").lower().strip()
+    if linked_email:
+        buyer = db.query(User).filter(User.email == linked_email).first()
+        if not buyer:
+            buyer = User(email=linked_email)
+            db.add(buyer)
+            db.flush()
+        buyer.license_id = license.id
+        db.commit()
+        logger.info("Linked %s to %s", data.license_key, linked_email)
+
     return {
         "message": "License provisioned successfully",
         "license_key": data.license_key,
         "tier": data.tier,
+        "linked_to": linked_email or None,
     }
 
 
