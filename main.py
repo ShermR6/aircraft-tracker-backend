@@ -316,6 +316,92 @@ async def refresh_token(
     return {"access_token": new_token, "token_type": "bearer"}
 
 
+# ─── Entitlement ──────────────────────────────────────────────────────────────
+
+async def fetch_entitlement(email: str):
+    """Ask the website what this account is entitled to. None on any failure,
+    which callers treat as 'leave the current state alone'."""
+    import aiohttp
+    import os
+    website_url = os.environ.get("WEBSITE_URL", "https://finalpingapp.com")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{website_url}/api/internal/entitlement",
+                json={"email": email, "product": "personal"},
+                headers={"x-internal-secret": WEBHOOK_INTERNAL_SECRET},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                return (await resp.json()).get("entitlement")
+    except Exception as e:
+        logger.warning("entitlement lookup failed for %s: %s", email, e)
+        return None
+
+
+def adopt_entitlement(db, user, ent):
+    """Mirror the website's entitlement onto this user's licence row.
+
+    The website (Stripe + Prisma) is the source of truth for what an account has
+    bought. Mirroring it here is what lets someone buy a plan and simply log in:
+    no licence key to find, type or keep.
+
+    `ent` of None means the lookup failed or the website is older than this
+    feature — leave things alone rather than revoking on a network blip.
+    """
+    if not isinstance(ent, dict):
+        return
+
+    ent_tier = ent.get("tier") or "free"
+    ent_key = ent.get("license_key")
+
+    if ent_tier != "free" and ent_key:
+        lic = db.query(License).filter(License.license_key == ent_key).first()
+        if not lic:
+            lic = License(
+                license_key=ent_key,
+                tier=ent_tier,
+                status="active",
+                activations_used=0,
+                activations_max=-1,   # entitlement follows the account, not the device
+                created_at=datetime.utcnow(),
+            )
+            db.add(lic)
+            db.flush()
+        else:
+            lic.tier = ent_tier
+            lic.status = "active"
+
+        exp = ent.get("expires_at")
+        if exp:
+            try:
+                lic.expires_at = datetime.fromisoformat(
+                    exp.replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+            except (ValueError, AttributeError):
+                pass
+        else:
+            # The entitlement says no expiry. Clear any date already on the row
+            # rather than leaving a stale one: moving from a dated plan to a
+            # lifetime one must actually drop the old date.
+            lic.expires_at = None
+
+        if lic.activated_at is None:
+            lic.activated_at = datetime.utcnow()
+        if user.license_id != lic.id:
+            user.license_id = lic.id
+        db.commit()
+        db.refresh(user)
+
+    elif ent_tier == "free" and user.license_id:
+        # Cancelled, refunded or lapsed — drop to free instead of leaving a paid
+        # tier attached to the account forever.
+        user.license_id = None
+        db.commit()
+        db.refresh(user)
+
+
 @app.post("/api/auth/login")
 @limiter.limit("10/minute")
 async def login(
@@ -401,65 +487,9 @@ async def login(
         user.display_name = website_name
         db.commit()
 
-    # Step 2.5 — Adopt the entitlement the website reported.
-    #
-    # The website (Stripe + Prisma) is the source of truth for what an account
-    # has bought. Mirroring it here is what lets someone buy a plan and simply
-    # log in: no licence key to find, type or keep. /api/activate still works
-    # for offline and gifted keys, it is just no longer the only way in.
-    #
-    # A payload with no "entitlement" key is an older website deploy, and means
-    # "leave it alone" rather than "revoke".
-    ent = verified.get("entitlement")
-    if isinstance(ent, dict):
-        ent_tier = ent.get("tier") or "free"
-        ent_key = ent.get("license_key")
-
-        if ent_tier != "free" and ent_key:
-            lic = db.query(License).filter(License.license_key == ent_key).first()
-            if not lic:
-                lic = License(
-                    license_key=ent_key,
-                    tier=ent_tier,
-                    status="active",
-                    activations_used=0,
-                    activations_max=-1,   # entitlement follows the account, not the device
-                    created_at=datetime.utcnow(),
-                )
-                db.add(lic)
-                db.flush()
-            else:
-                lic.tier = ent_tier
-                lic.status = "active"
-
-            exp = ent.get("expires_at")
-            if exp:
-                try:
-                    lic.expires_at = datetime.fromisoformat(
-                        exp.replace("Z", "+00:00")
-                    ).replace(tzinfo=None)
-                except (ValueError, AttributeError):
-                    pass
-            else:
-                # The entitlement says no expiry. Clear any date already on the
-                # row rather than leaving a stale one: moving from a dated plan
-                # to a lifetime one must actually drop the old date, or the app
-                # keeps showing an expiry that no longer applies.
-                lic.expires_at = None
-
-            if lic.activated_at is None:
-                lic.activated_at = datetime.utcnow()
-            if user.license_id != lic.id:
-                user.license_id = lic.id
-            db.commit()
-            db.refresh(user)
-
-        elif ent_tier == "free" and user.license_id:
-            # Cancelled, refunded or lapsed — drop to free instead of leaving a
-            # paid tier attached to the account forever.
-            user.license_id = None
-            db.commit()
-            db.refresh(user)
+    # Step 2.5 — Adopt whatever the website reported alongside the
+    # credential check, so a plan bought on the site applies immediately.
+    adopt_entitlement(db, user, verified.get("entitlement"))
 
     # Step 3 — Get license info (may not exist for free accounts)
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
@@ -539,6 +569,10 @@ async def google_desktop_login(
     elif website_name and user.display_name != website_name:
         user.display_name = website_name
         db.commit()
+
+    # Google sign-in has no password to verify, so ask the website directly.
+    # Without this, signing in with Google never picked up a plan at all.
+    adopt_entitlement(db, user, await fetch_entitlement(email))
 
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
     tier = "free"
@@ -1059,6 +1093,13 @@ async def get_current_user_info(
 ):
     """Get current user information"""
     from sqlalchemy import desc
+
+    # Refresh the entitlement from the website before reporting a tier. Without
+    # this, a plan change only took effect at the next password login: someone
+    # who upgraded, cancelled or signed in with Google kept seeing whatever was
+    # last written to their row. A failed lookup returns None and changes
+    # nothing, so a website blip never revokes anyone.
+    adopt_entitlement(db, current_user, await fetch_entitlement(current_user.email))
 
     # Find the most recently activated personal (non-team) license for this user.
     # Team licenses are excluded here — team access is via TeamMember, and the personal
