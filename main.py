@@ -440,6 +440,12 @@ async def login(
                     ).replace(tzinfo=None)
                 except (ValueError, AttributeError):
                     pass
+            else:
+                # The entitlement says no expiry. Clear any date already on the
+                # row rather than leaving a stale one: moving from a dated plan
+                # to a lifetime one must actually drop the old date, or the app
+                # keeps showing an expiry that no longer applies.
+                lic.expires_at = None
 
             if lic.activated_at is None:
                 lic.activated_at = datetime.utcnow()
