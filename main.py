@@ -59,6 +59,11 @@ from schemas import (
     TeamInviteCreate, TeamActivateInviteRequest, TeamRoleCreate, TeamRoleUpdate, AssignMemberRoleRequest
 )
 from tracker import CloudAircraftTracker
+from alert_rules import (
+    PLAN_CHANNELS, routed_integrations, clean_routing, prune_routing,
+    clean_headings, reconcile_headings, clean_gs_stats,
+)
+from models import read_optional_column
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -139,15 +144,17 @@ WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 
 # Tier feature limits (None = unlimited)
 TIER_LIMITS = {
-    "starter":      {"aircraft": 3,    "zones": 2,  "locations": 1,    "integrations": 1,    "channels": ["discord", "email"]},
-    "premium":      {"aircraft": 7,    "zones": 5,  "locations": 5,    "integrations": 3,    "channels": ["discord", "email", "slack", "teams", "google_chat"]},
-    "pro":          {"aircraft": 15,   "zones": 7,  "locations": None, "integrations": 5,    "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
-    "team-starter": {"aircraft": 25,   "zones": 2,     "locations": 3,    "integrations": 3,    "channels": ["discord", "email"]},
-    "team-premium": {"aircraft": 75,   "zones": 5,     "locations": 10,   "integrations": 10,   "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
-    "team-pro":     {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
+    # "channels" is what a plan may connect. The lists live in alert_rules so
+    # the tracker delivers to exactly what can be connected here.
+    "starter":      {"aircraft": 3,    "zones": 2,  "locations": 1,    "integrations": 1,    "channels": PLAN_CHANNELS["starter"]},
+    "premium":      {"aircraft": 7,    "zones": 5,  "locations": 5,    "integrations": 3,    "channels": PLAN_CHANNELS["premium"]},
+    "pro":          {"aircraft": 15,   "zones": 7,  "locations": None, "integrations": 5,    "channels": PLAN_CHANNELS["pro"]},
+    "team-starter": {"aircraft": 25,   "zones": 2,     "locations": 3,    "integrations": 3,    "channels": PLAN_CHANNELS["team-starter"]},
+    "team-premium": {"aircraft": 75,   "zones": 5,     "locations": 10,   "integrations": 10,   "channels": PLAN_CHANNELS["team-premium"]},
+    "team-pro":     {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": PLAN_CHANNELS["team-pro"]},
     # Internal, never sold. Every limit unlimited; paired with activations_max -1
     # so one key works on any machine.
-    "owner":        {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]},
+    "owner":        {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": PLAN_CHANNELS["owner"]},
 }
 
 
@@ -631,6 +638,11 @@ async def ground_ingest(
     if not integrations:
         return {"message": "No integrations configured", "alerts_sent": 0}
 
+    # Per-event routing: skip the integrations switched off for this alert type.
+    integrations = routed_integrations(
+        integrations, read_optional_column(db, current_user, "routing"), alert_type
+    )
+
     alert_settings = {
         s.alert_type: s.message_template
         for s in db.query(AlertSetting).filter(AlertSetting.user_id == current_user.id).all()
@@ -749,19 +761,37 @@ async def ground_config(
 
 
 @app.post("/api/ground/heartbeat")
-async def ground_heartbeat(current_user: User = Depends(get_ground_user), db: Session = Depends(get_db)):
-    """Called by the ground station every minute to signal it is online."""
+async def ground_heartbeat(request: Request, current_user: User = Depends(get_ground_user), db: Session = Depends(get_db)):
+    """Called by the ground station every minute to signal it is online.
+
+    Agents from 3.7 on also report a few stats in the body. Older agents send
+    an empty body, which leaves whatever is stored untouched.
+    """
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     now = datetime.utcnow()
     _gs.ground_last_seen[str(current_user.id)] = now
     current_user.gs_last_heartbeat = now
     db.commit()
+
+    # Stats are saved separately, after the heartbeat itself is safely
+    # recorded, so nothing about them can make a station look offline.
+    try:
+        stats = clean_gs_stats(await request.json())
+    except Exception:
+        stats = None
+    if stats is not None:
+        try:
+            current_user.gs_stats = stats
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.warning("Could not store ground station stats: %s", e)
     return {"ok": True}
 
 
 @app.get("/api/ground/status")
-async def ground_status(current_user: User = Depends(get_ground_user)):
+async def ground_status(current_user: User = Depends(get_ground_user), db: Session = Depends(get_db)):
     """Returns whether this user's ground station is currently online."""
     if not getattr(current_user, 'ground_station_enabled', False):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
@@ -784,6 +814,8 @@ async def ground_status(current_user: User = Depends(get_ground_user)):
         # been dead for a week and nobody noticed".
         "last_seen_seconds": int(age) if age is not None else None,
         "gs_device_key": getattr(current_user, 'gs_device_key', None),
+        # Reported by agents 3.7+ with each heartbeat; None for older agents.
+        "stats": read_optional_column(db, current_user, "gs_stats"),
     }
 
 
@@ -1543,6 +1575,34 @@ async def create_alert_setting(
         created_at=setting.created_at
     )
 
+class RoutingUpdate(BaseModel):
+    routing: dict
+
+
+@app.get("/api/settings/routing")
+async def get_routing(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Per-event channel routing: integrations switched OFF per alert type."""
+    return {"routing": read_optional_column(db, current_user, "routing") or {}}
+
+
+@app.put("/api/settings/routing")
+async def update_routing(
+    body: RoutingUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Replace the caller's routing. Unknown alert types and integration ids
+    that are not the caller's own are dropped."""
+    own_ids = [str(i.id) for i in db.query(Integration).filter(Integration.user_id == current_user.id).all()]
+    cleaned = clean_routing(body.routing, own_ids)
+    current_user.routing = cleaned or None
+    db.commit()
+    return {"routing": cleaned}
+
+
 # ============================================================================
 # AIRPORT CONFIGURATION
 # ============================================================================
@@ -1559,8 +1619,11 @@ async def get_airport_config(
     
     if not config:
         raise HTTPException(status_code=404, detail="No airport configuration found")
-    
+
     return {
+        # Several accepted runway headings (web app); None when only the single
+        # approach_runway_heading below is in use.
+        "approach_runway_headings": read_optional_column(db, config, "approach_runway_headings"),
         "id": str(config.id),
         "airport_code": config.airport_code,
         "airport_name": config.airport_name,
@@ -1639,6 +1702,14 @@ async def save_airport_config(
             config.approach_corridor_enabled = config_data["approach_corridor_enabled"]
         if "approach_runway_heading" in config_data:
             config.approach_runway_heading = config_data["approach_runway_heading"]
+        # Only written when it actually changes, so a save from the desktop app
+        # (which never sends the list) touches this column only to clear a list
+        # the web app set.
+        if "approach_runway_headings" in config_data or "approach_runway_heading" in config_data:
+            _current_headings = read_optional_column(db, config, "approach_runway_headings")
+            _new_headings = reconcile_headings(config_data, _current_headings)
+            if _new_headings != _current_headings:
+                config.approach_runway_headings = _new_headings
         config.airport_name = config_data.get("airport_name", config.airport_name)
         config.updated_at = datetime.utcnow()
     else:
@@ -1662,7 +1733,12 @@ async def save_airport_config(
             updated_at=datetime.utcnow()
         )
         db.add(config)
-    
+        # Set only when there is a list, so creating a config never writes the
+        # column otherwise.
+        _new_headings = clean_headings(config_data.get("approach_runway_headings"))
+        if _new_headings:
+            config.approach_runway_headings = _new_headings
+
     db.commit()
     db.refresh(config)
 
@@ -1672,6 +1748,9 @@ async def save_airport_config(
             valid_types = {f"{int(float(d))}nm" if float(d) == int(float(d)) else f"{float(d)}nm"
                           for d in config_data["alert_distances_nm"]}
             valid_types.add("landing")  # never delete landing alerts
+            # Takeoff was missing here, so a custom takeoff message was deleted
+            # every time the rings were saved.
+            valid_types.add("takeoff")
             existing_settings = db.query(AlertSetting).filter(
                 AlertSetting.user_id == current_user.id
             ).all()
@@ -1822,7 +1901,13 @@ async def delete_integration(
     ).first()
     if not integration:
         raise HTTPException(status_code=404, detail="Integration not found")
+    # Take the integration out of the per-event routing as well.
+    _routing = read_optional_column(db, current_user, "routing")
     db.delete(integration)
+    if _routing:
+        _pruned = prune_routing(_routing, remove_integration_id=integration_id)
+        if _pruned != _routing:
+            current_user.routing = _pruned or None
     db.commit()
     return {"message": "Integration deleted"}
 
