@@ -1682,7 +1682,12 @@ async def save_airport_config(
     config = db.query(AirportConfig).filter(
         AirportConfig.user_id == current_user.id
     ).first()
-    
+
+    # Read this before changing anything. On a database without the column the
+    # read rolls the session back, which would silently discard every change
+    # already made to `config` below.
+    _current_headings = read_optional_column(db, config, "approach_runway_headings")
+
     if config:
         config.airport_code = config_data.get("airport_code", config.airport_code)
         config.latitude = str(config_data.get("latitude", config.latitude))
@@ -1706,7 +1711,6 @@ async def save_airport_config(
         # (which never sends the list) touches this column only to clear a list
         # the web app set.
         if "approach_runway_headings" in config_data or "approach_runway_heading" in config_data:
-            _current_headings = read_optional_column(db, config, "approach_runway_headings")
             _new_headings = reconcile_headings(config_data, _current_headings)
             if _new_headings != _current_headings:
                 config.approach_runway_headings = _new_headings
