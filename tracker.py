@@ -17,6 +17,8 @@ from sqlalchemy.orm import Session
 from models import User, Aircraft, AirportConfig, AlertSetting, Integration, NotificationLog, Team, TeamChannel, TeamAlertSetting, TeamMember, TeamAirportConfig, AircraftClaim, EscalationConfig, AlertEscalation, TeamShift, TeamShiftMember, TeamDutyOverride, ExpectedArrival
 from database import SessionLocal
 import ground_state as _gs
+from alert_rules import send_channels_for_tier, routed_integrations, approach_headings, heading_allowed
+from models import read_optional_column
 
 
 def _is_safe_public_url(url: str) -> bool:
@@ -209,14 +211,12 @@ class UserTracker:
 
                     if crossed_with_buffer and alert_key not in self.distance_alerts_sent[aircraft_id]:
                         # Approach corridor filter — skip if aircraft heading is not aligned with runway
-                        if airspace.get('approach_corridor_enabled') and airspace.get('approach_runway_heading') is not None:
+                        rwy_headings = approach_headings(airspace) if airspace.get('approach_corridor_enabled') else []
+                        if rwy_headings:
                             track = aircraft_data.get('track') or aircraft_data.get('heading')
-                            if track is not None:
-                                rwy_hdg = float(airspace['approach_runway_heading'])
-                                diff = abs((track - rwy_hdg + 180) % 360 - 180)
-                                if diff > 35:
-                                    self.distance_alerts_sent[aircraft_id].add(alert_key)  # suppress quietly
-                                    continue
+                            if track is not None and not heading_allowed(track, rwy_headings):
+                                self.distance_alerts_sent[aircraft_id].add(alert_key)  # suppress quietly
+                                continue
 
                         # Send the distance alert
                         if self.should_notify(f'distance_{alert_distance}', aircraft_id):
@@ -352,6 +352,10 @@ class CloudAircraftTracker:
             # No config yet, skip
             return
 
+        # Read before anything else is loaded: on an un-migrated database this
+        # rolls the session back.
+        runway_headings = read_optional_column(db, airport_config, "approach_runway_headings")
+
         aircraft = db.query(Aircraft).filter(
             Aircraft.user_id == user_id,
             Aircraft.active == True
@@ -376,6 +380,7 @@ class CloudAircraftTracker:
                 'alert_distances_nm': [float(d) for d in airport_config.alert_distances_nm],
                 'approach_corridor_enabled': airport_config.approach_corridor_enabled or False,
                 'approach_runway_heading': airport_config.approach_runway_heading,
+                'approach_runway_headings': runway_headings,
             },
             'airport_code': airport_config.airport_code or '',
             'notification_cooldown_minutes': 1,
@@ -616,15 +621,6 @@ class CloudAircraftTracker:
                 print(f"Error tracking for user {user_id}: {e}")
                 traceback.print_exc()
 
-    TIER_CHANNELS = {
-        "starter":      ["discord", "email"],
-        "premium":      ["discord", "email", "slack", "sms", "teams"],
-        "pro":          ["discord", "email", "slack", "sms", "teams", "whatsapp"],
-        "team-starter": ["discord", "email"],
-        "team-premium": ["discord", "email", "slack", "sms", "teams", "google_chat", "webhook"],
-        "team-pro":     ["discord", "email", "slack", "sms", "teams", "google_chat", "webhook", "whatsapp"],
-    }
-
     async def send_notifications(self, user_id: str, notifications: List[dict]):
         """Send notifications via configured integrations"""
         db = SessionLocal()
@@ -637,6 +633,8 @@ class CloudAircraftTracker:
                 return
 
             user = db.query(User).filter(User.id == user_id).first()
+            # Per-event routing: integrations the user switched off per alert type.
+            routing = read_optional_column(db, user, "routing")
             tier = "starter"
             if user and user.license_id:
                 from models import License
@@ -652,7 +650,7 @@ class CloudAircraftTracker:
             if tier.startswith("team-"):
                 await self._send_team_notifications(user_id, user, notifications, alert_settings, db)
             else:
-                allowed_channels = self.TIER_CHANNELS.get(tier, self.TIER_CHANNELS["starter"])
+                allowed_channels = send_channels_for_tier(tier)
                 integrations = [
                     i for i in db.query(Integration).filter(
                         Integration.user_id == user_id,
@@ -667,7 +665,7 @@ class CloudAircraftTracker:
                     alert_type = notification['type']
                     template = alert_settings.get(alert_type, self.get_default_template(alert_type))
                     message = self.format_message(template, notification)
-                    for integration in integrations:
+                    for integration in routed_integrations(integrations, routing, alert_type):
                         success = await self.send_via_integration(integration, message)
                         db.add(NotificationLog(
                             user_id=user_id,
