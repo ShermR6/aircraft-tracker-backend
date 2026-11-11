@@ -5,11 +5,14 @@ SQLAlchemy ORM models for PostgreSQL
 
 from sqlalchemy import Column, String, Boolean, Integer, Float, DateTime, ForeignKey, JSON, Text, BigInteger
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, deferred
+import logging
 import uuid
 from datetime import datetime
 
 from database import Base
+
+logger = logging.getLogger("finalpingapp")
 
 
 class User(Base):
@@ -29,7 +32,16 @@ class User(Base):
     # is the normal case, not an error.
     gs_lat = Column(Float, nullable=True)
     gs_lon = Column(Float, nullable=True)
-    
+    # Added for the web app. Deferred on purpose: they are left out of the
+    # default SELECT, so a database where migrate_web_app.py has not run yet
+    # cannot break every query that touches this table. Read them through
+    # read_optional_column().
+    #
+    # routing: {"10nm": [integration_id, ...]} = integrations switched OFF for
+    # that alert type. gs_stats: what the ground agent last reported.
+    routing = deferred(Column(JSON, nullable=True))
+    gs_stats = deferred(Column(JSON, nullable=True))
+
     # Relationships
     license = relationship("License", back_populates="users")
     aircraft = relationship("Aircraft", back_populates="user", cascade="all, delete-orphan")
@@ -106,12 +118,15 @@ class AirportConfig(Base):
     runway_info = Column(JSON, nullable=True)          # [{ident, leHdg, heHdg, lengthFt}, ...]
     approach_corridor_enabled = Column(Boolean, default=False)
     approach_runway_heading = Column(Float, nullable=True)  # degrees true
+    # Several accepted runway headings (web app). When set, it replaces the
+    # single heading above. Deferred for the same reason as User.routing.
+    approach_runway_headings = deferred(Column(JSON, nullable=True))
 
     # Quiet hours
     quiet_hours_enabled = Column(Boolean, default=True)
     quiet_hours_start = Column(String(5), default="23:00")
     quiet_hours_end = Column(String(5), default="06:00")
-    
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -434,3 +449,23 @@ class AlertEscalation(Base):
     acked_at = Column(DateTime, nullable=True)
 
     team = relationship("Team")
+
+
+def read_optional_column(db, obj, name):
+    """Read a deferred column that an un-migrated database may not have.
+
+    Loading it issues its own SELECT. If that fails, the session is rolled
+    back (PostgreSQL refuses further statements in a failed transaction) and
+    None is returned, which every caller treats as "feature not in use".
+    """
+    if obj is None:
+        return None
+    try:
+        return getattr(obj, name)
+    except Exception as e:
+        logger.warning("Optional column %s unavailable: %s", name, e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None

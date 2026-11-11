@@ -2940,6 +2940,10 @@ async def startup_event():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255)",
             # TeamAirportConfig — multi-airport support
             "ALTER TABLE team_airport_configs ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE",
+            # Web app — per-event routing, receiver stats, multi-runway approach filter
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS routing JSON",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_stats JSON",
+            "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_runway_headings JSON",
             # New tables for teams v2
             """CREATE TABLE IF NOT EXISTS aircraft_claims (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
