@@ -144,6 +144,53 @@ def test_integrations_still_list_and_delete_without_routing():
     assert client.get("/api/integrations").json() == []
 
 
+# ── connecting channels ──────────────────────────────────────────────────────
+
+def _give_plan(tier):
+    from models import License
+    lic = License(id=uuid.uuid4(), license_key=f"TEST-{tier}"[:24], tier=tier, activations_max=1, status="active")
+    _shared.add(lic)
+    _shared.get(User, USER_ID).license_id = lic.id
+    _shared.commit()
+
+
+def test_pro_can_connect_every_channel_the_pricing_page_promises():
+    _give_plan("pro")
+    for kind, config in (
+        ("telegram", {"bot_token": "1:abc", "chat_id": "-100"}),
+        ("webhook", {"webhook_url": "https://example.com/hook"}),
+        ("google_chat", {"webhook_url": "https://chat.googleapis.com/v1/x"}),
+        ("sms", {"to_phone": "+15555550100"}),
+    ):
+        r = client.post("/api/integrations", json={"type": kind, "config": config, "enabled": True})
+        assert r.status_code == 200, (kind, r.text)
+    kinds = {i["type"] for i in client.get("/api/integrations").json()}
+    assert kinds == {"telegram", "webhook", "google_chat", "sms"}
+
+
+def test_plan_gate_still_refuses_channels_a_plan_does_not_include():
+    # No licence = starter: Discord and email only.
+    r = client.post("/api/integrations", json={"type": "telegram", "config": {"bot_token": "1:a", "chat_id": "1"}})
+    assert r.status_code == 403
+    r = client.post("/api/integrations", json={"type": "carrier_pigeon", "config": {}})
+    assert r.status_code == 422
+
+
+def test_alerts_reach_a_newly_connectable_channel(monkeypatch):
+    _give_plan("pro")
+    client.post("/api/integrations", json={"type": "telegram", "config": {"bot_token": "1:abc", "chat_id": "-100"}})
+    sent = []
+
+    async def fake_send(integration, message):
+        sent.append(integration.type)
+        return True
+
+    monkeypatch.setattr(main.tracker, "send_via_integration", fake_send)
+    note = {"type": "10nm", "tail": "N172AK", "distance": 10.2, "altitude": 2500, "eta": 6, "speed": 95, "time": datetime.now()}
+    asyncio.run(main.tracker.send_notifications(str(USER_ID), [note]))
+    assert sent == ["telegram"]
+
+
 # ── receiver stats ───────────────────────────────────────────────────────────
 
 def test_heartbeat_from_an_old_agent_still_works_and_reports_no_stats():

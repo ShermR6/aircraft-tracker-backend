@@ -186,7 +186,11 @@ class AlertSettingResponse(BaseModel):
 
 class IntegrationCreate(BaseModel):
     """Create integration"""
-    type: str = Field(..., pattern="^(discord|slack|teams|email|sms|whatsapp)$")
+    # Every type the tracker can deliver to. google_chat, telegram and webhook
+    # were missing, so the plans that include them (alert_rules.PLAN_CHANNELS)
+    # got a validation error when trying to connect one. Which plan may use
+    # which type is decided in the endpoint, not here.
+    type: str = Field(..., pattern="^(discord|slack|teams|email|sms|whatsapp|google_chat|telegram|webhook)$")
     config: Dict[str, Any]
     enabled: bool = True
 
