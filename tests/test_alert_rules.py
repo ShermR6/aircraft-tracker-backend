@@ -29,8 +29,19 @@ def test_nobody_loses_a_channel_the_tracker_used_to_send():
             assert ch in r.send_channels_for_tier(tier), (tier, ch)
 
 
-def test_unknown_tier_falls_back_to_starter():
-    assert r.send_channels_for_tier("free") == ["discord", "email"]
+def test_no_plan_gets_no_channels():
+    assert r.send_channels_for_tier("free") == []
+
+
+def test_the_three_old_plan_names_are_one_plan():
+    assert r.send_channels_for_tier("starter") == r.ALL_CHANNELS
+    assert r.PLAN_CHANNELS["premium"] == r.ALL_CHANNELS
+    assert r.PLAN_CHANNELS["pro"] == r.ALL_CHANNELS
+
+
+def test_unknown_personal_tier_gets_the_plan():
+    # e.g. "starter-yearly" on a licence sold before tier names were normalised
+    assert r.send_channels_for_tier("starter-yearly") == r.ALL_CHANNELS
 
 
 # ── routing ──────────────────────────────────────────────────────────────────

@@ -19,6 +19,7 @@ from database import SessionLocal
 import ground_state as _gs
 from alert_rules import send_channels_for_tier, routed_integrations, approach_headings, heading_allowed
 from models import read_optional_column
+from plans import live_license, plan_tier, sms_over_limit
 
 
 def _is_safe_public_url(url: str) -> bool:
@@ -347,6 +348,12 @@ class CloudAircraftTracker:
         if not user:
             return
 
+        # No live plan, no tracking: a free or lapsed account is not polled for
+        # and gets no alerts until it starts a trial or subscribes.
+        if live_license(db, user) is None:
+            self.user_trackers.pop(user_id, None)
+            return
+
         airport_config = db.query(AirportConfig).filter(AirportConfig.user_id == user_id).first()
         if not airport_config:
             # No config yet, skip
@@ -635,12 +642,9 @@ class CloudAircraftTracker:
             user = db.query(User).filter(User.id == user_id).first()
             # Per-event routing: integrations the user switched off per alert type.
             routing = read_optional_column(db, user, "routing")
-            tier = "starter"
-            if user and user.license_id:
-                from models import License
-                lic = db.query(License).filter(License.id == user.license_id).first()
-                if lic:
-                    tier = lic.tier
+            # "free" (no live licence) has no channels, so a plan that lapsed
+            # since this account was loaded stops alerting here.
+            tier = plan_tier(db, user)
 
             alert_settings = {
                 s.alert_type: s.message_template
@@ -666,14 +670,16 @@ class CloudAircraftTracker:
                     template = alert_settings.get(alert_type, self.get_default_template(alert_type))
                     message = self.format_message(template, notification)
                     for integration in routed_integrations(integrations, routing, alert_type):
-                        success = await self.send_via_integration(integration, message)
+                        # Texts cost money per message: each account has a monthly allowance.
+                        capped = integration.type == 'sms' and sms_over_limit(db, user.id)
+                        success = False if capped else await self.send_via_integration(integration, message)
                         db.add(NotificationLog(
                             user_id=user_id,
                             aircraft_tail=notification['tail'],
                             alert_type=alert_type,
                             message=message,
                             integration_type=integration.type,
-                            status='sent' if success else 'failed',
+                            status='limit' if capped else ('sent' if success else 'failed'),
                             sent_at=datetime.utcnow()
                         ))
 

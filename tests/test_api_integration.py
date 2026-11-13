@@ -92,6 +92,7 @@ def _fresh_db():
     _shared.add(User(id=USER_ID, email="pilot@example.com", ground_station_enabled=True))
     _shared.add(User(id=OTHER_ID, email="other@example.com"))
     _shared.commit()
+    _give_plan("starter")   # the paid plan; tests about having no plan call _drop_plan()
     main.tracker.user_trackers.clear()
     yield
 
@@ -146,11 +147,17 @@ def test_integrations_still_list_and_delete_without_routing():
 
 # ── connecting channels ──────────────────────────────────────────────────────
 
-def _give_plan(tier):
+def _give_plan(tier, expires_at=None):
     from models import License
-    lic = License(id=uuid.uuid4(), license_key=f"TEST-{tier}"[:24], tier=tier, activations_max=1, status="active")
+    lic = License(id=uuid.uuid4(), license_key=uuid.uuid4().hex[:24], tier=tier, activations_max=1,
+                  status="active", expires_at=expires_at)
     _shared.add(lic)
     _shared.get(User, USER_ID).license_id = lic.id
+    _shared.commit()
+
+
+def _drop_plan():
+    _shared.get(User, USER_ID).license_id = None
     _shared.commit()
 
 
@@ -168,12 +175,13 @@ def test_pro_can_connect_every_channel_the_pricing_page_promises():
     assert kinds == {"telegram", "webhook", "google_chat", "sms"}
 
 
-def test_plan_gate_still_refuses_channels_a_plan_does_not_include():
-    # No licence = starter: Discord and email only.
-    r = client.post("/api/integrations", json={"type": "telegram", "config": {"bot_token": "1:a", "chat_id": "1"}})
-    assert r.status_code == 403
+def test_no_plan_cannot_connect_a_channel_and_unknown_channels_are_invalid():
     r = client.post("/api/integrations", json={"type": "carrier_pigeon", "config": {}})
     assert r.status_code == 422
+    _drop_plan()
+    r = client.post("/api/integrations", json={"type": "telegram", "config": {"bot_token": "1:a", "chat_id": "1"}})
+    assert r.status_code == 402
+    assert r.json()["detail"] == "no_plan"
 
 
 def test_alerts_reach_a_newly_connectable_channel(monkeypatch):

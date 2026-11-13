@@ -60,7 +60,7 @@ from schemas import (
 )
 from tracker import CloudAircraftTracker
 from alert_rules import (
-    PLAN_CHANNELS, routed_integrations, clean_routing, prune_routing,
+    PLAN_CHANNELS, send_channels_for_tier, routed_integrations, clean_routing, prune_routing,
     clean_headings, reconcile_headings, clean_gs_stats,
 )
 from models import read_optional_column
@@ -154,7 +154,7 @@ LICENSE_DURATION_DAYS = 30
 
 # Grace period after expiry before blocking access — gives the Stripe renewal
 # webhook time to arrive and extend the license before users go dark.
-LICENSE_GRACE_PERIOD = timedelta(hours=48)
+from plans import LICENSE_GRACE_PERIOD, live_license, plan_tier, sms_over_limit  # noqa: E402
 
 import ground_state as _gs
 
@@ -165,9 +165,14 @@ WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
 TIER_LIMITS = {
     # "channels" is what a plan may connect. The lists live in alert_rules so
     # the tracker delivers to exactly what can be connected here.
-    "starter":      {"aircraft": 3,    "zones": 2,  "locations": 1,    "integrations": 1,    "channels": PLAN_CHANNELS["starter"]},
-    "premium":      {"aircraft": 7,    "zones": 5,  "locations": 5,    "integrations": 3,    "channels": PLAN_CHANNELS["premium"]},
-    "pro":          {"aircraft": 15,   "zones": 7,  "locations": None, "integrations": 5,    "channels": PLAN_CHANNELS["pro"]},
+    # No live licence: the account can sign in, but nothing can be set up or tracked.
+    "free":         {"aircraft": 0,    "zones": 0,  "locations": 0,    "integrations": 0,    "channels": PLAN_CHANNELS["free"]},
+    # One paid Personal plan since 2026-11-13: 15 aircraft, nothing else capped
+    # (texts have their own monthly cap in plans.py). The three names are what
+    # older licences were sold as. An unknown personal tier gets the same plan.
+    "starter":      {"aircraft": 15,   "zones": None, "locations": None, "integrations": None, "channels": PLAN_CHANNELS["starter"]},
+    "premium":      {"aircraft": 15,   "zones": None, "locations": None, "integrations": None, "channels": PLAN_CHANNELS["premium"]},
+    "pro":          {"aircraft": 15,   "zones": None, "locations": None, "integrations": None, "channels": PLAN_CHANNELS["pro"]},
     "team-starter": {"aircraft": 25,   "zones": 2,     "locations": 3,    "integrations": 3,    "channels": PLAN_CHANNELS["team-starter"]},
     "team-premium": {"aircraft": 75,   "zones": 5,     "locations": 10,   "integrations": 10,   "channels": PLAN_CHANNELS["team-premium"]},
     "team-pro":     {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": PLAN_CHANNELS["team-pro"]},
@@ -178,13 +183,21 @@ TIER_LIMITS = {
 
 
 def get_user_tier(user: "User", db) -> str:
-    """Get the license tier for a user"""
-    if user.license_id:
-        from models import License
-        lic = db.query(License).filter(License.id == user.license_id).first()
-        if lic:
-            return lic.tier
-    return "starter"
+    """The account's plan, or "free" when it has no live licence."""
+    return plan_tier(db, user)
+
+
+def plan_refusal(tier: str, sentence: str) -> HTTPException:
+    """Why a plan won't allow something: no plan at all (402), or its limit (403)."""
+    if tier == "free":
+        return HTTPException(status_code=402, detail="no_plan")
+    return HTTPException(status_code=403, detail=sentence)
+
+
+def gs_allowed(user, db) -> bool:
+    """Ground Station is part of the plan. The flag still covers accounts
+    that were granted it by hand or bought the old add-on."""
+    return bool(getattr(user, 'ground_station_enabled', False)) or live_license(db, user) is not None
 
 
 def get_tier_limit(tier: str, feature: str):
@@ -244,7 +257,7 @@ def _authenticate_device_key(token: str, db: Session) -> User:
     user = db.query(User).filter(User.gs_device_key == token).first()
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid device key")
-    if not getattr(user, 'ground_station_enabled', False):
+    if not gs_allowed(user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     return user
 
@@ -368,6 +381,19 @@ async def fetch_entitlement(email: str):
     except Exception as e:
         logger.warning("entitlement lookup failed for %s: %s", email, e)
         return None
+
+
+async def refresh_entitlement(db, user, ent):
+    """adopt_entitlement, then start or stop tracking if the account just
+    gained or lost its plan. Only on a change: reloading a tracked account
+    would forget which alerts an inbound aircraft has already sent."""
+    had_plan = live_license(db, user) is not None
+    adopt_entitlement(db, user, ent)
+    if (live_license(db, user) is not None) != had_plan:
+        try:
+            await tracker.update_user_aircraft(str(user.id), db)
+        except Exception as e:
+            logger.error("Could not update tracking for %s after a plan change: %s", user.id, e)
 
 
 def adopt_entitlement(db, user, ent):
@@ -519,7 +545,7 @@ async def login(
 
     # Step 2.5 — Adopt whatever the website reported alongside the
     # credential check, so a plan bought on the site applies immediately.
-    adopt_entitlement(db, user, verified.get("entitlement"))
+    await refresh_entitlement(db, user, verified.get("entitlement"))
 
     # Step 3 — Get license info (may not exist for free accounts)
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
@@ -602,7 +628,7 @@ async def google_desktop_login(
 
     # Google sign-in has no password to verify, so ask the website directly.
     # Without this, signing in with Google never picked up a plan at all.
-    adopt_entitlement(db, user, await fetch_entitlement(email))
+    await refresh_entitlement(db, user, await fetch_entitlement(email))
 
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
     tier = "free"
@@ -639,7 +665,7 @@ async def ground_ingest(
     from models import NotificationLog, Integration, AlertSetting
 
     # Check ground station access
-    if not getattr(current_user, 'ground_station_enabled', False):
+    if not gs_allowed(current_user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
 
     body = await request.json()
@@ -653,10 +679,14 @@ async def ground_ingest(
     if not alert_type:
         raise HTTPException(status_code=400, detail="Missing alert type")
 
-    integrations = db.query(Integration).filter(
-        Integration.user_id == current_user.id,
-        Integration.enabled == True
-    ).all()
+    allowed_channels = send_channels_for_tier(get_user_tier(current_user, db))
+    integrations = [
+        i for i in db.query(Integration).filter(
+            Integration.user_id == current_user.id,
+            Integration.enabled == True
+        ).all()
+        if i.type in allowed_channels
+    ]
 
     if not integrations:
         return {"message": "No integrations configured", "alerts_sent": 0}
@@ -697,14 +727,15 @@ async def ground_ingest(
     alerts_sent = 0
     for integration in integrations:
         try:
-            success = await tracker.send_via_integration(integration, message)
+            capped = integration.type == "sms" and sms_over_limit(db, current_user.id)
+            success = False if capped else await tracker.send_via_integration(integration, message)
             log_entry = NotificationLog(
                 user_id=current_user.id,
                 aircraft_tail=tail,
                 alert_type=alert_type,
                 message=message,
                 integration_type=integration.type,
-                status="sent" if success else "failed",
+                status="limit" if capped else ("sent" if success else "failed"),
                 sent_at=datetime.utcnow(),
             )
             db.add(log_entry)
@@ -734,7 +765,7 @@ async def ground_validate(
     Called by FinalPing Ground Station on startup.
     Returns whether this account has ground station access enabled.
     """
-    enabled = getattr(current_user, 'ground_station_enabled', False)
+    enabled = gs_allowed(current_user, db)
     if not enabled:
         raise HTTPException(
             status_code=403,
@@ -757,7 +788,7 @@ async def ground_config(
     Called on startup so credentials + config are never baked into the script.
     """
     from models import AirportConfig, Aircraft
-    if not getattr(current_user, 'ground_station_enabled', False):
+    if not gs_allowed(current_user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
 
     airport = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
@@ -790,7 +821,7 @@ async def ground_heartbeat(request: Request, current_user: User = Depends(get_gr
     Agents from 3.7 on also report a few stats in the body. Older agents send
     an empty body, which leaves whatever is stored untouched.
     """
-    if not getattr(current_user, 'ground_station_enabled', False):
+    if not gs_allowed(current_user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     now = datetime.utcnow()
     _gs.ground_last_seen[str(current_user.id)] = now
@@ -816,7 +847,7 @@ async def ground_heartbeat(request: Request, current_user: User = Depends(get_gr
 @app.get("/api/ground/status")
 async def ground_status(current_user: User = Depends(get_ground_user), db: Session = Depends(get_db)):
     """Returns whether this user's ground station is currently online."""
-    if not getattr(current_user, 'ground_station_enabled', False):
+    if not gs_allowed(current_user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     # The in-memory map is the fast path, but it lives in this process and is
     # empty after every redeploy, crash or container move — which made a
@@ -849,7 +880,7 @@ async def ground_range_post(
     db: Session = Depends(get_db),
 ):
     """Receives SDR reception range data (36 buckets, one per 10-degree bearing)."""
-    if not getattr(current_user, 'ground_station_enabled', False):
+    if not gs_allowed(current_user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     body = await request.json()
     range_nm = body.get("range_nm", [])
@@ -897,7 +928,7 @@ async def ground_range_get(
     db: Session = Depends(get_db),
 ):
     """Returns the latest SDR reception range polygon for this user."""
-    if not getattr(current_user, 'ground_station_enabled', False):
+    if not gs_allowed(current_user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     data = _gs.ground_range.get(str(current_user.id))
     if not data:
@@ -924,9 +955,10 @@ async def ground_range_get(
 async def ground_positions_post(
     request: Request,
     current_user: User = Depends(get_ground_user),
+    db: Session = Depends(get_db),
 ):
     """Receives live aircraft positions from the ground station for the live map."""
-    if not getattr(current_user, 'ground_station_enabled', False):
+    if not gs_allowed(current_user, db):
         raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     body = await request.json()
     positions = body.get("positions", {})
@@ -953,7 +985,7 @@ async def ground_claim(
         raise HTTPException(status_code=400, detail="Email required")
 
     user = db.query(User).filter(User.email == email).first()
-    if not user or not getattr(user, 'ground_station_enabled', False):
+    if not user or not gs_allowed(user, db):
         raise HTTPException(status_code=403, detail="Ground station not enabled for this account")
 
     if not user.gs_device_key:
@@ -1193,7 +1225,7 @@ async def get_current_user_info(
     # who upgraded, cancelled or signed in with Google kept seeing whatever was
     # last written to their row. A failed lookup returns None and changes
     # nothing, so a website blip never revokes anyone.
-    adopt_entitlement(db, current_user, await fetch_entitlement(current_user.email))
+    await refresh_entitlement(db, current_user, await fetch_entitlement(current_user.email))
 
     # Find the most recently activated personal (non-team) license for this user.
     # Team licenses are excluded here — team access is via TeamMember, and the personal
@@ -1219,8 +1251,9 @@ async def get_current_user_info(
         ).first()
 
     # If the only license we found is a team license, report the tier as "starter"
-    # so the personal app renders correct personal-tier limits.
-    display_tier = "starter"
+    # so the personal app renders correct personal-tier limits. No licence at
+    # all is "free": the app then asks the account to start a trial or subscribe.
+    display_tier = "free"
     if license:
         if license.tier.startswith("team-"):
             display_tier = "starter"
@@ -1418,7 +1451,7 @@ async def add_aircraft(
     if limit is not None:
         count = db.query(Aircraft).filter(Aircraft.user_id == current_user.id, Aircraft.active == True).count()
         if count >= limit:
-            raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {limit} aircraft. Upgrade to add more.")
+            raise plan_refusal(tier, f"Your plan covers up to {limit} aircraft. Remove one to add another.")
 
     existing = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
@@ -1684,7 +1717,7 @@ async def save_airport_config(
         tier = get_user_tier(current_user, db)
         zone_limit = get_tier_limit(tier, "zones")
         if zone_limit is not None and len(config_data["alert_distances_nm"]) > zone_limit:
-            raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {zone_limit} approach zones. Upgrade to add more.")
+            raise plan_refusal(tier, f"Your plan covers up to {zone_limit} alert distances.")
 
     # Auto-lookup elevation from coordinates if not provided
     lat = config_data.get("latitude")
@@ -1857,12 +1890,12 @@ async def create_integration(
         tier = get_user_tier(current_user, db)
         allowed_channels = TIER_LIMITS.get(tier, TIER_LIMITS["starter"])["channels"]
         if integration_data.type not in allowed_channels:
-            raise HTTPException(status_code=403, detail=f"Your {tier} plan does not include {integration_data.type} notifications. Upgrade to unlock.")
+            raise plan_refusal(tier, f"Your plan does not include {integration_data.type} notifications.")
         limit = get_tier_limit(tier, "integrations")
         if limit is not None:
             count = db.query(Integration).filter(Integration.user_id == current_user.id).count()
             if count >= limit:
-                raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {limit} integrations. Upgrade to add more.")
+                raise plan_refusal(tier, f"Your plan covers up to {limit} integrations.")
 
     if existing:
         existing.config = integration_data.config
@@ -2152,7 +2185,7 @@ async def create_location(
     if limit is not None:
         count = db.query(SavedLocation).filter(SavedLocation.user_id == current_user.id).count()
         if count >= limit:
-            raise HTTPException(status_code=403, detail=f"Your {tier} plan allows up to {limit} saved location(s). Upgrade to add more.")
+            raise plan_refusal(tier, f"Your plan covers up to {limit} saved location(s).")
 
     # If this is the first location, make it active
     existing_count = db.query(SavedLocation).filter(SavedLocation.user_id == current_user.id).count()

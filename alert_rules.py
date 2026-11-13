@@ -11,10 +11,16 @@ from typing import Iterable, List, Optional
 # ── Plan channels ────────────────────────────────────────────────────────────
 
 # Channels a plan may CONNECT. main.TIER_LIMITS[tier]["channels"] points here.
+ALL_CHANNELS = ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"]
+
 PLAN_CHANNELS = {
-    "starter":      ["discord", "email"],
-    "premium":      ["discord", "email", "slack", "teams", "google_chat"],
-    "pro":          ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"],
+    # No live licence: nothing is delivered.
+    "free":         [],
+    # One paid Personal plan since 2026-11-13. The three names are what older
+    # licences were sold as; they are the same plan now.
+    "starter":      ALL_CHANNELS,
+    "premium":      ALL_CHANNELS,
+    "pro":          ALL_CHANNELS,
     "team-starter": ["discord", "email"],
     "team-premium": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"],
     "team-pro":     ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"],
