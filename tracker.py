@@ -1291,8 +1291,11 @@ class CloudAircraftTracker:
 
         # Overlay GS positions when ground station is online — higher accuracy, 5s updates,
         # includes on-ground aircraft that adsb.lol may not have
+        # Only while the receiver is still sending them: a batch older than
+        # half a minute is dropped, so an aircraft that left its range falls
+        # back to the network position (with its real age) or off the list.
         if _gs.is_ground_station_online(user_id):
-            gs_positions = _gs.ground_positions.get(user_id, {})
+            gs_positions, gs_at = _gs.fresh_ground_positions(user_id)
             for icao24, gp in gs_positions.items():
                 if icao24 not in tracker.aircraft_to_track:
                     continue
@@ -1319,7 +1322,7 @@ class CloudAircraftTracker:
                         'velocity_kts': gp.get('speed', e['velocity_kts']),
                         'heading': gp.get('heading', e['heading']),
                         'distance_nm': distance,
-                        'last_seen': datetime.utcnow(),
+                        'last_seen': gs_at,
                         'source': 'ground_station',
                     })
                 else:
@@ -1335,7 +1338,7 @@ class CloudAircraftTracker:
                         'velocity_kts': gp.get('speed', 0),
                         'heading': gp.get('heading', 0),
                         'is_approaching': False,
-                        'last_seen': datetime.utcnow(),
+                        'last_seen': gs_at,
                         'latitude': lat,
                         'longitude': lon,
                         'source': 'ground_station',

@@ -909,6 +909,7 @@ async def ground_positions_post(
     positions = body.get("positions", {})
     if isinstance(positions, dict):
         _gs.ground_positions[str(current_user.id)] = positions
+        _gs.ground_positions_at[str(current_user.id)] = datetime.utcnow()
     return {"ok": True}
 
 
