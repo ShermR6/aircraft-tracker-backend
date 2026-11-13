@@ -123,6 +123,25 @@ WEBHOOK_INTERNAL_SECRET = os.getenv("WEBHOOK_INTERNAL_SECRET") or os.getenv("INT
 if not WEBHOOK_INTERNAL_SECRET:
     raise RuntimeError("WEBHOOK_INTERNAL_SECRET (or INTERNAL_API_SECRET) environment variable is not set")
 
+# The desktop apps were retired on 2026-11-13. Signing in and every signed-in
+# request are now served only when the website's server sent them: it adds the
+# internal secret, which no desktop app has. Not affected: receivers (device
+# key on /api/ground/*), and the website's own internal and billing calls.
+DESKTOP_RETIRED_MESSAGE = os.getenv("DESKTOP_RETIRED_MESSAGE") or (
+    'The FinalPing desktop app has been retired. FinalPing now runs in your browser: sign in at finalpingapp.com/app with the same account.'
+)
+
+
+def from_website(request: Request) -> bool:
+    sent = request.headers.get("x-internal-secret") or ""
+    return hmac.compare_digest(sent.encode(), WEBHOOK_INTERNAL_SECRET.encode())
+
+
+def require_website(request: Request):
+    """Refuse anything the website did not send: that is, the desktop apps."""
+    if not from_website(request):
+        raise HTTPException(status_code=410, detail=DESKTOP_RETIRED_MESSAGE)
+
 
 def _valid_internal_secret(provided: str) -> bool:
     """Constant-time check of an internal/admin request secret."""
@@ -256,6 +275,7 @@ def _authenticate_jwt(token: str, db: Session) -> User:
 
 
 async def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
@@ -267,23 +287,26 @@ async def get_current_user(
     token = credentials.credentials
     if _looks_like_device_key(token):
         raise HTTPException(status_code=401, detail="Invalid token")
+    require_website(request)
     return _authenticate_jwt(token, db)
 
 
 async def get_ground_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
     """Auth for /api/ground/* endpoints. Accepts either the ground station's
-    GS device key (used by the Pi client) or a normal JWT (so the desktop app
-    can read ground-station status)."""
+    GS device key (used by the Pi client) or a normal JWT sent by the website
+    (so the web app can read ground-station status)."""
     token = credentials.credentials
     if _looks_like_device_key(token):
         return _authenticate_device_key(token, db)
+    require_website(request)
     return _authenticate_jwt(token, db)
 
 
-@app.post("/api/auth/refresh")
+@app.post("/api/auth/refresh", dependencies=[Depends(require_website)])
 @limiter.limit("20/minute")
 async def refresh_token(
     request: Request,
@@ -409,7 +432,7 @@ def adopt_entitlement(db, user, ent):
         db.refresh(user)
 
 
-@app.post("/api/auth/login")
+@app.post("/api/auth/login", dependencies=[Depends(require_website)])
 @limiter.limit("10/minute")
 async def login(
     request: Request,
@@ -524,7 +547,7 @@ async def login(
     )
 
 
-@app.post("/api/auth/google-desktop", response_model=TokenResponse)
+@app.post("/api/auth/google-desktop", response_model=TokenResponse, dependencies=[Depends(require_website)])
 @limiter.limit("10/minute")
 async def google_desktop_login(
     request: Request,
@@ -976,7 +999,7 @@ async def grant_ground_station(
     }
 
 
-@app.post("/api/activate", response_model=TokenResponse)
+@app.post("/api/activate", response_model=TokenResponse, dependencies=[Depends(require_website)])
 @limiter.limit("10/minute")
 async def activate_license(
     request: Request,
@@ -2279,7 +2302,7 @@ async def create_billing_portal(
 
 LATEST_APP_VERSION = "1.0.8"
 
-@app.get("/api/app/version")
+@app.get("/api/app/version", dependencies=[Depends(require_website)])
 async def get_app_version():
     """Returns the latest desktop app version for update checking"""
     return {
@@ -3504,7 +3527,7 @@ async def revoke_team_invite(
     return None
 
 
-@app.post("/api/teams/activate-invite", response_model=TokenResponse)
+@app.post("/api/teams/activate-invite", response_model=TokenResponse, dependencies=[Depends(require_website)])
 @limiter.limit("10/minute")
 async def activate_team_invite(
     request: Request,
