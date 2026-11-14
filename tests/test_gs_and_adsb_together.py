@@ -235,12 +235,52 @@ def test_saving_settings_mid_approach_keeps_the_alert(monkeypatch):
 
 # ── landings: no early ones, no repeats ──────────────────────────────────────
 
-def test_slow_final_into_a_headwind_is_not_a_landing(monkeypatch):
+def later(minutes):
+    """Move time on: the in-memory cooldown and the alert log both age."""
+    minutes_pass(minutes)
+    for row in db.query(api.NotificationLog).all():
+        row.sent_at = row.sent_at - timedelta(minutes=minutes)
+    db.commit()
+
+
+def lap(receiver_too=True):
+    """One stop-and-go or touch-and-go as adsb.lol reports it (the transponder
+    says "ground" on the runway), with the receiver hearing it as well."""
+    adsb_at(0.4, alt="ground", gs=45)
+    if receiver_too:
+        ground_at(0.4, speed=55)          # the receiver alone would call this airborne
+    cycle()
+    adsb_at(0.8, alt=925, gs=80)
+    if receiver_too:
+        ground_at(0.8, speed=80)
+    cycle()
+
+
+def test_pattern_laps_report_every_landing_and_takeoff(monkeypatch):
+    """Like the log of 14 Nov: laps 4 min 43 s apart, each one reported."""
+    sent = _setup(monkeypatch, rings=(15, 10, 5, 2))
+    adsb_at(1.5, alt=1500, gs=75); ground_at(1.5, speed=75); cycle()
+    for _ in range(3):
+        lap()
+        later(4)
+    assert sent.count("landing") == 3
+    assert sent.count("takeoff") == 3
+
+
+def test_laps_still_count_when_only_adsb_sees_them(monkeypatch):
     sent = _setup(monkeypatch, rings=(10, 2))
-    ground_at(3, speed=80); cycle()
-    ground_at(1, speed=45, on_ground=True); cycle()   # receiver says "ground" at 45 kt
-    assert "landing" not in sent
-    ground_at(0.2, speed=25, on_ground=True); cycle()
+    adsb_at(1.5, alt=1500, gs=75); cycle()
+    for _ in range(2):
+        lap(receiver_too=False)
+        later(4)
+    assert sent.count("landing") == 2 and sent.count("takeoff") == 2
+
+
+def test_receiver_decides_landing_when_adsb_has_lost_the_aircraft(monkeypatch):
+    sent = _setup(monkeypatch, rings=(10, 2))
+    adsb_at(3, alt=1200, gs=70); cycle()
+    adsb_gone()                                         # below public coverage
+    ground_at(0.3, speed=40, on_ground=True); cycle()   # receiver: on the runway
     assert sent.count("landing") == 1
 
 

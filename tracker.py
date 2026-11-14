@@ -57,9 +57,11 @@ REARM_OUTSIDE_NM = 2.0
 # ...and every ring is armed again after an aircraft has gone unseen this long.
 REARM_AFTER_MINUTES = 30
 # A landing or takeoff already logged within this window is not sent again.
-REPEAT_WINDOW_MINUTES = 5
-# A receiver position counts as on the ground below this ground speed.
-GROUND_SPEED_KTS = 35
+# One minute, like the old per-alert cooldown: no pattern lap is that quick,
+# so every lap still reports its landing and takeoff.
+REPEAT_WINDOW_MINUTES = 1
+# adsb.lol decides landings and takeoffs while its fix is at most this old.
+ADSB_FRESH_SECONDS = 20
 
 
 def _fresh_ground_fix(fix) -> Optional[dict]:
@@ -79,17 +81,55 @@ def _fresh_ground_fix(fix) -> Optional[dict]:
     return fix
 
 
-def _aircraft_from_ground(icao24: str, tail: str, fix: dict) -> dict:
-    """A receiver position in the shape check_and_notify takes.
+def _aircraft_from_adsb(icao24: str, tail: str, ac: dict, airspace: dict) -> dict:
+    """An adsb.lol aircraft in the shape check_and_notify takes, with the
+    ground detection the tracker has always used for it."""
+    alt_baro = ac.get('alt_baro')
+    gs = ac.get('gs')
+    seen_pos = ac.get('seen_pos')  # seconds since last position update
 
-    The receiver marks an aircraft on the ground when the decoder says so or
-    when it is under 50 kt, and then reports field elevation instead of its
-    altitude. 50 kt is a light aircraft's ground speed on final into a strong
-    headwind, which would announce a landing before touchdown, so here it only
-    counts as on the ground below 35 kt: a rollout or taxi.
-    """
-    speed = fix.get('speed')
-    on_ground = bool(fix.get('on_ground')) and (speed is None or float(speed) < GROUND_SPEED_KTS)
+    # Ground detection: multiple signals
+    is_on_ground = alt_baro == 'ground'
+
+    if not is_on_ground and alt_baro is not None and alt_baro != 'ground':
+        field_elev = float(airspace.get('field_elevation_ft_msl', 0) or 0)
+        alt_agl = float(alt_baro) - field_elev if isinstance(alt_baro, (int, float)) else 999
+
+        # On ground if: altitude within 150ft of field AND speed under 50kts (or no speed reported)
+        if alt_agl < 150 and (gs is None or gs < 50):
+            is_on_ground = True
+
+        # On ground if: very close to airport, low altitude, and stale position data (>30s)
+        ac_lat = ac.get('lat')
+        ac_lon = ac.get('lon')
+        if ac_lat and ac_lon and seen_pos is not None and seen_pos > 30:
+            center_lat = float(airspace['center_lat'])
+            center_lon = float(airspace['center_lon'])
+            dlat = abs(float(ac_lat) - center_lat) * 60
+            dlon = abs(float(ac_lon) - center_lon) * 60 * 0.85  # rough cos correction
+            approx_dist = (dlat**2 + dlon**2) ** 0.5
+            if approx_dist < 3 and alt_agl < 500:
+                is_on_ground = True
+
+    return {
+        'icao24': icao24,
+        'callsign': tail,
+        'latitude': ac.get('lat'),
+        'longitude': ac.get('lon'),
+        'baro_altitude': alt_baro,
+        'on_ground': is_on_ground,
+        'velocity': gs,
+        'heading': ac.get('track'),
+        'source': 'adsb',
+    }
+
+
+def _aircraft_from_ground(icao24: str, tail: str, fix: dict) -> dict:
+    """A receiver position in the shape check_and_notify takes. The receiver
+    marks an aircraft on the ground when the decoder says so or when it is
+    under 50 kt (the same speed adsb.lol fixes are judged by), and then reports
+    field elevation instead of its altitude."""
+    on_ground = bool(fix.get('on_ground'))
     heading = fix.get('heading')
     return {
         'icao24': icao24,
@@ -637,65 +677,32 @@ class CloudAircraftTracker:
 
                 seen_icao24 = set()
                 for icao24 in list(tracker.aircraft_to_track):
+                    tail = tracker.aircraft_to_track[icao24]
                     ground_fix = _fresh_ground_fix(gs_positions.get(icao24))
-                    if ground_fix is not None:
-                        seen_icao24.add(icao24)
-                        aircraft_dict = _aircraft_from_ground(icao24, tracker.aircraft_to_track[icao24], ground_fix)
-                        notifications = await tracker.check_and_notify(aircraft_dict)
-                        notifications = self._drop_recent_repeats(user_id, notifications)
-                        if notifications and not tracker.in_quiet_hours():
-                            await self.send_notifications(user_id, notifications)
+                    adsb = icao_lookup.get(icao24)
+                    if ground_fix is None and adsb is None:
                         continue
+                    seen_icao24.add(icao24)
 
-                    aircraft_data = icao_lookup.get(icao24)
-                    if aircraft_data is not None:
-                        seen_icao24.add(icao24)
-                        # Build aircraft dict
-                        alt_baro = aircraft_data.get('alt_baro')
-                        gs = aircraft_data.get('gs')
-                        baro_rate = aircraft_data.get('baro_rate')
-                        seen_pos = aircraft_data.get('seen_pos')  # seconds since last position update
+                    from_adsb = _aircraft_from_adsb(icao24, tail, adsb, tracker.config['airspace']) if adsb is not None else None
+                    if ground_fix is None:
+                        aircraft_dict = from_adsb
+                    else:
+                        aircraft_dict = _aircraft_from_ground(icao24, tail, ground_fix)
+                        # Landings and takeoffs follow adsb.lol whenever it has a
+                        # recent fix, exactly as before the receiver was used
+                        # here: that is what reports each lap of pattern work.
+                        # The receiver decides only when adsb.lol has lost the
+                        # aircraft (low, close to the field).
+                        seen_pos = adsb.get('seen_pos') if adsb is not None else None
+                        if from_adsb is not None and seen_pos is not None and seen_pos <= ADSB_FRESH_SECONDS:
+                            aircraft_dict['on_ground'] = from_adsb['on_ground']
+                            aircraft_dict['baro_altitude'] = from_adsb['baro_altitude']
 
-                        # Ground detection: multiple signals
-                        is_on_ground = alt_baro == 'ground'
-
-                        if not is_on_ground and alt_baro is not None and alt_baro != 'ground':
-                            field_elev = float(tracker.config['airspace'].get('field_elevation_ft_msl', 0))
-                            alt_agl = float(alt_baro) - field_elev if isinstance(alt_baro, (int, float)) else 999
-
-                            # On ground if: altitude within 150ft of field AND speed under 50kts (or no speed reported)
-                            if alt_agl < 150 and (gs is None or gs < 50):
-                                is_on_ground = True
-
-                            # On ground if: very close to airport, low altitude, and stale position data (>30s)
-                            ac_lat = aircraft_data.get('lat')
-                            ac_lon = aircraft_data.get('lon')
-                            if ac_lat and ac_lon and seen_pos is not None and seen_pos > 30:
-                                center_lat = float(tracker.config['airspace']['center_lat'])
-                                center_lon = float(tracker.config['airspace']['center_lon'])
-                                # Quick distance estimate in nm
-                                dlat = abs(float(ac_lat) - center_lat) * 60
-                                dlon = abs(float(ac_lon) - center_lon) * 60 * 0.85  # rough cos correction
-                                approx_dist = (dlat**2 + dlon**2) ** 0.5
-                                if approx_dist < 3 and alt_agl < 500:
-                                    is_on_ground = True
-
-                        aircraft_dict = {
-                            'icao24': icao24,
-                            'callsign': tracker.aircraft_to_track[icao24],
-                            'latitude': aircraft_data.get('lat'),
-                            'longitude': aircraft_data.get('lon'),
-                            'baro_altitude': alt_baro,
-                            'on_ground': is_on_ground,
-                            'velocity': gs,
-                            'heading': aircraft_data.get('track'),
-                        }
-
-                        # Check and get notifications
-                        notifications = await tracker.check_and_notify(aircraft_dict)
-                        notifications = self._drop_recent_repeats(user_id, notifications)
-                        if notifications and not tracker.in_quiet_hours():
-                            await self.send_notifications(user_id, notifications)
+                    notifications = await tracker.check_and_notify(aircraft_dict)
+                    notifications = self._drop_recent_repeats(user_id, notifications)
+                    if notifications and not tracker.in_quiet_hours():
+                        await self.send_notifications(user_id, notifications)
 
                 # Signal loss detection — tracked aircraft neither source has.
                 # Skipped when adsb.lol could not be asked: every aircraft would
