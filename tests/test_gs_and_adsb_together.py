@@ -292,3 +292,30 @@ def test_a_landing_already_logged_is_not_sent_again(monkeypatch):
     ground_at(2, speed=70); cycle()
     ground_at(0.1, speed=15, on_ground=True); cycle()
     assert "landing" not in sent
+
+
+# ── an aircraft lost from sight ──────────────────────────────────────────────
+
+def test_lost_from_sight_at_pattern_height_is_not_a_landing(monkeypatch):
+    """Like N7231Q on 14 Nov: "landed" between its 5 nm and 2 nm alerts."""
+    sent = _setup(monkeypatch, rings=(15, 10, 5, 2))
+    for nm in (18, 12, 4.5):
+        adsb_at(nm, alt=1700, gs=95); cycle()
+    assert sent == ["15nm", "10nm", "5nm"]
+    adsb_gone()
+    for _ in range(5):                 # a coverage gap 3-5 nm out, at pattern height
+        cycle()
+    assert "landing" not in sent
+    adsb_at(1.5, alt=1400, gs=90); cycle()
+    assert sent == ["15nm", "10nm", "5nm", "2nm"]
+
+
+def test_lost_from_sight_on_short_final_is_a_landing(monkeypatch):
+    sent = _setup(monkeypatch, rings=(10, 2))
+    for nm in (12, 4, 1.2):
+        adsb_at(nm, alt=1000 if nm < 2 else 2000, gs=75); cycle()   # 358 ft above the field at 1.2 nm
+    adsb_gone()
+    cycle(); cycle()
+    assert "landing" not in sent       # two polls is not enough
+    cycle()
+    assert sent.count("landing") == 1

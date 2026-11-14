@@ -60,6 +60,11 @@ REARM_AFTER_MINUTES = 30
 # One minute, like the old per-alert cooldown: no pattern lap is that quick,
 # so every lap still reports its landing and takeoff.
 REPEAT_WINDOW_MINUTES = 1
+# A landing is assumed for an aircraft lost from sight only when it was last
+# seen this close and this low, and has then been missing for this many polls.
+LOST_LANDING_NM = 2.0
+LOST_LANDING_AGL_FT = 800
+LOST_LANDING_POLLS = 3
 # adsb.lol decides landings and takeoffs while its fix is at most this old.
 ADSB_FRESH_SECONDS = 20
 
@@ -715,13 +720,16 @@ class CloudAircraftTracker:
                         missing = state.get('consecutive_missing', 0) + 1
                         state['consecutive_missing'] = missing
 
-                        # If aircraft was close to airport and disappeared for 2+ polls (~60 sec)
-                        # Use last_distance instead of landing_ready so restarts don't break detection
-                        # Cloud fires as fallback even when GS is online; dedup via NotificationLog
-                        if (state.get('last_distance', 999) < 5.0
+                        # Lost from sight on short final: last seen inside 2 nm and low,
+                        # then missing for 3 polls (~90 s), so it has landed below
+                        # coverage. It used to be "inside 5 nm, any height, 2 polls",
+                        # which called a landing whenever an aircraft 3-5 nm out at
+                        # pattern height dropped out of coverage for a minute.
+                        if (state.get('last_distance', 999) < LOST_LANDING_NM
+                                and (state.get('altitude_agl') if state.get('altitude_agl') is not None else 9999) <= LOST_LANDING_AGL_FT
                                 and not state.get('on_ground', False)
                                 and not state.get('landed', False)
-                                and missing >= 2):
+                                and missing >= LOST_LANDING_POLLS):
                             # Check NotificationLog to avoid double-firing if GS already sent
                             from models import NotificationLog
                             _db = SessionLocal()
