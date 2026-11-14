@@ -51,6 +51,58 @@ def _is_safe_public_url(url: str) -> bool:
 
 
 from functools import lru_cache
+
+# Alerts: each ring is armed again once the aircraft is this far outside it.
+REARM_OUTSIDE_NM = 2.0
+# ...and every ring is armed again after an aircraft has gone unseen this long.
+REARM_AFTER_MINUTES = 30
+# A landing or takeoff already logged within this window is not sent again.
+REPEAT_WINDOW_MINUTES = 5
+# A receiver position counts as on the ground below this ground speed.
+GROUND_SPEED_KTS = 35
+
+
+def _fresh_ground_fix(fix) -> Optional[dict]:
+    """A position from the account's receiver, if it is usable and under 30 s
+    old. The receiver resends its whole list every few seconds, so a fix that
+    has not been refreshed is an aircraft it can no longer hear."""
+    if not isinstance(fix, dict) or fix.get('lat') is None or fix.get('lon') is None:
+        return None
+    stamp = fix.get('updated_at')
+    if stamp:
+        try:
+            age = (datetime.utcnow() - datetime.fromisoformat(str(stamp).replace('Z', ''))).total_seconds()
+        except ValueError:
+            return None
+        if age > _gs.GROUND_POSITION_MAX_AGE_SECONDS:
+            return None
+    return fix
+
+
+def _aircraft_from_ground(icao24: str, tail: str, fix: dict) -> dict:
+    """A receiver position in the shape check_and_notify takes.
+
+    The receiver marks an aircraft on the ground when the decoder says so or
+    when it is under 50 kt, and then reports field elevation instead of its
+    altitude. 50 kt is a light aircraft's ground speed on final into a strong
+    headwind, which would announce a landing before touchdown, so here it only
+    counts as on the ground below 35 kt: a rollout or taxi.
+    """
+    speed = fix.get('speed')
+    on_ground = bool(fix.get('on_ground')) and (speed is None or float(speed) < GROUND_SPEED_KTS)
+    heading = fix.get('heading')
+    return {
+        'icao24': icao24,
+        'callsign': tail,
+        'latitude': fix.get('lat'),
+        'longitude': fix.get('lon'),
+        'baro_altitude': None if on_ground else fix.get('altitude'),
+        'on_ground': on_ground,
+        'velocity': fix.get('speed'),
+        # The receiver sends 0 when it has no track; that is not a heading.
+        'heading': heading if heading else None,
+        'source': 'ground',
+    }
 try:
     from timezonefinder import TimezoneFinder
     _tf = TimezoneFinder()
@@ -82,10 +134,31 @@ class UserTracker:
         # State tracking
         self.aircraft_state = {}
         self.distance_alerts_sent = {}
+        # Rings crossed while the approach filter said "not lined up yet". They
+        # fire later, once the aircraft lines up while still inside the ring.
+        self.pending_alerts = {}
         self.last_notifications = {}
         # Track last date SMS/WhatsApp opt-out was appended (once per day)
         self.sms_stop_last_sent_date = None
         self.whatsapp_stop_last_sent_date = None
+
+    def adopt_state(self, old: "UserTracker"):
+        """Carry alert state over from the tracker this one replaces.
+
+        The tracker is rebuilt whenever an aircraft or the airport settings are
+        saved. Starting from nothing lost the previous distance of every
+        aircraft in flight, so a ring crossed in that cycle never fired, and
+        forgot which rings had fired, so they could fire twice.
+        """
+        keep = set(self.aircraft_to_track)
+        for name in ("aircraft_state", "distance_alerts_sent", "pending_alerts", "last_notifications"):
+            old_map = getattr(old, name, {}) or {}
+            if name == "last_notifications":
+                setattr(self, name, {k: v for k, v in old_map.items() if k.split("_", 1)[0] in keep})
+            else:
+                setattr(self, name, {k: v for k, v in old_map.items() if k in keep})
+        self.sms_stop_last_sent_date = old.sms_stop_last_sent_date
+        self.whatsapp_stop_last_sent_date = old.whatsapp_stop_last_sent_date
 
     def haversine_distance(self, lat1, lon1, lat2, lon2):
         """Calculate distance between two points in nautical miles"""
@@ -169,6 +242,13 @@ class UserTracker:
 
         in_airspace = in_horizontal and in_vertical
 
+        # Not seen for a long time (out of coverage, parked, switched off): this
+        # is a new flight as far as alerts go, so every ring is armed again.
+        last_update = self.aircraft_state.get(aircraft_id, {}).get('last_update')
+        if last_update is not None and datetime.now() - last_update > timedelta(minutes=REARM_AFTER_MINUTES):
+            self.distance_alerts_sent[aircraft_id] = set()
+            self.pending_alerts[aircraft_id] = set()
+
         # Get previous state
         was_in_airspace = self.aircraft_state.get(aircraft_id, {}).get('in_airspace', False)
         was_on_ground = self.aircraft_state.get(aircraft_id, {}).get('on_ground', None)
@@ -183,6 +263,7 @@ class UserTracker:
 
             if aircraft_id not in self.distance_alerts_sent:
                 self.distance_alerts_sent[aircraft_id] = set()
+            pending = self.pending_alerts.setdefault(aircraft_id, set())
 
             prev_distance = self.aircraft_state.get(aircraft_id, {}).get('last_distance', None)
             max_distance = self.aircraft_state.get(aircraft_id, {}).get('max_distance', None)
@@ -209,15 +290,21 @@ class UserTracker:
                         prev_distance > (alert_distance + ALERT_BUFFER_NM) and
                         distance_nm <= (alert_distance + ALERT_BUFFER_NM)
                     )
+                    # A ring crossed earlier but held back by the approach
+                    # filter, and the aircraft is still inside it.
+                    still_waiting = alert_key in pending and distance_nm <= (alert_distance + ALERT_BUFFER_NM)
 
-                    if crossed_with_buffer and alert_key not in self.distance_alerts_sent[aircraft_id]:
-                        # Approach corridor filter — skip if aircraft heading is not aligned with runway
+                    if (crossed_with_buffer or still_waiting) and alert_key not in self.distance_alerts_sent[aircraft_id]:
+                        # Approach corridor filter: not lined up with a runway
+                        # yet. Hold the alert rather than drop it, so it fires
+                        # if the aircraft lines up while still inside the ring.
                         rwy_headings = approach_headings(airspace) if airspace.get('approach_corridor_enabled') else []
                         if rwy_headings:
                             track = aircraft_data.get('track') or aircraft_data.get('heading')
                             if track is not None and not heading_allowed(track, rwy_headings):
-                                self.distance_alerts_sent[aircraft_id].add(alert_key)  # suppress quietly
+                                pending.add(alert_key)
                                 continue
+                        pending.discard(alert_key)
 
                         # Send the distance alert
                         if self.should_notify(f'distance_{alert_distance}', aircraft_id):
@@ -244,10 +331,17 @@ class UserTracker:
                             if larger_distances and all_crossed:
                                 self.aircraft_state.setdefault(aircraft_id, {})['landing_ready'] = True
 
-            # Reset alerts if plane goes back out beyond the largest configured distance + 2nm buffer
-            reset_distance = (max(alert_distances) + 2.0) if alert_distances else 12.0
+            # Each ring is armed again once the aircraft is seen 2 nm outside it.
+            # Only re-arming them all beyond the largest ring missed every
+            # alert on the next arrival after a local flight that stayed
+            # inside it (out to 12 nm and back, with a 15 nm ring).
+            for d in alert_distances:
+                if distance_nm > d + REARM_OUTSIDE_NM:
+                    self.distance_alerts_sent[aircraft_id].discard(dist_key(d))
+                    pending.discard(dist_key(d))
+
+            reset_distance = (max(alert_distances) + REARM_OUTSIDE_NM) if alert_distances else 12.0
             if distance_nm > reset_distance:
-                self.distance_alerts_sent[aircraft_id] = set()
                 if aircraft_id in self.aircraft_state:
                     self.aircraft_state[aircraft_id]['max_distance'] = distance_nm
                     self.aircraft_state[aircraft_id]['landed'] = False
@@ -409,8 +503,13 @@ class CloudAircraftTracker:
             for a in aircraft
         ]
 
-        # Create or update tracker
-        self.user_trackers[user_id] = UserTracker(user_id, config, aircraft_list)
+        # Create or update tracker, keeping what the old one knew about flights
+        # in progress.
+        fresh = UserTracker(user_id, config, aircraft_list)
+        old = self.user_trackers.get(user_id)
+        if old is not None:
+            fresh.adopt_state(old)
+        self.user_trackers[user_id] = fresh
 
     async def update_team_aircraft(self, team_id: str, db: Session):
         """Update tracked aircraft for a team (reads TeamAirportConfig + TeamAircraft)."""
@@ -503,8 +602,11 @@ class CloudAircraftTracker:
         if not all_icaos:
             return
 
-        # One API call for all aircraft anywhere on the globe
+        # One API call for all aircraft anywhere on the globe. A failure no
+        # longer ends the cycle: ground stations can still cover their own
+        # aircraft without it.
         icao_lookup: dict = {}
+        adsb_ok = False
         icao_str = ",".join(all_icaos)
         url = f"https://api.adsb.lol/v2/icao/{icao_str}"
         async with aiohttp.ClientSession() as session:
@@ -516,25 +618,37 @@ class CloudAircraftTracker:
                             icao = ac.get('hex', '').lower()
                             if icao:
                                 icao_lookup[icao] = ac
+                        adsb_ok = True
+                    else:
+                        print(f"adsb.lol answered HTTP {response.status} for {len(all_icaos)} aircraft; using ground stations only this cycle")
             except Exception as e:
-                print(f"Error fetching ICAO batch: {type(e).__name__}: {e}")
-                return
+                print(f"Error fetching ICAO batch: {type(e).__name__}: {e}; using ground stations only this cycle")
 
         # Iterate a snapshot — request handlers mutate user_trackers across the
         # awaits below, which would otherwise raise "dictionary changed size
         # during iteration" and drop the whole polling cycle.
         for user_id, tracker in list(self.user_trackers.items()):
             try:
-                # When ground station is online it handles alerts — cloud tracker still tracks positions for live map
-                gs_online = _gs.is_ground_station_online(str(user_id))
+                # The account's own receiver, when it has heard an aircraft in
+                # the last 30 seconds, is preferred: it hears the aircraft down
+                # to the runway, where public coverage often drops out. Out of
+                # its range, adsb.lol covers the aircraft.
+                gs_positions, _ = _gs.fresh_ground_positions(str(user_id))
 
-                aircraft_list = [icao_lookup[icao] for icao in tracker.aircraft_to_track if icao in icao_lookup]
-
-                # Filter to only tracked aircraft
                 seen_icao24 = set()
-                for aircraft_data in aircraft_list:
-                    icao24 = aircraft_data.get('hex', '').lower()
-                    if icao24 in tracker.aircraft_to_track:
+                for icao24 in list(tracker.aircraft_to_track):
+                    ground_fix = _fresh_ground_fix(gs_positions.get(icao24))
+                    if ground_fix is not None:
+                        seen_icao24.add(icao24)
+                        aircraft_dict = _aircraft_from_ground(icao24, tracker.aircraft_to_track[icao24], ground_fix)
+                        notifications = await tracker.check_and_notify(aircraft_dict)
+                        notifications = self._drop_recent_repeats(user_id, notifications)
+                        if notifications and not tracker.in_quiet_hours():
+                            await self.send_notifications(user_id, notifications)
+                        continue
+
+                    aircraft_data = icao_lookup.get(icao24)
+                    if aircraft_data is not None:
                         seen_icao24.add(icao24)
                         # Build aircraft dict
                         alt_baro = aircraft_data.get('alt_baro')
@@ -579,15 +693,16 @@ class CloudAircraftTracker:
 
                         # Check and get notifications
                         notifications = await tracker.check_and_notify(aircraft_dict)
-
-                        # Cloud always sends distance alerts regardless of GS status.
-                        # GS handles takeoff/landing (local events); cloud is the fallback
-                        # for everything else and the primary for out-of-range distance alerts.
+                        notifications = self._drop_recent_repeats(user_id, notifications)
                         if notifications and not tracker.in_quiet_hours():
                             await self.send_notifications(user_id, notifications)
 
-                # Signal loss detection — check tracked aircraft NOT in the API response
+                # Signal loss detection — tracked aircraft neither source has.
+                # Skipped when adsb.lol could not be asked: every aircraft would
+                # look lost, and one last seen close in would "land".
                 for icao24, tail in tracker.aircraft_to_track.items():
+                    if not adsb_ok:
+                        break
                     if icao24 not in seen_icao24 and icao24 in tracker.aircraft_state:
                         state = tracker.aircraft_state[icao24]
                         missing = state.get('consecutive_missing', 0) + 1
@@ -627,6 +742,33 @@ class CloudAircraftTracker:
                 import traceback
                 print(f"Error tracking for user {user_id}: {e}")
                 traceback.print_exc()
+
+    def _drop_recent_repeats(self, user_id: str, notifications: List[dict]) -> List[dict]:
+        """Landings and takeoffs already logged for this aircraft in the last few
+        minutes, by any path (a restart, the signal-loss fallback, an older
+        receiver that reported them itself), are not sent again."""
+        events = [n for n in notifications if n.get('type') in ('landing', 'takeoff')]
+        if not events:
+            return notifications
+        _db = SessionLocal()
+        try:
+            since = datetime.utcnow() - timedelta(minutes=REPEAT_WINDOW_MINUTES)
+            drop = set()
+            for n in events:
+                hit = _db.query(NotificationLog).filter(
+                    NotificationLog.user_id == user_id,
+                    NotificationLog.aircraft_tail == n.get('tail'),
+                    NotificationLog.alert_type == n['type'],
+                    NotificationLog.sent_at >= since,
+                ).first()
+                if hit:
+                    drop.add(id(n))
+        except Exception as e:
+            print(f"Repeat check failed, sending anyway: {type(e).__name__}: {e}")
+            return notifications
+        finally:
+            _db.close()
+        return [n for n in notifications if id(n) not in drop]
 
     async def send_notifications(self, user_id: str, notifications: List[dict]):
         """Send notifications via configured integrations"""
