@@ -867,7 +867,9 @@ async def ground_status(current_user: User = Depends(get_ground_user), db: Sessi
         # which is the difference between "it just restarted" and "this has
         # been dead for a week and nobody noticed".
         "last_seen_seconds": int(age) if age is not None else None,
-        "gs_device_key": getattr(current_user, 'gs_device_key', None),
+        # Only the last four characters: the key itself is sent by
+        # /api/ground/key when the person asks to see or copy it.
+        "gs_key_hint": _key_hint(getattr(current_user, 'gs_device_key', None)),
         # Reported by agents 3.7+ with each heartbeat; None for older agents.
         "stats": read_optional_column(db, current_user, "gs_stats"),
     }
@@ -920,6 +922,73 @@ async def ground_range_post(
         logger.warning("Failed to persist range to DB: %s", e)
         db.rollback()
     return {"ok": True}
+
+
+def _key_hint(key):
+    """The last four characters of a device key, so a person can tell which key
+    a receiver has without the key itself going over the wire."""
+    return key[-4:] if key else None
+
+
+def _new_device_key(db: Session) -> str:
+    """A fresh device key no other account has."""
+    while True:
+        key = secrets.token_hex(32)
+        if not db.query(User).filter(User.gs_device_key == key).first():
+            return key
+
+
+@app.get("/api/ground/key")
+@limiter.limit("30/minute")
+async def ground_key(
+    request: Request,
+    reveal: bool = False,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """The account's Ground Station device key, treated like an API key.
+
+    Any signed-in account gets one, with or without a plan: someone setting up
+    a receiver to feed needs the key before they have a plan. The key is made
+    the first time it is asked for. Without ?reveal=1 only its last four
+    characters are returned, so the page can show which key it is without
+    the key being sent.
+
+    Website sessions only (get_current_user): a device key cannot read or
+    replace itself.
+    """
+    if not current_user.gs_device_key:
+        current_user.gs_device_key = _new_device_key(db)
+        db.commit()
+    key = current_user.gs_device_key
+    return {
+        "hint": _key_hint(key),
+        "key": key if reveal else None,
+        "ground_station_enabled": gs_allowed(current_user, db),
+    }
+
+
+@app.post("/api/ground/key/rotate")
+@limiter.limit("5/minute")
+async def ground_key_rotate(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Replace the device key, for when the old one may have been seen.
+
+    The old key stops working at once: any receiver still using it is refused
+    until it is given the new one. Returns the new key, revealed, so the page
+    can show it for copying.
+    """
+    current_user.gs_device_key = _new_device_key(db)
+    db.commit()
+    key = current_user.gs_device_key
+    return {
+        "hint": _key_hint(key),
+        "key": key,
+        "ground_station_enabled": gs_allowed(current_user, db),
+    }
 
 
 @app.get("/api/ground/range")
