@@ -53,7 +53,30 @@ def _is_safe_public_url(url: str) -> bool:
 from functools import lru_cache
 
 # Alerts: each ring is armed again once the aircraft is this far outside it.
-REARM_OUTSIDE_NM = 2.0
+REARM_OUTSIDE_NM = 3.0
+REARM_OUTSIDE_FACTOR = 1.6
+# Rings of this size and up fire only for an aircraft heading roughly at the
+# field (within INBOUND_TRACK_DEG of the bearing to it). Smaller rings are
+# crossed on base and final turns, which point elsewhere.
+INBOUND_CHECK_FROM_NM = 5.0
+INBOUND_TRACK_DEG = 75.0
+
+
+def rearm_at(ring_nm: float) -> float:
+    """How far out an aircraft must be seen before a ring can alert again:
+    well outside it, so working an area near a ring, or a wide pattern,
+    does not repeat its alert."""
+    return max(ring_nm + REARM_OUTSIDE_NM, ring_nm * REARM_OUTSIDE_FACTOR)
+
+
+def bearing_to(lat1, lon1, lat2, lon2) -> float:
+    """Initial bearing in degrees from point 1 to point 2."""
+    p1, p2 = radians(float(lat1)), radians(float(lat2))
+    dl = radians(float(lon2) - float(lon1))
+    x = sin(dl) * cos(p2)
+    y = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
+    from math import atan2, degrees
+    return (degrees(atan2(x, y)) + 360) % 360
 # ...and every ring is armed again after an aircraft has gone unseen this long.
 REARM_AFTER_MINUTES = 30
 # A landing or takeoff already logged within this window is not sent again.
@@ -340,6 +363,18 @@ class UserTracker:
                     still_waiting = alert_key in pending and distance_nm <= (alert_distance + ALERT_BUFFER_NM)
 
                     if (crossed_with_buffer or still_waiting) and alert_key not in self.distance_alerts_sent[aircraft_id]:
+                        # Bigger rings only for an aircraft heading at the field:
+                        # crossing one while working an area sideways to it is
+                        # not an arrival. Held, like the approach filter below,
+                        # so it fires if the aircraft turns in while inside.
+                        track = aircraft_data.get('heading')
+                        if alert_distance >= INBOUND_CHECK_FROM_NM and track is not None:
+                            to_field = bearing_to(aircraft_data['latitude'], aircraft_data['longitude'],
+                                                  airspace['center_lat'], airspace['center_lon'])
+                            if abs((float(track) - to_field + 180) % 360 - 180) > INBOUND_TRACK_DEG:
+                                pending.add(alert_key)
+                                continue
+
                         # Approach corridor filter: not lined up with a runway
                         # yet. Hold the alert rather than drop it, so it fires
                         # if the aircraft lines up while still inside the ring.
@@ -381,11 +416,11 @@ class UserTracker:
             # alert on the next arrival after a local flight that stayed
             # inside it (out to 12 nm and back, with a 15 nm ring).
             for d in alert_distances:
-                if distance_nm > d + REARM_OUTSIDE_NM:
+                if distance_nm > rearm_at(d):
                     self.distance_alerts_sent[aircraft_id].discard(dist_key(d))
                     pending.discard(dist_key(d))
 
-            reset_distance = (max(alert_distances) + REARM_OUTSIDE_NM) if alert_distances else 12.0
+            reset_distance = rearm_at(max(alert_distances)) if alert_distances else 12.0
             if distance_nm > reset_distance:
                 if aircraft_id in self.aircraft_state:
                     self.aircraft_state[aircraft_id]['max_distance'] = distance_nm
@@ -401,6 +436,16 @@ class UserTracker:
         # Guard against stale on_ground flags from the API — if the flag flips while
         # the aircraft is already well above field elevation, it's not a real takeoff event.
         if was_on_ground is True and on_ground is False and altitude_agl_ft <= 1500:
+            # A departure is not an arrival: the rings it took off inside stay
+            # quiet until it has been well outside them again. Without this, a
+            # pattern or a turn back after take-off "crossed 2 nm".
+            rings = self.aircraft_alert_distances.get(aircraft_id) or airspace.get('alert_distances_nm', [10.0, 5.0, 2.0])
+            sent = self.distance_alerts_sent.setdefault(aircraft_id, set())
+            for d in rings:
+                d = float(d)
+                if distance_nm <= d + 0.9:
+                    sent.add(f"{int(d) if d == int(d) else d}nm")
+                    self.pending_alerts.get(aircraft_id, set()).discard(f"{int(d) if d == int(d) else d}nm")
             if self.should_notify('takeoff', aircraft_id):
                 notifications.append({
                     'type': 'takeoff',

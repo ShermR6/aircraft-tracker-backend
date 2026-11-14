@@ -358,8 +358,9 @@ def test_tracker_single_heading_filters_as_before():
 def test_tracker_heading_list_allows_either_runway():
     ut = _load_tracker([180, 0])
     assert ut.config["airspace"]["approach_runway_headings"] == [180.0, 0.0]
-    asyncio.run(ut.check_and_notify(_track(12, 0)))
-    fired = asyncio.run(ut.check_and_notify(_track(10.5, 0)))
+    # South of the field flying north: inbound, and lined up with runway 0.
+    asyncio.run(ut.check_and_notify(_track(-12, 0)))
+    fired = asyncio.run(ut.check_and_notify(_track(-10.5, 0)))
     assert [n["type"] for n in fired] == ["10nm"]
 
 

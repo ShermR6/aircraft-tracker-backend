@@ -172,16 +172,16 @@ def test_stale_receiver_positions_are_ignored(monkeypatch):
 
 # ── re-arming ────────────────────────────────────────────────────────────────
 
-def test_a_ring_re_arms_once_the_aircraft_is_2_nm_outside_it(monkeypatch):
+def test_a_ring_re_arms_once_the_aircraft_is_well_outside_it(monkeypatch):
     sent = _setup(monkeypatch)
     for nm in (18, 14, 9, 4, 1.5):
         adsb_at(nm); cycle()
     assert sent == ["15nm", "10nm", "5nm", "2nm"]
     sent.clear()
     minutes_pass()
-    for nm in (6, 12.5, 9, 4, 1.5):     # local flight out to 12.5 nm and back
+    for nm in (6, 17, 9, 4, 1.5):       # local flight out to 17 nm and back
         adsb_at(nm); cycle()
-    assert sent == ["10nm", "5nm", "2nm"]   # 15 nm not re-armed: never beyond 17
+    assert sent == ["10nm", "5nm", "2nm"]   # 15 nm re-arms only beyond 24 (1.6 x 15)
 
 
 def test_pattern_work_does_not_repeat_the_2_nm_alert(monkeypatch):
@@ -319,3 +319,43 @@ def test_lost_from_sight_on_short_final_is_a_landing(monkeypatch):
     assert "landing" not in sent       # two polls is not enough
     cycle()
     assert sent.count("landing") == 1
+
+
+# ── no alerts for departures or for working an area near a ring ─────────────
+
+def test_turning_back_after_take_off_is_not_an_arrival(monkeypatch):
+    """Like N73784 on 14 Nov: took off 16:48, "crossed 2 nm" at 16:50."""
+    sent = _setup(monkeypatch)
+    for nm in (18, 14, 9, 4, 1.5):
+        adsb_at(nm); cycle()
+    adsb_at(0.2, alt="ground", gs=10); cycle()            # landed
+    minutes_pass(50)
+    state = main.tracker.user_trackers[UID].aircraft_state[ICAO]
+    state["last_update"] = datetime.now() - timedelta(minutes=50)   # parked out of sight
+    adsb_at(0.2, alt="ground", gs=10); cycle()
+    sent.clear()
+    adsb_at(0.6, alt=1000, gs=67, track=0); cycle()       # took off, northbound
+    adsb_at(3.5, alt=1800, gs=90, track=0); cycle()
+    adsb_at(2.5, alt=1600, gs=90, track=180); cycle()     # turned back toward the field
+    assert sent == ["takeoff"]
+
+
+def test_working_an_area_near_the_15_nm_ring_alerts_once(monkeypatch):
+    """Like N73784: "crossed 15 nm" at 17:01 and again at 17:47."""
+    sent = _setup(monkeypatch)
+    adsb_at(20); cycle()
+    adsb_at(14.5); cycle()
+    assert sent == ["15nm"]
+    minutes_pass()
+    for nm in (18.5, 14.8, 19, 14.6):                     # in and out around the ring
+        adsb_at(nm); cycle()
+    assert sent == ["15nm"]
+
+
+def test_crossing_a_ring_sideways_waits_until_it_turns_in(monkeypatch):
+    sent = _setup(monkeypatch, rings=(10, 2))
+    adsb_at(11.5, track=90); cycle()
+    adsb_at(10.5, track=90); cycle()                      # inside 10.9, heading east: not inbound
+    assert sent == []
+    adsb_at(10.2, track=200); cycle()                     # turned toward the field
+    assert sent == ["10nm"]
