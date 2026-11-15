@@ -1476,7 +1476,8 @@ class CloudAircraftTracker:
             state = tracker.aircraft_state.get(icao24, {})
             if state:
                 last_update = state.get('last_update')
-                if last_update and (datetime.utcnow() - last_update).total_seconds() > 1800:
+                # last_update is local time (datetime.now()), like every tracker stamp.
+                if last_update and (datetime.now() - last_update).total_seconds() > 1800:
                     continue  # stale — not seen in 30+ min, show as Not Detected
                 entry = {
                     'tail_number': tail,
@@ -1497,59 +1498,55 @@ class CloudAircraftTracker:
                 result.append(entry)
                 result_by_icao[icao24] = entry
 
-        # Overlay GS positions when ground station is online — higher accuracy, 5s updates,
-        # includes on-ground aircraft that adsb.lol may not have
-        # Only while the receiver is still sending them: a batch older than
-        # half a minute is dropped, so an aircraft that left its range falls
-        # back to the network position (with its real age) or off the list.
-        if _gs.is_ground_station_online(user_id):
-            gs_positions, gs_at = _gs.fresh_ground_positions(user_id)
-            for icao24, gp in gs_positions.items():
-                if icao24 not in tracker.aircraft_to_track:
-                    continue
-                lat = gp.get('lat')
-                lon = gp.get('lon')
-                if lat is None or lon is None:
-                    continue
-                tail = tracker.aircraft_to_track[icao24]
-                alt_baro = gp.get('altitude', field_elev)
-                alt_msl = float(alt_baro) if alt_baro else field_elev
-                alt_agl = max(0, alt_msl - field_elev)
-                distance = tracker.haversine_distance(center_lat, center_lon, lat, lon)
-                on_ground = gp.get('on_ground', False)
-
-                if icao24 in result_by_icao:
-                    # Update existing cloud entry with fresher GS data
-                    e = result_by_icao[icao24]
-                    e.update({
-                        'latitude': lat,
-                        'longitude': lon,
-                        'on_ground': on_ground,
-                        'altitude_ft_agl': alt_agl,
-                        'altitude_ft_msl': alt_msl,
-                        'velocity_kts': gp.get('speed', e['velocity_kts']),
-                        'heading': gp.get('heading', e['heading']),
-                        'distance_nm': distance,
-                        'last_seen': gs_at,
-                        'source': 'ground_station',
-                    })
-                else:
-                    # Aircraft only visible to GS (on ground, not in adsb.lol)
-                    result.append({
-                        'tail_number': tail,
-                        'icao24': icao24,
-                        'status': 'on_ground' if on_ground else 'outside',
-                        'on_ground': on_ground,
-                        'distance_nm': distance,
-                        'altitude_ft_agl': alt_agl,
-                        'altitude_ft_msl': alt_msl,
-                        'velocity_kts': gp.get('speed', 0),
-                        'heading': gp.get('heading', 0),
-                        'is_approaching': False,
-                        'last_seen': gs_at,
-                        'latitude': lat,
-                        'longitude': lon,
-                        'source': 'ground_station',
-                    })
+        # The receiver's positions: for each aircraft, its last fix from the
+        # account's own receiver is used whenever it is newer than the network
+        # position. Keeping the last fix (not just the latest batch) holds an
+        # aircraft where it was last heard through a gap on the runway or a
+        # taxiway, instead of jumping back to an older network position out
+        # on final.
+        now = datetime.utcnow()
+        for icao24, (gp, gp_at) in list(_gs.ground_last_fix.get(user_id, {}).items()):
+            if icao24 not in tracker.aircraft_to_track:
+                continue
+            lat, lon = gp.get('lat'), gp.get('lon')
+            if lat is None or lon is None or (now - gp_at).total_seconds() > _gs.LAST_FIX_MAX_AGE_SECONDS:
+                continue
+            existing = result_by_icao.get(icao24)
+            cloud_at = existing.get('last_seen') if existing else None
+            # The tracker stamps network fixes with local time (datetime.now());
+            # receiver fixes are UTC. Compare both in UTC.
+            if isinstance(cloud_at, datetime) and cloud_at + (datetime.utcnow() - datetime.now()) > gp_at:
+                continue   # the network has heard it more recently
+            tail = tracker.aircraft_to_track[icao24]
+            alt_baro = gp.get('altitude', field_elev)
+            alt_msl = float(alt_baro) if alt_baro else field_elev
+            alt_agl = max(0, alt_msl - field_elev)
+            distance = tracker.haversine_distance(center_lat, center_lon, lat, lon)
+            on_ground = gp.get('on_ground', False)
+            fields = {
+                'latitude': lat,
+                'longitude': lon,
+                'on_ground': on_ground,
+                'altitude_ft_agl': alt_agl,
+                'altitude_ft_msl': alt_msl,
+                'distance_nm': distance,
+                'last_seen': gp_at,
+                'source': 'ground_station',
+            }
+            if existing:
+                existing.update(fields)
+                existing['velocity_kts'] = gp.get('speed', existing['velocity_kts'])
+                existing['heading'] = gp.get('heading', existing['heading'])
+            else:
+                # Only the receiver has it (on the ground, below the network)
+                result.append({
+                    'tail_number': tail,
+                    'icao24': icao24,
+                    'status': 'on_ground' if on_ground else 'outside',
+                    'velocity_kts': gp.get('speed', 0),
+                    'heading': gp.get('heading', 0),
+                    'is_approaching': False,
+                    **fields,
+                })
 
         return result

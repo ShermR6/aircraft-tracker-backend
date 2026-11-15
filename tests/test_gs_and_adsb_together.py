@@ -359,3 +359,48 @@ def test_crossing_a_ring_sideways_waits_until_it_turns_in(monkeypatch):
     assert sent == []
     adsb_at(10.2, track=200); cycle()                     # turned toward the field
     assert sent == ["10nm"]
+
+
+# ── the live map: the newer of the receiver's last fix and the network ───────
+
+def _post_fix(nm, on_ground=False, speed=60, age_s=0):
+    at = (datetime.utcnow() - timedelta(seconds=age_s)).isoformat()
+    body = {"positions": {ICAO: {"lat": _north(nm), "lon": LON0, "altitude": 642 if on_ground else 1500,
+                                 "speed": speed, "heading": 180, "on_ground": on_ground, "updated_at": at}}}
+    assert client.post("/api/ground/positions", json=body).status_code == 200
+
+
+def _live():
+    rows = asyncio.run(main.tracker.get_live_aircraft(UID))
+    return next(r for r in rows if r["icao24"] == ICAO)
+
+
+def test_live_map_uses_the_receiver_when_it_is_newer(monkeypatch):
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    adsb_at(3); cycle()                       # the network: 3 nm out
+    _post_fix(0.3, on_ground=True, speed=40)  # the receiver: on the runway, just now
+    row = _live()
+    assert row["source"] == "ground_station" and row["on_ground"] is True
+    assert row["distance_nm"] < 0.5
+
+
+def test_live_map_holds_the_runway_position_through_a_receiver_gap(monkeypatch):
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    adsb_at(3); cycle()
+    state = main.tracker.user_trackers[UID].aircraft_state[ICAO]
+    state["last_update"] = datetime.now() - timedelta(seconds=120)   # network lost it 2 min ago (tracker stamps are local time)
+    _post_fix(0.2, on_ground=True, speed=15, age_s=60)                   # receiver last heard it 1 min ago
+    _gs.ground_positions_at[UID] = datetime.utcnow() - timedelta(seconds=60)
+    row = _live()
+    assert row["distance_nm"] < 0.5, "jumped back to the older network position"
+
+
+def test_live_map_uses_the_network_when_it_is_newer(monkeypatch):
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    _post_fix(0.5, age_s=300)                 # receiver heard it 5 minutes ago
+    adsb_at(8); cycle()                       # network has it now, 8 nm out
+    row = _live()
+    assert row["source"] == "cloud" and row["distance_nm"] > 7

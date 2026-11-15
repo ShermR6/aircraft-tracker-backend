@@ -1032,8 +1032,10 @@ async def ground_positions_post(
     body = await request.json()
     positions = body.get("positions", {})
     if isinstance(positions, dict):
+        now = datetime.utcnow()
         _gs.ground_positions[str(current_user.id)] = positions
-        _gs.ground_positions_at[str(current_user.id)] = datetime.utcnow()
+        _gs.ground_positions_at[str(current_user.id)] = now
+        _gs.remember_fixes(str(current_user.id), positions, now)
     return {"ok": True}
 
 
