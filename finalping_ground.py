@@ -19,10 +19,10 @@ import sys
 import threading
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "3.7"
+VERSION    = "3.8"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -32,6 +32,14 @@ SBS_PORT     = int(os.environ.get("SBS_PORT", "30003"))
 CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 POLL_INTERVAL      = 5
+# While a tracked aircraft is being heard, positions go out every second, so
+# the live map can follow it down to the runway and along the taxiways.
+FAST_POLL_INTERVAL = 1
+# A position dump1090 has not refreshed for this long is not sent: at one
+# send a second it would otherwise go out as new, over and over.
+MAX_POSITION_AGE_S = 10
+# The per-send log line, at most this often (one a second would flood it).
+POSITION_LOG_INTERVAL = 15
 HEARTBEAT_INTERVAL = 60
 RANGE_PUSH_INTERVAL = 300
 # Consecutive heartbeat failures before we stop assuming it is the network
@@ -248,8 +256,9 @@ def _parse_sbs_line(line):
                 if cs: ac["flight"] = cs
 
             elif msg_type == "2":
-                if field(14): ac["lat"] = float(parts[14])
-                if field(15): ac["lon"] = float(parts[15])
+                if field(14) and field(15):
+                    ac["lat"] = float(parts[14]); ac["lon"] = float(parts[15])
+                    ac["pos_time"] = time.time()
                 if field(12): ac["gs"]  = float(parts[12])
                 if field(13): ac["track"] = float(parts[13])
                 ac["alt_baro"] = "ground"
@@ -257,8 +266,9 @@ def _parse_sbs_line(line):
 
             elif msg_type == "3":
                 if field(11): ac["alt_baro"] = int(parts[11])
-                if field(14): ac["lat"] = float(parts[14])
-                if field(15): ac["lon"] = float(parts[15])
+                if field(14) and field(15):
+                    ac["lat"] = float(parts[14]); ac["lon"] = float(parts[15])
+                    ac["pos_time"] = time.time()
                 on_g = field(21) if len(parts) > 21 else None
                 ac["on_ground"] = (on_g == "-1")
 
@@ -312,9 +322,21 @@ def fetch_dump1090():
             return data.get("aircraft", data.get("ac", []))
 
     if _sbs_connected:
-        cutoff = time.time() - 30
+        now = time.time()
+        cutoff = now - 30
+        out = []
         with _sbs_lock:
-            return [dict(ac) for ac in _sbs_aircraft.values() if ac.get("last_seen", 0) > cutoff]
+            for ac in _sbs_aircraft.values():
+                if ac.get("last_seen", 0) <= cutoff:
+                    continue
+                a = dict(ac)
+                # Any message keeps an aircraft listed, but only a position
+                # message moves it: report how old the position is, as the
+                # JSON output does, so a stale one is not sent as new.
+                if a.get("pos_time"):
+                    a["seen_pos"] = now - a["pos_time"]
+                out.append(a)
+        return out
 
     raise RuntimeError("dump1090 not reachable via HTTP, filesystem, or SBS stream")
 
@@ -509,6 +531,7 @@ def run():
     last_update_check = time.time()
     last_config_refresh = time.time()
     last_aircraft_count = None
+    last_position_log = 0.0
 
     while True:
         now = time.time()
@@ -593,9 +616,17 @@ def run():
             if lat is None or lon is None:
                 continue
 
+            # How old dump1090's position is: it keeps the last one for a
+            # minute after the aircraft goes quiet.
+            seen_pos = ac.get("seen_pos")
+            age = float(seen_pos) if isinstance(seen_pos, (int, float)) else 0.0
+            if age > MAX_POSITION_AGE_S:
+                continue
+
             gs       = ac.get("gs")
             alt_baro = ac.get("alt_baro")
-            on_ground = ac.get("on_ground", False) or (alt_baro == "ground") or (gs is not None and gs < 50)
+            decoder_ground = bool(ac.get("on_ground", False)) or (alt_baro == "ground")
+            on_ground = decoder_ground or (gs is not None and gs < 50)
             altitude  = field_elevation if on_ground else (float(alt_baro) if alt_baro and alt_baro != "ground" else field_elevation)
             speed_kts = float(gs) if gs is not None else 0.0
             heading   = float(ac.get("track") or 0)
@@ -606,24 +637,32 @@ def run():
                 "speed": speed_kts,
                 "heading": heading,
                 "on_ground": on_ground,
-                "updated_at": datetime.utcnow().isoformat(),
+                # 3.8+: the decoder's own ground flag (not the speed guess)
+                # and the altitude as reported, for the backend to use.
+                "decoder_ground": decoder_ground,
+                "alt_baro": alt_baro if isinstance(alt_baro, (int, float)) else None,
+                "updated_at": (datetime.utcnow() - timedelta(seconds=age)).isoformat(),
             }
 
+        quiet_log = now - last_position_log < POSITION_LOG_INTERVAL
         if positions:
             try:
                 api_post("/api/ground/positions", token, {"positions": positions})
-                parts = []
-                for icao, p in positions.items():
-                    tail = tracked[icao]
-                    loc  = "GND" if p["on_ground"] else f"{p['altitude']:.0f}ft"
-                    parts.append(f"{tail} {loc}")
-                log(f"[OK] {' | '.join(parts)}")
+                if not quiet_log:
+                    parts = []
+                    for icao, p in positions.items():
+                        tail = tracked[icao]
+                        loc  = "GND" if p["on_ground"] else f"{p['altitude']:.0f}ft"
+                        parts.append(f"{tail} {loc}")
+                    log(f"[OK] {' | '.join(parts)}")
+                    last_position_log = now
             except Exception as e:
                 log(f"[WARN] Position push failed: {e}")
-        else:
+        elif not quiet_log:
             log("No tracked aircraft in dump1090 feed")
+            last_position_log = now
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(FAST_POLL_INTERVAL if positions else POLL_INTERVAL)
 
 
 if __name__ == "__main__":
