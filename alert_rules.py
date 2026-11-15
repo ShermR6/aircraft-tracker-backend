@@ -202,4 +202,8 @@ def clean_gs_stats(body) -> Optional[dict]:
         if x != x or x < 0 or x > cap:
             continue
         out[key] = round(float(x), 1) if is_float else int(x)
+    # 3.9+: whether adsb.lol can see this receiver's feed. Absent or null
+    # means the agent does not know, which is not the same as "no".
+    if isinstance(body.get("feeding"), bool):
+        out["feeding"] = body["feeding"]
     return out or None

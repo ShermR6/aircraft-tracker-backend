@@ -54,6 +54,8 @@ class UserResponse(BaseModel):
     email: str
     display_name: Optional[str] = None
     license_tier: str
+    # "feeder" when the plan is the free one for feeding adsb.lol.
+    plan_source: Optional[str] = None
     created_at: datetime
     activated_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None

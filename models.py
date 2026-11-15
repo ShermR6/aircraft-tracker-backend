@@ -41,6 +41,9 @@ class User(Base):
     # that alert type. gs_stats: what the ground agent last reported.
     routing = deferred(Column(JSON, nullable=True))
     gs_stats = deferred(Column(JSON, nullable=True))
+    # Minutes per UTC day this account's receiver was feeding adsb.lol, which
+    # is what the free plan for feeders is worked out from. See feeder.py.
+    gs_feed = deferred(Column(JSON, nullable=True))
 
     # Relationships
     license = relationship("License", back_populates="users")

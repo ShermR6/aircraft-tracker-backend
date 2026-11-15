@@ -11,6 +11,7 @@ Shared by main.py and tracker.py so the two cannot disagree.
 import os
 from datetime import datetime, timedelta
 
+from feeder import is_feeder_license
 from models import License, NotificationLog
 
 # A lapsed licence keeps working this long, so a late renewal webhook or a
@@ -28,7 +29,10 @@ def live_license(db, user, now: datetime = None):
     lic = db.query(License).filter(License.id == user.license_id).first()
     if lic is None or lic.status == "expired":
         return None
-    if lic.expires_at and lic.expires_at + LICENSE_GRACE_PERIOD < (now or datetime.utcnow()):
+    # The free plan for feeding is already dated to the last day its rule
+    # holds, so it gets no grace on top.
+    grace = timedelta(0) if is_feeder_license(lic) else LICENSE_GRACE_PERIOD
+    if lic.expires_at and lic.expires_at + grace < (now or datetime.utcnow()):
         return None
     return lic
 

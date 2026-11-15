@@ -134,7 +134,9 @@ def test_ground_station_needs_only_the_plan():
 
     api._drop_plan()
     assert main.gs_allowed(_user(), db) is False
-    assert client.get("/api/ground/status").status_code == 403
+    # The page still answers without a plan: a receiver that feeds is how an
+    # account gets one for free (tests/test_feeder.py).
+    assert client.get("/api/ground/status").status_code == 200
 
 
 def test_hand_granted_ground_station_survives_without_a_plan():

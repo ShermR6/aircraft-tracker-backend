@@ -155,6 +155,9 @@ LICENSE_DURATION_DAYS = 30
 # Grace period after expiry before blocking access — gives the Stripe renewal
 # webhook time to arrive and extend the license before users go dark.
 from plans import LICENSE_GRACE_PERIOD, live_license, plan_tier, sms_over_limit  # noqa: E402
+from feeder import (  # noqa: E402
+    feeder_summary, is_feeder_license, record_feed_minute, sync_feeder_license,
+)
 
 import ground_state as _gs
 
@@ -195,8 +198,14 @@ def plan_refusal(tier: str, sentence: str) -> HTTPException:
 
 
 def gs_allowed(user, db) -> bool:
-    """Ground Station is part of the plan. The flag still covers accounts
-    that were granted it by hand or bought the old add-on."""
+    """Whether this account's receiver data is used: Ground Station is part of
+    the plan. The flag still covers accounts that were granted it by hand or
+    bought the old add-on.
+
+    Any account may connect a receiver (that is how the free plan for feeding
+    is earned), so this no longer decides who can sign a receiver in. It
+    decides whose aircraft the receiver is told to listen for and whose
+    positions are kept."""
     return bool(getattr(user, 'ground_station_enabled', False)) or live_license(db, user) is not None
 
 
@@ -257,8 +266,7 @@ def _authenticate_device_key(token: str, db: Session) -> User:
     user = db.query(User).filter(User.gs_device_key == token).first()
     if user is None:
         raise HTTPException(status_code=401, detail="Invalid device key")
-    if not gs_allowed(user, db):
-        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    # No plan check: an account without a plan runs a receiver to earn one.
     return user
 
 
@@ -281,7 +289,10 @@ def _authenticate_jwt(token: str, db: Session) -> User:
     # Check license expiry — free accounts (no license) are allowed through
     if user.license_id:
         license = db.query(License).filter(License.id == user.license_id).first()
-        if license and license.expires_at and license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow():
+        # A lapsed free plan for feeding is simply no plan: the account drops
+        # to the preview and gets the plan back by feeding again.
+        if (license and not is_feeder_license(license) and license.expires_at
+                and license.expires_at + LICENSE_GRACE_PERIOD < datetime.utcnow()):
             raise HTTPException(status_code=401, detail="license_expired")
 
     return user
@@ -389,6 +400,12 @@ async def refresh_entitlement(db, user, ent):
     would forget which alerts an inbound aircraft has already sent."""
     had_plan = live_license(db, user) is not None
     adopt_entitlement(db, user, ent)
+    # With no paid plan, an account whose receiver feeds has the plan for free.
+    try:
+        sync_feeder_license(db, user, read_optional_column(db, user, "gs_feed"))
+    except Exception as e:
+        db.rollback()
+        logger.warning("Could not update the feeder plan for %s: %s", user.id, e)
     if (live_license(db, user) is not None) != had_plan:
         try:
             await tracker.update_user_aircraft(str(user.id), db)
@@ -452,10 +469,13 @@ def adopt_entitlement(db, user, ent):
 
     elif ent_tier == "free" and user.license_id:
         # Cancelled, refunded or lapsed — drop to free instead of leaving a paid
-        # tier attached to the account forever.
-        user.license_id = None
-        db.commit()
-        db.refresh(user)
+        # tier attached to the account forever. The free plan for feeding is
+        # not the website's to take away: feeder.py attaches and removes it.
+        attached = db.query(License).filter(License.id == user.license_id).first()
+        if not is_feeder_license(attached):
+            user.license_id = None
+            db.commit()
+            db.refresh(user)
 
 
 @app.post("/api/auth/login", dependencies=[Depends(require_website)])
@@ -765,14 +785,11 @@ async def ground_validate(
     Called by FinalPing Ground Station on startup.
     Returns whether this account has ground station access enabled.
     """
-    enabled = gs_allowed(current_user, db)
-    if not enabled:
-        raise HTTPException(
-            status_code=403,
-            detail="ground_station_not_enabled"
-        )
     return {
         "enabled": True,
+        # Whether the account has a plan. Without one the receiver still runs
+        # and feeds; it is just not given any aircraft to listen for.
+        "plan": gs_allowed(current_user, db),
         "email": current_user.email,
         "message": "Ground station access confirmed",
     }
@@ -788,8 +805,6 @@ async def ground_config(
     Called on startup so credentials + config are never baked into the script.
     """
     from models import AirportConfig, Aircraft
-    if not gs_allowed(current_user, db):
-        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
 
     airport = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
     if not airport:
@@ -798,10 +813,12 @@ async def ground_config(
             detail="No location configured. Set up your airport location in the FinalPing app first."
         )
 
+    # Without a plan nothing is tracked, so the receiver is given no aircraft
+    # and sends no positions.
     aircraft = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
         Aircraft.active == True
-    ).all()
+    ).all() if gs_allowed(current_user, db) else []
 
     return {
         "lat": float(airport.latitude),
@@ -820,9 +837,10 @@ async def ground_heartbeat(request: Request, current_user: User = Depends(get_gr
 
     Agents from 3.7 on also report a few stats in the body. Older agents send
     an empty body, which leaves whatever is stored untouched.
+
+    Agents from 3.9 on say whether adsb.lol can see their feed. Each heartbeat
+    that says yes counts a minute towards the free plan for feeding.
     """
-    if not gs_allowed(current_user, db):
-        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     now = datetime.utcnow()
     _gs.ground_last_seen[str(current_user.id)] = now
     current_user.gs_last_heartbeat = now
@@ -841,14 +859,29 @@ async def ground_heartbeat(request: Request, current_user: User = Depends(get_gr
         except Exception as e:
             db.rollback()
             logger.warning("Could not store ground station stats: %s", e)
+
+    # Feeding minutes, and the plan they earn. Also after the heartbeat is
+    # recorded, and never able to fail it.
+    if stats is not None and stats.get("feeding") is True:
+        try:
+            feed = record_feed_minute(read_optional_column(db, current_user, "gs_feed"), now)
+            current_user.gs_feed = feed
+            db.commit()
+            if sync_feeder_license(db, current_user, feed, now):
+                await tracker.update_user_aircraft(str(current_user.id), db)
+        except Exception as e:
+            db.rollback()
+            logger.warning("Could not record feeding for %s: %s", current_user.id, e)
     return {"ok": True}
 
 
 @app.get("/api/ground/status")
 async def ground_status(current_user: User = Depends(get_ground_user), db: Session = Depends(get_db)):
-    """Returns whether this user's ground station is currently online."""
-    if not gs_allowed(current_user, db):
-        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+    """Returns whether this user's ground station is currently online.
+
+    Every account can ask, with or without a plan: a receiver that feeds is
+    how an account without one gets one, and the page has to show its progress.
+    """
     # The in-memory map is the fast path, but it lives in this process and is
     # empty after every redeploy, crash or container move — which made a
     # perfectly healthy ground station report Offline until its next heartbeat,
@@ -872,7 +905,17 @@ async def ground_status(current_user: User = Depends(get_ground_user), db: Sessi
         "gs_key_hint": _key_hint(getattr(current_user, 'gs_device_key', None)),
         # Reported by agents 3.7+ with each heartbeat; None for older agents.
         "stats": read_optional_column(db, current_user, "gs_stats"),
+        # Where the account stands on the free plan for feeding adsb.lol.
+        "feeder": _feeder_status(db, current_user),
     }
+
+
+def _feeder_status(db, user) -> dict:
+    out = feeder_summary(read_optional_column(db, user, "gs_feed"), datetime.utcnow())
+    lic = live_license(db, user)
+    # "feeder": the plan is the free one. "paid": a paid plan, which wins.
+    out["plan"] = "feeder" if is_feeder_license(lic) else ("paid" if lic is not None else "none")
+    return out
 
 
 @app.post("/api/ground/range")
@@ -882,8 +925,6 @@ async def ground_range_post(
     db: Session = Depends(get_db),
 ):
     """Receives SDR reception range data (36 buckets, one per 10-degree bearing)."""
-    if not gs_allowed(current_user, db):
-        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     body = await request.json()
     range_nm = body.get("range_nm", [])
     if not isinstance(range_nm, list) or len(range_nm) != 36:
@@ -997,8 +1038,6 @@ async def ground_range_get(
     db: Session = Depends(get_db),
 ):
     """Returns the latest SDR reception range polygon for this user."""
-    if not gs_allowed(current_user, db):
-        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
     data = _gs.ground_range.get(str(current_user.id))
     if not data:
         # Fall back to DB (survives backend restarts)
@@ -1028,7 +1067,9 @@ async def ground_positions_post(
 ):
     """Receives live aircraft positions from the ground station for the live map."""
     if not gs_allowed(current_user, db):
-        raise HTTPException(status_code=403, detail="ground_station_not_enabled")
+        # Nothing is tracked without a plan. Answered as a success so a
+        # receiver whose plan has just lapsed does not log an error a second.
+        return {"ok": True}
     body = await request.json()
     positions = body.get("positions", {})
     if isinstance(positions, dict):
@@ -1358,8 +1399,11 @@ async def get_current_user_info(
         email=current_user.email,
         display_name=current_user.display_name,
         license_tier=display_tier,
+        plan_source="feeder" if is_feeder_license(license) else None,
         activated_at=license.activated_at if license else None,
-        expires_at=license.expires_at if license and not license.tier.startswith("team-") else None,
+        # The free plan for feeding has no end date to show: it runs while
+        # the receiver keeps feeding.
+        expires_at=license.expires_at if license and not license.tier.startswith("team-") and not is_feeder_license(license) else None,
         created_at=current_user.created_at,
         has_team=has_team,
         team_id=team_id,
@@ -3160,6 +3204,7 @@ async def startup_event():
             # Web app — per-event routing, receiver stats, multi-runway approach filter
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS routing JSON",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_stats JSON",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_feed JSON",
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_runway_headings JSON",
             # New tables for teams v2
             """CREATE TABLE IF NOT EXISTS aircraft_claims (

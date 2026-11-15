@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-FinalPing Ground Station v3.0
-─────────────────────────────
-Reads live ADS-B data from dump1090 and pushes positions to the FinalPing cloud.
-Authenticates with a permanent device key (no email/password required).
+FinalPing Ground Station
+────────────────────────
+Reads live ADS-B data from the decoder on this machine (readsb or dump1090)
+and sends the positions of the account's aircraft to FinalPing. Signs in with
+the account's device key: no email or password is stored here.
 
-Data source priority: HTTP JSON API → filesystem aircraft.json → SBS TCP stream (port 30003)
+It also reports whether adsb.lol can see a feed from this receiver, which is
+what the free plan for feeding is worked out from.
 
-Setup:
-  Token is claimed automatically via the FinalPing_Setup hotspot on first boot.
-  Or set manually: echo '{"token": "YOUR_KEY"}' > /home/pi/finalping-ground/config.json
+Data source priority: HTTP JSON API → aircraft.json on disk → SBS TCP stream (port 30003)
+
+Setup, one command (the device key is on finalpingapp.com/app/ground-station):
+  curl -fsSL https://finalpingapp.com/install.sh | sudo bash -s -- YOUR_DEVICE_KEY
+Or by hand: put {"token": "YOUR_DEVICE_KEY"} in config.json next to this file.
 """
 
 import json
@@ -19,10 +23,10 @@ import sys
 import threading
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "3.7"
+VERSION    = "3.9"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -32,8 +36,34 @@ SBS_PORT     = int(os.environ.get("SBS_PORT", "30003"))
 CONFIG_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 POLL_INTERVAL      = 5
+# While a tracked aircraft is being heard, positions go out every second, so
+# the live map can follow it down to the runway and along the taxiways.
+FAST_POLL_INTERVAL = 1
+# A position dump1090 has not refreshed for this long is not sent: at one
+# send a second it would otherwise go out as new, over and over.
+MAX_POSITION_AGE_S = 10
+# The per-send log line, at most this often (one a second would flood it).
+POSITION_LOG_INTERVAL = 15
 HEARTBEAT_INTERVAL = 60
 RANGE_PUSH_INTERVAL = 300
+# How often the account's airport and aircraft are fetched again, so an
+# aircraft added in the app is listened for within minutes.
+CONFIG_REFRESH_INTERVAL = 600
+# ...and while the account has no airport yet (a receiver set up before the
+# app was), so it starts working soon after one is added.
+CONFIG_RETRY_NO_AIRPORT = 120
+# An aircraft.json nothing has rewritten for this long belongs to a decoder
+# that has stopped: its positions are not where anything is.
+STALE_FILE_S = 60
+
+# adsb.lol answers this with the feeds it has from the caller's own network.
+ADSBLOL_ME_URL = "https://api.adsb.lol/0/me"
+FEED_CHECK_INTERVAL = 600        # while feeding
+FEED_RECHECK_INTERVAL = 120      # while not, so a new feed shows up quickly
+# adsb.lol not answering is not the feed being down: the last answer stands
+# for this long before it becomes "unknown".
+FEED_ANSWER_KEPT_S = 3600
+ADSBLOL_FEED_CONFIG = "/etc/default/adsblol"
 # Consecutive heartbeat failures before we stop assuming it is the network
 # and go re-check our credentials.
 REVALIDATE_AFTER_FAILURES = 5
@@ -54,6 +84,8 @@ DUMP1090_FILE_PATHS = [
     "/run/dump1090-fa/aircraft.json",
     "/run/readsb/aircraft.json",
     "/run/dump1090/aircraft.json",
+    # Written every second by the adsb.lol feed client from the same decoder.
+    "/run/adsblol-feed/aircraft.json",
     "/var/run/dump1090-fa/aircraft.json",
     "/tmp/dump1090-fa/aircraft.json",
     "/home/pi/dump1090/aircraft.json",
@@ -97,12 +129,45 @@ def message_rate(now):
     return round(dn / dt, 1)
 
 
+# ── adsb.lol feed ─────────────────────────────────────────────────────────────
+_feed = {"feeding": None, "at": 0.0, "checked": 0.0}
+
+
+def check_feed(now):
+    """Ask adsb.lol whether it has a feed from this network.
+
+    True or False is adsb.lol's own answer. None means it could not be asked
+    for over an hour, which the backend counts as neither.
+    """
+    _feed["checked"] = now
+    try:
+        r = requests.get(ADSBLOL_ME_URL, timeout=10)
+        r.raise_for_status()
+        clients = r.json().get("clients") or {}
+        feeding = bool(clients.get("beast"))
+        if feeding != _feed["feeding"]:
+            log("[OK] adsb.lol is receiving this feed" if feeding
+                else "[WARN] adsb.lol has no feed from this network yet")
+        _feed["feeding"], _feed["at"] = feeding, now
+    except Exception as e:
+        if _feed["feeding"] is not None and now - _feed["at"] > FEED_ANSWER_KEPT_S:
+            log(f"[WARN] Could not ask adsb.lol about the feed for an hour ({e})")
+            _feed["feeding"] = None
+    return _feed["feeding"]
+
+
+def feed_check_due(now):
+    wait = FEED_CHECK_INTERVAL if _feed["feeding"] else FEED_RECHECK_INTERVAL
+    return now - _feed["checked"] >= wait
+
+
 def heartbeat_stats(now, aircraft_count):
     return {
         "version": VERSION,
         "uptime_s": int(now - START_TIME),
         "msg_rate": message_rate(now),
         "aircraft_count": aircraft_count,
+        "feeding": _feed["feeding"],
     }
 
 
@@ -248,8 +313,9 @@ def _parse_sbs_line(line):
                 if cs: ac["flight"] = cs
 
             elif msg_type == "2":
-                if field(14): ac["lat"] = float(parts[14])
-                if field(15): ac["lon"] = float(parts[15])
+                if field(14) and field(15):
+                    ac["lat"] = float(parts[14]); ac["lon"] = float(parts[15])
+                    ac["pos_time"] = time.time()
                 if field(12): ac["gs"]  = float(parts[12])
                 if field(13): ac["track"] = float(parts[13])
                 ac["alt_baro"] = "ground"
@@ -257,8 +323,9 @@ def _parse_sbs_line(line):
 
             elif msg_type == "3":
                 if field(11): ac["alt_baro"] = int(parts[11])
-                if field(14): ac["lat"] = float(parts[14])
-                if field(15): ac["lon"] = float(parts[15])
+                if field(14) and field(15):
+                    ac["lat"] = float(parts[14]); ac["lon"] = float(parts[15])
+                    ac["pos_time"] = time.time()
                 on_g = field(21) if len(parts) > 21 else None
                 ac["on_ground"] = (on_g == "-1")
 
@@ -306,20 +373,55 @@ def fetch_dump1090():
 
     for path in DUMP1090_FILE_PATHS:
         if os.path.exists(path):
-            with open(path) as f:
-                data = json.load(f)
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except (OSError, ValueError):
+                continue
+            stamp = data.get("now") if isinstance(data, dict) else None
+            if isinstance(stamp, (int, float)) and time.time() - stamp > STALE_FILE_S:
+                continue
             _note_messages(data)
             return data.get("aircraft", data.get("ac", []))
 
     if _sbs_connected:
-        cutoff = time.time() - 30
+        now = time.time()
+        cutoff = now - 30
+        out = []
         with _sbs_lock:
-            return [dict(ac) for ac in _sbs_aircraft.values() if ac.get("last_seen", 0) > cutoff]
+            for ac in _sbs_aircraft.values():
+                if ac.get("last_seen", 0) <= cutoff:
+                    continue
+                a = dict(ac)
+                # Any message keeps an aircraft listed, but only a position
+                # message moves it: report how old the position is, as the
+                # JSON output does, so a stale one is not sent as new.
+                if a.get("pos_time"):
+                    a["seen_pos"] = now - a["pos_time"]
+                out.append(a)
+        return out
 
     raise RuntimeError("dump1090 not reachable via HTTP, filesystem, or SBS stream")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+def _feed_client_location():
+    """The location given to the adsb.lol feed client, when it was given a real one."""
+    try:
+        found = {}
+        with open(ADSBLOL_FEED_CONFIG, encoding="utf-8") as f:
+            for line in f:
+                name, _, value = line.strip().partition("=")
+                if name in ("LATITUDE", "LONGITUDE"):
+                    found[name] = float(value.strip().strip('"'))
+        lat, lon = found["LATITUDE"], found["LONGITUDE"]
+        if (lat or lon) and -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+    except Exception:
+        pass
+    return None
+
 
 def load_receiver_location(airport_lat, airport_lon):
     """Where the antenna is, which is not necessarily the airport.
@@ -329,8 +431,10 @@ def load_receiver_location(airport_lat, airport_lon):
     distorts the shape. A station at home watching a field 7 nm away is the
     normal case, not a misconfiguration.
 
-    Falls back to the airport so an unconfigured station still produces
-    something, but says so loudly, because the result is subtly wrong.
+    Falls back to the location the adsb.lol feed client was given, then to the
+    airport so an unconfigured station still produces something, but says so
+    loudly, because the result is subtly wrong. (None, None, False) when there
+    is nothing to go on at all: the account has no airport yet either.
     """
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
@@ -342,6 +446,9 @@ def load_receiver_location(airport_lat, airport_lon):
                 return lat, lon, True
     except Exception:
         pass
+    fed = _feed_client_location()
+    if fed:
+        return fed[0], fed[1], True
     return airport_lat, airport_lon, False
 
 
@@ -434,10 +541,11 @@ def wait_for_valid_token():
                 return token
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else None
-                if code == 403:
-                    log(f"[ERR] Ground station not enabled for this account. Retrying in {backoff}s...")
+                if code == 401:
+                    log(f"[ERR] This device key was not accepted. If the key was replaced in the app, "
+                        f"put the new one in config.json. Retrying in {backoff}s...")
                 else:
-                    log(f"[ERR] Validation failed (HTTP {code}) — check the device token. Retrying in {backoff}s...")
+                    log(f"[ERR] Validation failed (HTTP {code}). Retrying in {backoff}s...")
             except Exception as e:
                 log(f"[ERR] Could not reach backend: {e}. Retrying in {backoff}s...")
         else:
@@ -445,6 +553,29 @@ def wait_for_valid_token():
         time.sleep(backoff)
         backoff = min(backoff * 2, 300)
         check_for_update()
+
+
+def fetch_config(token):
+    """The account's airport and aircraft, or None while it has no airport.
+
+    A receiver can be set up before the app is: it then feeds and reports in,
+    and picks the airport up once one is added.
+    """
+    try:
+        config = api_get("/api/ground/config", token)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return None
+        raise
+    return {
+        "lat": float(config["lat"]),
+        "lon": float(config["lon"]),
+        "elevation": float(config.get("elevation_ft") or 0),
+        "tracked": {
+            a["icao24"].lower(): a["tail"]
+            for a in config.get("aircraft", []) if a.get("icao24")
+        },
+    }
 
 
 def run():
@@ -459,30 +590,34 @@ def run():
 
     log("Fetching config from backend...")
     try:
-        config = api_get("/api/ground/config", token)
+        config = fetch_config(token)
     except Exception as e:
         log(f"[ERR] Failed to fetch config: {e}")
         sys.exit(1)
 
-    center_lat      = float(config["lat"])
-    center_lon      = float(config["lon"])
-    field_elevation = float(config.get("elevation_ft", 0))
-    tracked = {
-        a["icao24"].lower(): a["tail"]
-        for a in config.get("aircraft", []) if a.get("icao24")
-    }
+    center_lat      = config["lat"] if config else None
+    center_lon      = config["lon"] if config else None
+    field_elevation = config["elevation"] if config else 0.0
+    tracked         = config["tracked"] if config else {}
 
     recv_lat, recv_lon, recv_configured = load_receiver_location(center_lat, center_lon)
 
-    log(f"[OK] Airport: {center_lat:.4f}, {center_lon:.4f} | Elevation: {field_elevation:.0f}ft MSL")
-    if recv_configured:
+    if config:
+        log(f"[OK] Airport: {center_lat:.4f}, {center_lon:.4f} | Elevation: {field_elevation:.0f}ft MSL")
+    else:
+        log("[WARN] This account has no airport yet. Feeding and reporting in; "
+            "add an airport and aircraft in the FinalPing app to start tracking.")
+    if recv_configured and config:
         gap = haversine_distance(center_lat, center_lon, recv_lat, recv_lon)
         log(f"[OK] Receiver: {recv_lat:.4f}, {recv_lon:.4f} ({gap:.1f} nm from the airport)")
-    else:
+    elif recv_configured:
+        log(f"[OK] Receiver: {recv_lat:.4f}, {recv_lon:.4f}")
+    elif config:
         log("[WARN] No receiver_lat/receiver_lon in config.json - measuring range "
             "from the airport instead. If the antenna is somewhere else, the "
             "range outline will be offset by that distance.")
     log(f"[OK] Tracking {len(tracked)} aircraft: {', '.join(tracked.values()) or 'none configured'}")
+    check_feed(time.time())
 
     t = threading.Thread(target=_sbs_reader_thread, daemon=True)
     t.start()
@@ -509,6 +644,7 @@ def run():
     last_update_check = time.time()
     last_config_refresh = time.time()
     last_aircraft_count = None
+    last_position_log = 0.0
 
     while True:
         now = time.time()
@@ -517,17 +653,26 @@ def run():
             check_for_update()
             last_update_check = now
 
-        if now - last_config_refresh >= 3600:
+        if now - last_config_refresh >= (CONFIG_REFRESH_INTERVAL if config else CONFIG_RETRY_NO_AIRPORT):
             try:
-                config = api_get("/api/ground/config", token)
-                tracked = {
-                    a["icao24"].lower(): a["tail"]
-                    for a in config.get("aircraft", []) if a.get("icao24")
-                }
-                log(f"[OK] Config refreshed — tracking {len(tracked)} aircraft")
+                fresh = fetch_config(token)
+                if fresh:
+                    if not config:
+                        log(f"[OK] Airport set: {fresh['lat']:.4f}, {fresh['lon']:.4f}")
+                    if set(fresh["tracked"]) != set(tracked):
+                        log(f"[OK] Now tracking {len(fresh['tracked'])} aircraft: "
+                            f"{', '.join(fresh['tracked'].values()) or 'none configured'}")
+                    config = fresh
+                    center_lat, center_lon = config["lat"], config["lon"]
+                    field_elevation, tracked = config["elevation"], config["tracked"]
+                    if not recv_configured:
+                        recv_lat, recv_lon = center_lat, center_lon
             except Exception as e:
                 log(f"[WARN] Config refresh failed: {e}")
             last_config_refresh = now
+
+        if feed_check_due(now):
+            check_feed(now)
 
         if now - last_heartbeat >= HEARTBEAT_INTERVAL:
             try:
@@ -557,7 +702,7 @@ def run():
                     heartbeat_failures = 0
                     last_heartbeat = 0.0
 
-        if now - last_range_push >= RANGE_PUSH_INTERVAL and any(v > 0 for v in range_nm):
+        if recv_lat is not None and now - last_range_push >= RANGE_PUSH_INTERVAL and any(v > 0 for v in range_nm):
             try:
                 api_post("/api/ground/range", token, {
                     "range_nm": range_nm,
@@ -579,7 +724,8 @@ def run():
 
         # Reception range is a property of the antenna, so it is measured from
         # every aircraft we can hear -- not just the tracked ones.
-        bin_range(range_nm, aircraft_list, recv_lat, recv_lon)
+        if recv_lat is not None:
+            bin_range(range_nm, aircraft_list, recv_lat, recv_lon)
         last_aircraft_count = sum(1 for ac in aircraft_list if ac.get("lat") is not None and ac.get("lon") is not None)
 
         positions = {}
@@ -593,9 +739,17 @@ def run():
             if lat is None or lon is None:
                 continue
 
+            # How old dump1090's position is: it keeps the last one for a
+            # minute after the aircraft goes quiet.
+            seen_pos = ac.get("seen_pos")
+            age = float(seen_pos) if isinstance(seen_pos, (int, float)) else 0.0
+            if age > MAX_POSITION_AGE_S:
+                continue
+
             gs       = ac.get("gs")
             alt_baro = ac.get("alt_baro")
-            on_ground = ac.get("on_ground", False) or (alt_baro == "ground") or (gs is not None and gs < 50)
+            decoder_ground = bool(ac.get("on_ground", False)) or (alt_baro == "ground")
+            on_ground = decoder_ground or (gs is not None and gs < 50)
             altitude  = field_elevation if on_ground else (float(alt_baro) if alt_baro and alt_baro != "ground" else field_elevation)
             speed_kts = float(gs) if gs is not None else 0.0
             heading   = float(ac.get("track") or 0)
@@ -606,24 +760,32 @@ def run():
                 "speed": speed_kts,
                 "heading": heading,
                 "on_ground": on_ground,
-                "updated_at": datetime.utcnow().isoformat(),
+                # 3.8+: the decoder's own ground flag (not the speed guess)
+                # and the altitude as reported, for the backend to use.
+                "decoder_ground": decoder_ground,
+                "alt_baro": alt_baro if isinstance(alt_baro, (int, float)) else None,
+                "updated_at": (datetime.utcnow() - timedelta(seconds=age)).isoformat(),
             }
 
+        quiet_log = now - last_position_log < POSITION_LOG_INTERVAL
         if positions:
             try:
                 api_post("/api/ground/positions", token, {"positions": positions})
-                parts = []
-                for icao, p in positions.items():
-                    tail = tracked[icao]
-                    loc  = "GND" if p["on_ground"] else f"{p['altitude']:.0f}ft"
-                    parts.append(f"{tail} {loc}")
-                log(f"[OK] {' | '.join(parts)}")
+                if not quiet_log:
+                    parts = []
+                    for icao, p in positions.items():
+                        tail = tracked[icao]
+                        loc  = "GND" if p["on_ground"] else f"{p['altitude']:.0f}ft"
+                        parts.append(f"{tail} {loc}")
+                    log(f"[OK] {' | '.join(parts)}")
+                    last_position_log = now
             except Exception as e:
                 log(f"[WARN] Position push failed: {e}")
-        else:
+        elif not quiet_log:
             log("No tracked aircraft in dump1090 feed")
+            last_position_log = now
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(FAST_POLL_INTERVAL if positions else POLL_INTERVAL)
 
 
 if __name__ == "__main__":
