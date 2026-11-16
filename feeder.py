@@ -2,13 +2,19 @@
 
 A receiver (agent 3.9+) says with each heartbeat whether adsb.lol can see its
 feed. Those minutes are counted per UTC day on the account. An account whose
-receiver was feeding on at least FEED_DAYS_NEEDED of the last FEED_WINDOW_DAYS
-days has the plan for free, for as long as that stays true.
+receiver was feeding on at least FEED_DAYS_NEEDED of the FEED_WINDOW_DAYS days
+before today has the plan for free, for as long as that stays true. The window
+moves forward a day at a time, so the receiver has to keep feeding every week.
 
-    A day counts once the receiver has fed for FEED_MINUTES_PER_DAY minutes
-    of it. The day a receiver first feeds counts at once, and the days before
-    it are credited, so a new feeder has the plan from its first heartbeat
-    and keeps it by continuing to feed. That credit is given once per account.
+    A day counts when the receiver fed for FEED_MINUTES_PER_DAY minutes of it
+    (18 hours, three quarters of the day). A day is judged once it is over:
+    today is not in the window, so the plan never drops in the morning only
+    to come back when today's hours are in.
+
+    The day a receiver first feeds counts whatever its hours, and the days
+    before it are credited, so a new feeder has the plan from its first
+    heartbeat and keeps it by continuing to feed. That credit is given once
+    per account.
 
 The plan is an ordinary licence row (key FP-FEEDER-...), dated to the last day
 the rule would still hold if the receiver stopped now. Nothing has to notice a
@@ -32,7 +38,7 @@ FEEDER_TIER = "starter"
 
 FEED_WINDOW_DAYS = int(os.getenv("FEED_WINDOW_DAYS", "7"))
 FEED_DAYS_NEEDED = int(os.getenv("FEED_DAYS_NEEDED", "5"))
-FEED_MINUTES_PER_DAY = int(os.getenv("FEED_MINUTES_PER_DAY", "360"))
+FEED_MINUTES_PER_DAY = int(os.getenv("FEED_MINUTES_PER_DAY", "1080"))   # 18 h: 75% of the day
 # Days of history kept on the account: the window, and a little to look back on.
 FEED_DAYS_KEPT = 14
 # Heartbeats arrive once a minute. Two inside this many seconds count once,
@@ -99,19 +105,19 @@ def fed_days(feed) -> set:
     return days
 
 
+def window(on: date) -> list:
+    """The days the rule looks at on `on`: the FEED_WINDOW_DAYS days before it."""
+    return [on - timedelta(days=back) for back in range(1, FEED_WINDOW_DAYS + 1)]
+
+
 def days_counted(feed, on: date) -> int:
-    """Days in the window ending on `on` that count: fed, or credited as before the first feed."""
+    """Days in the window before `on` that count: fed, or credited as before the first feed."""
     f = _clean(feed)
     since = _day(f["since"])
     if since is None:
         return 0
     fed = fed_days(f)
-    n = 0
-    for back in range(FEED_WINDOW_DAYS):
-        d = on - timedelta(days=back)
-        if d in fed or d < since:
-            n += 1
-    return n
+    return sum(1 for d in window(on) if d in fed or d < since)
 
 
 def qualifies(feed, on: date) -> bool:
@@ -136,10 +142,9 @@ def feeder_summary(feed, now: datetime) -> dict:
     f = _clean(feed)
     today = now.date()
     fed = fed_days(f)
-    window = [today - timedelta(days=b) for b in range(FEED_WINDOW_DAYS)]
     until = valid_until(f, today)
     return {
-        "days_fed": sum(1 for d in window if d in fed),
+        "days_fed": sum(1 for d in window(today) if d in fed),
         "days_counted": days_counted(f, today),
         "days_needed": FEED_DAYS_NEEDED,
         "window_days": FEED_WINDOW_DAYS,

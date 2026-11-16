@@ -1,6 +1,6 @@
-"""The free plan for feeding adsb.lol: a receiver that was feeding on 5 of the
-last 7 days has the plan, a new feeder has it from its first heartbeat, and a
-paid plan is never touched.
+"""The free plan for feeding adsb.lol: a receiver that fed for 18 hours on 5 of
+the 7 days before today has the plan, a new feeder has it from its first
+heartbeat, and a paid plan is never touched.
 
 The rule itself is checked on plain data; the rest uses the app and throwaway
 database set up in test_api_integration (whose fixture gives the test account
@@ -48,25 +48,43 @@ def test_a_new_feeder_has_the_plan_from_its_first_minute():
     feed = feeder.record_feed_minute(None, datetime(2026, 11, 20, 14, 0))
     assert feed["since"] == "2026-11-20"
     assert feeder.qualifies(feed, DAY)
-    # ...and keeps it for two more days if the receiver is then unplugged
-    assert feeder.valid_until(feed, DAY) == DAY + timedelta(days=2)
-    assert not feeder.qualifies(feed, DAY + timedelta(days=3))
+    # ...and keeps it for three more days if the receiver is then unplugged
+    assert feeder.valid_until(feed, DAY) == DAY + timedelta(days=3)
+    assert not feeder.qualifies(feed, DAY + timedelta(days=4))
 
 
-def test_a_steady_feeder_keeps_the_plan_two_days_past_its_last_feed():
+def test_a_steady_feeder_keeps_the_plan_three_days_past_its_last_feed():
     days = {DAY - timedelta(days=n): 1440 for n in range(10)}
     feed = _record(DAY - timedelta(days=40), days)
     assert feeder.days_counted(feed, DAY) == 7
-    assert feeder.valid_until(feed, DAY) == DAY + timedelta(days=2)
+    assert feeder.valid_until(feed, DAY) == DAY + timedelta(days=3)
+
+
+def test_a_day_is_eighteen_hours():
+    assert FULL == 18 * 60
 
 
 def test_five_days_in_seven_is_enough_and_four_is_not():
     since = DAY - timedelta(days=40)
-    five = _record(since, {DAY - timedelta(days=n): FULL for n in (0, 1, 3, 4, 6)})
+    five = _record(since, {DAY - timedelta(days=n): FULL for n in (1, 2, 4, 5, 7)})
     assert feeder.qualifies(five, DAY)
-    four = _record(since, {DAY - timedelta(days=n): FULL for n in (0, 1, 3, 4)})
+    four = _record(since, {DAY - timedelta(days=n): FULL for n in (1, 2, 4, 5)})
     assert not feeder.qualifies(four, DAY)
     assert feeder.valid_until(four, DAY) is None
+
+
+def test_today_is_judged_tomorrow():
+    """Two missed days are allowed, and that must hold at one minute past
+    midnight too: today's hours are not in yet and must not be held against it."""
+    since = DAY - timedelta(days=40)
+    feed = _record(since, {DAY - timedelta(days=n): FULL for n in (1, 2, 3, 6, 7)})
+    assert feeder.qualifies(feed, DAY)                      # nothing fed today yet
+    # ...and a full day today cannot make up for a week that fell short
+    short = _record(since, {DAY - timedelta(days=n): FULL for n in (0, 1, 2, 3)})
+    assert not feeder.qualifies(short, DAY)
+    assert feeder.qualifies(short, DAY + timedelta(days=1)) is False
+    short["days"][_iso(DAY - timedelta(days=4))] = FULL
+    assert feeder.qualifies(short, DAY + timedelta(days=1))
 
 
 def test_a_day_needs_its_hours_except_the_very_first():
@@ -80,11 +98,12 @@ def test_a_day_needs_its_hours_except_the_very_first():
 
 def test_the_starting_credit_is_given_once():
     """Someone who fed for a day long ago and comes back has to feed five days again."""
+    tomorrow = DAY + timedelta(days=1)
     back = _record(DAY - timedelta(days=60), {DAY: FULL})
-    assert feeder.days_counted(back, DAY) == 1
-    assert not feeder.qualifies(back, DAY)
+    assert feeder.days_counted(back, tomorrow) == 1
+    assert not feeder.qualifies(back, tomorrow)
     back["days"].update({_iso(DAY - timedelta(days=n)): FULL for n in range(1, 5)})
-    assert feeder.qualifies(back, DAY)
+    assert feeder.qualifies(back, tomorrow)
 
 
 def test_heartbeats_close_together_count_once_and_old_days_are_dropped():
