@@ -312,6 +312,15 @@ def test_the_admin_list_shows_feeders_and_refused_attempts():
     assert {r["email"] for r in row["refused"]} == {"other@example.com"}
 
 
+def test_an_email_no_longer_gets_anyone_a_device_key():
+    user = _user()
+    user.gs_device_key = "f" * 64
+    db.commit()
+    res = client.post("/api/ground/claim", json={"email": "pilot@example.com"})
+    assert res.status_code == 410
+    assert "f" * 64 not in res.text
+
+
 # ── a receiver on an account without a plan ──────────────────────────────────
 
 def test_a_receiver_can_sign_in_without_a_plan():

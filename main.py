@@ -1097,30 +1097,15 @@ async def ground_positions_post(
 
 @app.post("/api/ground/claim")
 @limiter.limit("10/minute")
-async def ground_claim(
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    """
-    Called by a Pi on first boot after connecting to WiFi.
-    Takes the user's email and returns their GS device key if GS is enabled.
-    No auth required — the device key is the credential returned, not input.
-    """
-    body = await request.json()
-    email = body.get("email", "").lower().strip()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email required")
-
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not gs_allowed(user, db):
-        raise HTTPException(status_code=403, detail="Ground station not enabled for this account")
-
-    if not user.gs_device_key:
-        import secrets
-        user.gs_device_key = secrets.token_hex(32)
-        db.commit()
-
-    return {"gs_device_key": user.gs_device_key}
+async def ground_claim(request: Request):
+    """Retired. Kits used to call this on first boot with the buyer's email
+    and were given the account's device key, which meant anyone who knew an
+    email could get that key. A receiver is now set up with the key itself:
+    the install command on the Ground Station page."""
+    raise HTTPException(
+        status_code=410,
+        detail="This setup method has been retired. Use the install command on finalpingapp.com/app/ground-station",
+    )
 
 
 @app.post("/api/admin/grant-ground-station")
