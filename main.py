@@ -156,7 +156,8 @@ LICENSE_DURATION_DAYS = 30
 # webhook time to arrive and extend the license before users go dark.
 from plans import LICENSE_GRACE_PERIOD, live_license, plan_tier, sms_over_limit  # noqa: E402
 from feeder import (  # noqa: E402
-    feeder_summary, is_feeder_license, record_feed_minute, sync_feeder_license,
+    claim_devices, device_status, feeder_summary, is_feeder_license, record_feed_minute,
+    sync_feeder_license,
 )
 
 import ground_state as _gs
@@ -839,7 +840,9 @@ async def ground_heartbeat(request: Request, current_user: User = Depends(get_gr
     an empty body, which leaves whatever is stored untouched.
 
     Agents from 3.9 on say whether adsb.lol can see their feed. Each heartbeat
-    that says yes counts a minute towards the free plan for feeding.
+    that says yes counts a minute towards the free plan for feeding, provided
+    the receiver also says which machine it is (4.0 on) and that machine is
+    not already earning for another account.
     """
     now = datetime.utcnow()
     _gs.ground_last_seen[str(current_user.id)] = now
@@ -864,11 +867,12 @@ async def ground_heartbeat(request: Request, current_user: User = Depends(get_gr
     # recorded, and never able to fail it.
     if stats is not None and stats.get("feeding") is True:
         try:
-            feed = record_feed_minute(read_optional_column(db, current_user, "gs_feed"), now)
-            current_user.gs_feed = feed
-            db.commit()
-            if sync_feeder_license(db, current_user, feed, now):
-                await tracker.update_user_aircraft(str(current_user.id), db)
+            if claim_devices(db, current_user, stats.get("hw"), stats.get("feed_id"), stats.get("hw_model"), now):
+                feed = record_feed_minute(read_optional_column(db, current_user, "gs_feed"), now)
+                current_user.gs_feed = feed
+                db.commit()
+                if sync_feeder_license(db, current_user, feed, now):
+                    await tracker.update_user_aircraft(str(current_user.id), db)
         except Exception as e:
             db.rollback()
             logger.warning("Could not record feeding for %s: %s", current_user.id, e)
@@ -904,17 +908,28 @@ async def ground_status(current_user: User = Depends(get_ground_user), db: Sessi
         # /api/ground/key when the person asks to see or copy it.
         "gs_key_hint": _key_hint(getattr(current_user, 'gs_device_key', None)),
         # Reported by agents 3.7+ with each heartbeat; None for older agents.
-        "stats": read_optional_column(db, current_user, "gs_stats"),
+        # The receiver's ids stay on the server: the page has no use for them.
+        "stats": _shown_stats(read_optional_column(db, current_user, "gs_stats")),
         # Where the account stands on the free plan for feeding adsb.lol.
         "feeder": _feeder_status(db, current_user),
     }
 
 
+def _shown_stats(stats):
+    if not isinstance(stats, dict):
+        return stats
+    return {k: v for k, v in stats.items() if k not in ("hw", "feed_id")}
+
+
 def _feeder_status(db, user) -> dict:
-    out = feeder_summary(read_optional_column(db, user, "gs_feed"), datetime.utcnow())
+    now = datetime.utcnow()
+    out = feeder_summary(read_optional_column(db, user, "gs_feed"), now)
     lic = live_license(db, user)
     # "feeder": the plan is the free one. "paid": a paid plan, which wins.
     out["plan"] = "feeder" if is_feeder_license(lic) else ("paid" if lic is not None else "none")
+    # The receiver last heard from: its model, and whether it can earn for
+    # this account (False when it is already earning for another).
+    out["device"] = device_status(db, user, read_optional_column(db, user, "gs_stats"), now)
     return out
 
 
@@ -2807,6 +2822,63 @@ async def list_ground_devices(request: Request, db: Session = Depends(get_db)):
         })
 
     return {"devices": result}
+
+
+@app.get("/api/internal/feeders")
+async def list_feeders(request: Request, db: Session = Depends(get_db)):
+    """Every account with a receiver that has fed adsb.lol, for the admin
+    panel: where each stands on the free plan, which receivers it earns with,
+    and any other account that tried to earn with the same receiver."""
+    if not _valid_internal_secret(request.headers.get("x-internal-secret")):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    from models import FeederDevice
+
+    now = datetime.utcnow()
+    devices = db.query(FeederDevice).all()
+    by_user = {}
+    for d in devices:
+        by_user.setdefault(d.user_id, []).append(d)
+    wanted = set(by_user) | {d.refused_user_id for d in devices if d.refused_user_id}
+    users = {u.id: u for u in db.query(User).filter(User.id.in_(wanted)).all()} if wanted else {}
+
+    feeders = []
+    for user_id, rows in by_user.items():
+        u = users.get(user_id)
+        if u is None:
+            continue
+        summary = feeder_summary(read_optional_column(db, u, "gs_feed"), now)
+        stats = read_optional_column(db, u, "gs_stats") or {}
+        lic = live_license(db, u)
+        last_seen = _gs.ground_last_seen.get(str(u.id)) or getattr(u, "gs_last_heartbeat", None)
+        feeders.append({
+            "email": u.email,
+            "plan": "feeder" if is_feeder_license(lic) else ("paid" if lic is not None else "none"),
+            "qualifies": summary["qualifies"],
+            "days_counted": summary["days_counted"],
+            "days_needed": summary["days_needed"],
+            "window_days": summary["window_days"],
+            "minutes_today": summary["minutes_today"],
+            "since": summary["since"],
+            "valid_until": summary["valid_until"],
+            "online": last_seen is not None and (now - last_seen).total_seconds() < 90,
+            "last_seen": last_seen.isoformat() if last_seen else None,
+            "version": stats.get("version"),
+            "feeding": stats.get("feeding"),
+            "model": next((r.model for r in rows if r.model), None),
+            "devices": sorted(
+                ({"kind": r.id.split(":", 1)[0], "id": r.id.split(":", 1)[1][:10],
+                  "first_seen": r.first_seen.isoformat() if r.first_seen else None,
+                  "last_seen": r.last_seen.isoformat() if r.last_seen else None} for r in rows),
+                key=lambda x: x["kind"], reverse=True),
+            # Another account that tried to earn with one of these receivers.
+            "refused": [
+                {"email": users[r.refused_user_id].email if r.refused_user_id in users else "(deleted account)",
+                 "kind": r.id.split(":", 1)[0], "at": r.refused_at.isoformat() if r.refused_at else None}
+                for r in rows if r.refused_user_id
+            ],
+        })
+    feeders.sort(key=lambda f: (f["plan"] != "feeder", f["email"]))
+    return {"feeders": feeders}
 
 
 @app.post("/api/internal/push-display-name", status_code=204)

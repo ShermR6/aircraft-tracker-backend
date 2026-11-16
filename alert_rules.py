@@ -206,4 +206,15 @@ def clean_gs_stats(body) -> Optional[dict]:
     # means the agent does not know, which is not the same as "no".
     if isinstance(body.get("feeding"), bool):
         out["feeding"] = body["feeding"]
+    # 4.0+: which receiver this is (hashes of the machine's serial and of its
+    # adsb.lol feeder id), and why it is not feeding when it is not.
+    for key in ("hw", "feed_id"):
+        value = body.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{16,64}", value):
+            out[key] = value
+    model = body.get("hw_model")
+    if isinstance(model, str) and 0 < len(model) <= 60 and model.isprintable():
+        out["hw_model"] = model
+    if body.get("feed_why") in ("no_feed_client", "not_connected", "no_data"):
+        out["feed_why"] = body["feed_why"]
     return out or None

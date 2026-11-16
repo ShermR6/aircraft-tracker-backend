@@ -38,8 +38,20 @@ def _user():
     return db.get(api.User, USER_ID)
 
 
-def _feeding_heartbeat(feeding=True):
-    return client.post("/api/ground/heartbeat", json={"version": "3.9", "uptime_s": 60, "feeding": feeding})
+HW, FEED = "a" * 32, "b" * 32
+PI = "Raspberry Pi Zero 2 W Rev 1.0"
+
+
+def _feeding_heartbeat(feeding=True, hw=HW, feed_id=FEED):
+    return client.post("/api/ground/heartbeat", json={
+        "version": "4.0", "uptime_s": 60, "feeding": feeding, "hw": hw, "feed_id": feed_id, "hw_model": PI})
+
+
+def _as_other():
+    """Heartbeats come from the other account until the returned undo is called."""
+    was = main.app.dependency_overrides[main.get_ground_user]
+    main.app.dependency_overrides[main.get_ground_user] = lambda: db.get(api.User, api.OTHER_ID)
+    return lambda: main.app.dependency_overrides.__setitem__(main.get_ground_user, was)
 
 
 # ── the rule ─────────────────────────────────────────────────────────────────
@@ -169,8 +181,9 @@ def test_user_me_reports_the_feeder_plan_without_an_end_date(monkeypatch):
 
 def test_a_receiver_that_is_not_feeding_earns_nothing():
     api._drop_plan()
-    for body in ({"version": "3.9", "feeding": False}, {"version": "3.8"}, {"version": "3.9", "feeding": None},
-                 {"version": "3.9", "feeding": "yes"}):
+    ids = {"hw": HW, "feed_id": FEED}
+    for body in ({"version": "4.0", "feeding": False, **ids}, {"version": "3.8"}, {"version": "4.0", "feeding": None, **ids},
+                 {"version": "4.0", "feeding": "yes", **ids}):
         assert client.post("/api/ground/heartbeat", json=body).status_code == 200
     assert _user().license_id is None
     assert client.get("/api/ground/status").json()["feeder"]["plan"] == "none"
@@ -229,6 +242,74 @@ def test_the_feeder_plan_gets_no_grace_period():
     lic.expires_at = datetime.utcnow() - timedelta(hours=1)
     db.commit()
     assert main.live_license(db, _user()) is None
+
+
+# ── one receiver, one account ────────────────────────────────────────────────
+
+def test_a_receiver_that_does_not_say_which_machine_it_is_earns_nothing():
+    """Agents before 4.0, and anything that leaves the ids out."""
+    api._drop_plan()
+    for body in ({"version": "3.9", "feeding": True}, {"version": "4.0", "feeding": True, "hw": HW},
+                 {"version": "4.0", "feeding": True, "feed_id": FEED}, {"version": "4.0", "feeding": True, "hw": "nope", "feed_id": FEED}):
+        assert client.post("/api/ground/heartbeat", json=body).status_code == 200
+    assert _user().license_id is None
+    assert client.get("/api/ground/status").json()["feeder"]["plan"] == "none"
+
+
+def test_the_same_receiver_earns_for_one_account_only():
+    api._drop_plan()
+    assert _feeding_heartbeat().status_code == 200
+    assert client.get("/api/ground/status").json()["feeder"]["device"] == {"model": PI, "linked": True, "why": None}
+
+    undo = _as_other()
+    try:
+        # the same Pi, and then the same feed behind a different machine id
+        assert _feeding_heartbeat().status_code == 200
+        assert _feeding_heartbeat(hw="c" * 32).status_code == 200
+        other = db.get(api.User, api.OTHER_ID)
+        assert other.license_id is None and not other.gs_feed
+        status = client.get("/api/ground/status").json()
+        assert status["feeder"]["plan"] == "none" and status["feeder"]["device"]["linked"] is False
+        assert "hw" not in status["stats"] and "feed_id" not in status["stats"]
+        # a receiver of their own does earn
+        assert _feeding_heartbeat(hw="d" * 32, feed_id="e" * 32).status_code == 200
+        assert client.get("/api/ground/status").json()["feeder"]["plan"] == "feeder"
+    finally:
+        undo()
+
+
+def test_a_receiver_left_unused_moves_to_whoever_feeds_with_it_next():
+    api._drop_plan()
+    _feeding_heartbeat()
+    for row in db.query(feeder.FeederDevice).all():
+        row.last_seen = datetime.utcnow() - timedelta(days=feeder.DEVICE_RELEASE_DAYS + 1)
+    db.commit()
+    undo = _as_other()
+    try:
+        _feeding_heartbeat()
+        assert client.get("/api/ground/status").json()["feeder"]["plan"] == "feeder"
+    finally:
+        undo()
+    owners = {row.user_id for row in db.query(feeder.FeederDevice).all()}
+    assert owners == {api.OTHER_ID}
+
+
+def test_the_admin_list_shows_feeders_and_refused_attempts():
+    api._drop_plan()
+    _feeding_heartbeat()
+    undo = _as_other()
+    try:
+        _feeding_heartbeat()
+    finally:
+        undo()
+    assert client.get("/api/internal/feeders").status_code == 403
+    res = client.get("/api/internal/feeders", headers={"x-internal-secret": "test-internal"})
+    assert res.status_code == 200
+    [row] = res.json()["feeders"]
+    assert row["email"] == "pilot@example.com" and row["plan"] == "feeder" and row["model"] == PI
+    assert [d["kind"] for d in row["devices"]] == ["hw", "feed"]
+    assert all(len(d["id"]) == 10 for d in row["devices"])
+    assert {r["email"] for r in row["refused"]} == {"other@example.com"}
 
 
 # ── a receiver on an account without a plan ──────────────────────────────────

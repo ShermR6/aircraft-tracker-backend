@@ -63,29 +63,125 @@ class _Reply:
         return self._body
 
 
-def _feed_reset():
-    g._feed.update(feeding=None, at=0.0, checked=0.0)
+MINE = "abcd1234-ef56-7890-aaaa-bbbbccccdddd"
+SHOWN = "abcd1234-ef56-..."          # adsb.lol shows only the start of an id
 
 
-def test_feeding_is_what_adsblol_says(monkeypatch):
-    _feed_reset()
-    monkeypatch.setattr(g.requests, "get", lambda *a, **k: _Reply({"clients": {"beast": [{"kbps": 1}], "mlat": []}}))
+def _feed_reset(monkeypatch=None, mine=MINE):
+    g._feed.update(feeding=None, at=0.0, checked=0.0, why=None, traffic_at=None)
+    if monkeypatch is not None:
+        monkeypatch.setattr(g, "feeder_id", lambda: mine)
+
+
+def _me(*beast):
+    return lambda *a, **k: _Reply({"clients": {"beast": list(beast), "mlat": []}})
+
+
+def _client(uuid=SHOWN, rate=3.5):
+    return {"uuid": uuid, "messages_per_second": rate, "kbps": 0.1}
+
+
+def test_feeding_is_this_machines_own_feed_carrying_data(monkeypatch):
+    _feed_reset(monkeypatch)
+    monkeypatch.setattr(g.requests, "get", _me(_client()))
     assert g.check_feed(1000.0) is True
-    assert g.heartbeat_stats(g.START_TIME + 5, 0)["feeding"] is True
-    monkeypatch.setattr(g.requests, "get", lambda *a, **k: _Reply({"clients": {"beast": [], "mlat": []}}))
+    stats = g.heartbeat_stats(g.START_TIME + 5, 0)
+    assert stats["feeding"] is True and stats["feed_why"] is None
+    monkeypatch.setattr(g.requests, "get", _me())
     assert g.check_feed(2000.0) is False
+    assert g.heartbeat_stats(g.START_TIME + 5, 0)["feed_why"] == "not_connected"
 
 
-def test_adsblol_not_answering_keeps_the_last_answer_for_an_hour(monkeypatch):
-    _feed_reset()
-    monkeypatch.setattr(g.requests, "get", lambda *a, **k: _Reply({"clients": {"beast": [{}]}}))
+def test_another_feeder_on_the_same_network_does_not_count(monkeypatch):
+    _feed_reset(monkeypatch)
+    monkeypatch.setattr(g.requests, "get", _me(_client(uuid="99999999-0000-..."), {"kbps": 1}, "junk"))
+    assert g.check_feed(1000.0) is False
+    assert g._feed["why"] == "not_connected"
+
+
+def test_a_machine_with_no_feed_client_is_not_feeding(monkeypatch):
+    _feed_reset(monkeypatch, mine=None)
+    monkeypatch.setattr(g.requests, "get", _me(_client()))
+    assert g.check_feed(1000.0) is False
+    assert g._feed["why"] == "no_feed_client"
+    assert g.heartbeat_stats(g.START_TIME + 5, 0)["feed_id"] is None
+
+
+def test_a_connected_feed_with_no_radio_behind_it_is_not_feeding(monkeypatch):
+    _feed_reset(monkeypatch)
+    monkeypatch.setattr(g.requests, "get", _me(_client(rate=0)))
+    assert g.check_feed(1000.0) is False
+    assert g._feed["why"] == "no_data"
+    monkeypatch.setattr(g.requests, "get", _me(_client(rate=True)))     # not a number
+    assert g.check_feed(1100.0) is False
+
+
+def test_a_quiet_spell_still_counts_but_not_for_ever(monkeypatch):
+    _feed_reset(monkeypatch)
+    monkeypatch.setattr(g.requests, "get", _me(_client(rate=2.0)))
+    assert g.check_feed(1000.0) is True
+    monkeypatch.setattr(g.requests, "get", _me(_client(rate=0)))
+    assert g.check_feed(1000.0 + g.FEED_QUIET_ALLOWED_S - 60) is True
+    assert g.check_feed(1000.0 + g.FEED_QUIET_ALLOWED_S + 60) is False
+    assert g._feed["why"] == "no_data"
+
+
+def test_the_receiver_says_which_machine_it_is_without_sending_the_serial(monkeypatch):
+    files = {
+        "/sys/firmware/devicetree/base/serial-number": "10000000abcdef01",
+        "/sys/firmware/devicetree/base/model": "Raspberry Pi Zero 2 W Rev 1.0",
+        g.ADSBLOL_UUID_FILE: MINE + "\n",
+    }
+    monkeypatch.setattr(g, "_read", lambda path: files.get(path, "").strip())
+    monkeypatch.setattr(g, "_hardware", None)
+    hw, model = g.hardware()
+    assert model == "Raspberry Pi Zero 2 W Rev 1.0"
+    assert len(hw) == 32 and "abcdef01" not in hw
+    assert g.hardware() == (hw, model)                      # the same every time
+    assert g.feeder_id() == MINE
+    stats = g.heartbeat_stats(g.START_TIME + 5, 0)
+    assert stats["hw"] == hw and stats["hw_model"] == model
+    assert len(stats["feed_id"]) == 32 and MINE[:8] not in stats["feed_id"]
+
+    # not a Pi: the system's machine id stands in
+    files.pop("/sys/firmware/devicetree/base/serial-number")
+    files.pop("/sys/firmware/devicetree/base/model")
+    files["/etc/machine-id"] = "0123456789abcdef0123456789abcdef"
+    monkeypatch.setattr(g, "_hardware", None)
+    other, other_model = g.hardware()
+    assert other and other != hw and other_model
+    # nothing to go on at all
+    files.pop("/etc/machine-id")
+    monkeypatch.setattr(g, "_hardware", None)
+    assert g.hardware() == (None, None)
+    monkeypatch.setattr(g, "_hardware", None)
+
+
+def test_the_feed_is_asked_about_in_the_background(monkeypatch):
+    _feed_reset(monkeypatch)
+    g._feed.pop("busy", None)
+    monkeypatch.setattr(g.requests, "get", _me(_client()))
+    assert g.feed_check_due(5000.0)
+    t = g.start_feed_check(5000.0)
+    t.join(5)
+    assert g._feed["feeding"] is True and not g._feed["busy"]
+    assert not g.feed_check_due(5000.0 + 30)                 # asked a moment ago
+    # one question at a time
+    g._feed["busy"] = True
+    assert g.start_feed_check(9000.0) is None and not g.feed_check_due(99999.0)
+    g._feed["busy"] = False
+
+
+def test_adsblol_not_answering_keeps_the_last_answer_for_a_while(monkeypatch):
+    _feed_reset(monkeypatch)
+    monkeypatch.setattr(g.requests, "get", _me(_client()))
     assert g.check_feed(1000.0) is True
 
     def down(*a, **k):
         raise g.requests.ConnectionError("no route")
 
     monkeypatch.setattr(g.requests, "get", down)
-    assert g.check_feed(1000.0 + 1800) is True
+    assert g.check_feed(1000.0 + g.FEED_ANSWER_KEPT_S - 60) is True
     assert g.check_feed(1000.0 + g.FEED_ANSWER_KEPT_S + 1) is None
     monkeypatch.setattr(g.requests, "get", lambda *a, **k: _Reply({}, status=503))
     assert g.check_feed(9000.0) is None

@@ -6,8 +6,9 @@ Reads live ADS-B data from the decoder on this machine (readsb or dump1090)
 and sends the positions of the account's aircraft to FinalPing. Signs in with
 the account's device key: no email or password is stored here.
 
-It also reports whether adsb.lol can see a feed from this receiver, which is
-what the free plan for feeding is worked out from.
+It also reports whether adsb.lol is getting data from this machine's own feed,
+and which machine this is, which is what the free plan for feeding is worked
+out from: one receiver earns the plan for one account.
 
 Data source priority: HTTP JSON API → aircraft.json on disk → SBS TCP stream (port 30003)
 
@@ -16,8 +17,11 @@ Setup, one command (the device key is on finalpingapp.com/app/ground-station):
 Or by hand: put {"token": "YOUR_DEVICE_KEY"} in config.json next to this file.
 """
 
+import hashlib
 import json
 import os
+import platform
+import re
 import socket
 import sys
 import threading
@@ -26,7 +30,7 @@ import requests
 from datetime import datetime, timedelta
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "3.9"
+VERSION    = "4.0"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -56,13 +60,21 @@ CONFIG_RETRY_NO_AIRPORT = 120
 # that has stopped: its positions are not where anything is.
 STALE_FILE_S = 60
 
-# adsb.lol answers this with the feeds it has from the caller's own network.
+# adsb.lol answers this with the feeds it has from the caller's own network,
+# each with the start of its feeder id and how much it is sending.
 ADSBLOL_ME_URL = "https://api.adsb.lol/0/me"
+# This machine's own feeder id, written by adsb.lol's feed client.
+ADSBLOL_UUID_FILE = "/usr/local/share/adsblol/adsblol-uuid"
+# A quiet field can go hours with nothing in range. A feed that carried
+# traffic this recently still counts for as long as it stays connected.
+FEED_QUIET_ALLOWED_S = 6 * 3600
 FEED_CHECK_INTERVAL = 600        # while feeding
 FEED_RECHECK_INTERVAL = 120      # while not, so a new feed shows up quickly
 # adsb.lol not answering is not the feed being down: the last answer stands
 # for this long before it becomes "unknown".
-FEED_ANSWER_KEPT_S = 3600
+FEED_ANSWER_KEPT_S = 3 * 3600
+# adsb.lol can take a quarter of a minute to answer when it is busy.
+FEED_ASK_TIMEOUT_S = 40
 ADSBLOL_FEED_CONFIG = "/etc/default/adsblol"
 # Consecutive heartbeat failures before we stop assuming it is the network
 # and go re-check our credentials.
@@ -130,35 +142,118 @@ def message_rate(now):
 
 
 # ── adsb.lol feed ─────────────────────────────────────────────────────────────
-_feed = {"feeding": None, "at": 0.0, "checked": 0.0}
+# feeding: adsb.lol's answer. why: when it is False, which of FEED_WHY.
+# traffic_at: when this machine's feed last carried messages.
+_feed = {"feeding": None, "at": 0.0, "checked": 0.0, "why": None, "traffic_at": None}
+FEED_WHY = {
+    "no_feed_client": "[WARN] No adsb.lol feed client on this machine. Run the FinalPing installer again to add it",
+    "not_connected": "[WARN] adsb.lol has no feed from this machine yet",
+    "no_data": "[WARN] The adsb.lol feed is connected but carries no data. Is the radio plugged in?",
+}
+
+
+def _read(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().strip(b"\x00 \r\n\t").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def feeder_id():
+    """This machine's own adsb.lol feeder id, or None when it has no feed client."""
+    value = _read(ADSBLOL_UUID_FILE).lower()
+    return value if re.fullmatch(r"[0-9a-f-]{16,64}", value) else None
+
+
+_hardware = None
+
+
+def hardware():
+    """(id, model) of this machine. The id is a hash of the Raspberry Pi's
+    serial number (or the system's machine id elsewhere): the same every
+    time, and the serial itself never leaves the machine."""
+    global _hardware
+    if _hardware is None:
+        serial = _read("/sys/firmware/devicetree/base/serial-number")
+        model = _read("/sys/firmware/devicetree/base/model")
+        raw = ("pi:" + serial) if serial.strip("0") else ("machine:" + _read("/etc/machine-id"))
+        if raw in ("pi:", "machine:"):
+            _hardware = (None, None)
+        else:
+            ident = hashlib.sha256(("finalping-hw:" + raw).encode()).hexdigest()[:32]
+            _hardware = (ident, (model or f"{platform.system()} {platform.machine()}")[:60])
+    return _hardware
+
+
+def _own_client(clients, mine):
+    """The entry in adsb.lol's list that is this machine's feed. adsb.lol
+    shows only the start of each feeder id."""
+    for c in clients if isinstance(clients, list) else []:
+        if not isinstance(c, dict):
+            continue
+        shown = re.match(r"[0-9a-f-]*", str(c.get("uuid") or "").lower()).group(0).rstrip("-")
+        if len(shown) >= 8 and mine.startswith(shown):
+            return c
+    return None
 
 
 def check_feed(now):
-    """Ask adsb.lol whether it has a feed from this network.
+    """Ask adsb.lol whether it is getting data from this machine's own feed.
 
-    True or False is adsb.lol's own answer. None means it could not be asked
-    for over an hour, which the backend counts as neither.
+    Another feeder on the same network does not count, and neither does a
+    feed client that is connected with no radio behind it. True or False is
+    adsb.lol's own answer. None means it could not be asked for over an hour,
+    which the backend counts as neither.
     """
     _feed["checked"] = now
     try:
-        r = requests.get(ADSBLOL_ME_URL, timeout=10)
+        r = requests.get(ADSBLOL_ME_URL, timeout=FEED_ASK_TIMEOUT_S)
         r.raise_for_status()
         clients = r.json().get("clients") or {}
-        feeding = bool(clients.get("beast"))
-        if feeding != _feed["feeding"]:
-            log("[OK] adsb.lol is receiving this feed" if feeding
-                else "[WARN] adsb.lol has no feed from this network yet")
-        _feed["feeding"], _feed["at"] = feeding, now
+        mine = feeder_id()
+        own = _own_client(clients.get("beast"), mine) if mine else None
+        if own is not None:
+            rate = own.get("messages_per_second")
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool) and rate > 0:
+                _feed["traffic_at"] = now
+        carried = _feed["traffic_at"] is not None and now - _feed["traffic_at"] <= FEED_QUIET_ALLOWED_S
+        feeding = own is not None and carried
+        why = None if feeding else ("no_feed_client" if not mine else "not_connected" if own is None else "no_data")
+        if feeding != _feed["feeding"] or why != _feed["why"]:
+            log("[OK] adsb.lol is receiving this machine's feed" if feeding else FEED_WHY[why])
+        _feed["feeding"], _feed["why"], _feed["at"] = feeding, why, now
     except Exception as e:
         if _feed["feeding"] is not None and now - _feed["at"] > FEED_ANSWER_KEPT_S:
-            log(f"[WARN] Could not ask adsb.lol about the feed for an hour ({e})")
-            _feed["feeding"] = None
+            log(f"[WARN] Could not ask adsb.lol about the feed for {FEED_ANSWER_KEPT_S // 3600} hours ({e})")
+            _feed["feeding"], _feed["why"] = None, None
     return _feed["feeding"]
 
 
 def feed_check_due(now):
+    if _feed.get("busy"):
+        return False
     wait = FEED_CHECK_INTERVAL if _feed["feeding"] else FEED_RECHECK_INTERVAL
     return now - _feed["checked"] >= wait
+
+
+def start_feed_check(now):
+    """Ask adsb.lol in the background. It can be slow to answer, and sending
+    positions must never wait for it."""
+    if _feed.get("busy"):
+        return None
+    _feed["busy"] = True
+    _feed["checked"] = now
+
+    def ask():
+        try:
+            check_feed(now)
+        finally:
+            _feed["busy"] = False
+
+    t = threading.Thread(target=ask, daemon=True)
+    t.start()
+    return t
 
 
 def heartbeat_stats(now, aircraft_count):
@@ -168,7 +263,18 @@ def heartbeat_stats(now, aircraft_count):
         "msg_rate": message_rate(now),
         "aircraft_count": aircraft_count,
         "feeding": _feed["feeding"],
+        "feed_why": _feed["why"],
+        # Which receiver this is, so one receiver earns the free plan for one
+        # account. Both are hashes: neither the serial nor the feeder id is sent.
+        "hw": hardware()[0],
+        "hw_model": hardware()[1],
+        "feed_id": _feed_hash(),
     }
+
+
+def _feed_hash():
+    mine = feeder_id()
+    return hashlib.sha256(("finalping-feed:" + mine).encode()).hexdigest()[:32] if mine else None
 
 
 def log(msg):
@@ -672,7 +778,7 @@ def run():
             last_config_refresh = now
 
         if feed_check_due(now):
-            check_feed(now)
+            start_feed_check(now)
 
         if now - last_heartbeat >= HEARTBEAT_INTERVAL:
             try:

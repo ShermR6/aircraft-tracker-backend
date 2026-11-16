@@ -16,13 +16,19 @@ moves forward a day at a time, so the receiver has to keep feeding every week.
     heartbeat and keeps it by continuing to feed. That credit is given once
     per account.
 
+One receiver earns the plan for one account. A receiver (agent 4.0+) says
+which machine it is and which adsb.lol feed is its own, and counts as feeding
+only while adsb.lol is getting data from that very feed. The first account a
+machine or a feed earns minutes for keeps it (claim_devices): the same Pi
+under a second account earns that account nothing.
+
 The plan is an ordinary licence row (key FP-FEEDER-...), dated to the last day
 the rule would still hold if the receiver stopped now. Nothing has to notice a
 receiver going quiet: the date passes and the account is on no plan. A paid
 plan always wins; the feeder licence is only attached when there is no other.
 
 This is what the receiver reports about itself. It is not proof: someone
-could send the heartbeats by hand. It is the same trust the rest of the
+could send the heartbeats by hand, with made-up ids. It is the same trust the rest of the
 Ground Station API places in a device key.
 """
 
@@ -31,7 +37,7 @@ import os
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from models import License
+from models import FeederDevice, License
 
 FEEDER_KEY_PREFIX = "FP-FEEDER-"
 FEEDER_TIER = "starter"
@@ -44,6 +50,62 @@ FEED_DAYS_KEPT = 14
 # Heartbeats arrive once a minute. Two inside this many seconds count once,
 # so a restarting receiver cannot run a day's minutes up early.
 FEED_MIN_GAP_SECONDS = 45
+
+
+# A receiver nobody has fed with for this long is free to earn for another
+# account: it was sold on, or its owner moved to a different account.
+DEVICE_RELEASE_DAYS = int(os.getenv("FEED_DEVICE_RELEASE_DAYS", "14"))
+
+
+def _device_keys(hw, feed_id) -> list:
+    return [k for k in ("hw:" + hw if hw else None, "feed:" + feed_id if feed_id else None) if k]
+
+
+def _held_by_another(row, user, now: datetime) -> bool:
+    if row is None or row.user_id == user.id:
+        return False
+    return row.last_seen is not None and now - row.last_seen <= timedelta(days=DEVICE_RELEASE_DAYS)
+
+
+def claim_devices(db, user, hw, feed_id, model, now: datetime) -> bool:
+    """Whether this receiver may earn feeding minutes for this account.
+
+    Needs both ids (agents before 4.0 send neither, and earn nothing). Each is
+    taken by the first account to feed with it. When either is another
+    account's, nothing is taken and the attempt is noted for the admin list.
+    """
+    if not hw or not feed_id:
+        return False
+    rows = {key: db.query(FeederDevice).filter(FeederDevice.id == key).first() for key in _device_keys(hw, feed_id)}
+    refused = [row for row in rows.values() if _held_by_another(row, user, now)]
+    if refused:
+        for row in refused:
+            row.refused_user_id, row.refused_at = user.id, now
+        db.commit()
+        return False
+    for key, row in rows.items():
+        if row is None:
+            db.add(FeederDevice(id=key, user_id=user.id, model=model, first_seen=now, last_seen=now))
+        else:
+            if row.user_id != user.id:      # released: it moves to this account
+                row.user_id, row.first_seen = user.id, now
+                row.refused_user_id, row.refused_at = None, None
+            row.last_seen = now
+            row.model = model or row.model
+    db.commit()
+    return True
+
+
+def device_status(db, user, stats, now: datetime) -> dict:
+    """For the web app: the receiver this account last heard from, and
+    whether it can earn for this account (False: it is another account's)."""
+    stats = stats if isinstance(stats, dict) else {}
+    keys = _device_keys(stats.get("hw"), stats.get("feed_id"))
+    linked = None
+    if len(keys) == 2:
+        rows = [db.query(FeederDevice).filter(FeederDevice.id == key).first() for key in keys]
+        linked = not any(_held_by_another(row, user, now) for row in rows)
+    return {"model": stats.get("hw_model"), "linked": linked, "why": stats.get("feed_why")}
 
 
 def is_feeder_license(lic) -> bool:

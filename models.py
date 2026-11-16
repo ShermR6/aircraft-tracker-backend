@@ -53,6 +53,22 @@ class User(Base):
     airport_config = relationship("AirportConfig", back_populates="user", uselist=False, cascade="all, delete-orphan")
 
 
+class FeederDevice(Base):
+    """A receiver that has earned feeding minutes, and the one account it
+    earns them for. Two rows per receiver: the machine ("hw:...") and its
+    adsb.lol feed ("feed:..."), each a hash the receiver reports. See feeder.py."""
+    __tablename__ = "feeder_devices"
+
+    id = Column(String(48), primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    model = Column(String(80), nullable=True)
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    # The last other account that tried to earn with this receiver.
+    refused_user_id = Column(UUID(as_uuid=True), nullable=True)
+    refused_at = Column(DateTime, nullable=True)
+
+
 class License(Base):
     """License keys"""
     __tablename__ = "licenses"
