@@ -30,7 +30,7 @@ import requests
 from datetime import datetime, timedelta
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "4.0"
+VERSION    = "4.1"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -144,7 +144,10 @@ def message_rate(now):
 # ── adsb.lol feed ─────────────────────────────────────────────────────────────
 # feeding: adsb.lol's answer. why: when it is False, which of FEED_WHY.
 # traffic_at: when this machine's feed last carried messages.
-_feed = {"feeding": None, "at": 0.0, "checked": 0.0, "why": None, "traffic_at": None}
+# mlat: whether adsb.lol also has this machine's MLAT client, and mlat_peers
+# how many other receivers it is in sync with.
+_feed = {"feeding": None, "at": 0.0, "checked": 0.0, "why": None, "traffic_at": None,
+         "mlat": None, "mlat_peers": None}
 FEED_WHY = {
     "no_feed_client": "[WARN] No adsb.lol feed client on this machine. Run the FinalPing installer again to add it",
     "not_connected": "[WARN] adsb.lol has no feed from this machine yet",
@@ -223,10 +226,18 @@ def check_feed(now):
         if feeding != _feed["feeding"] or why != _feed["why"]:
             log("[OK] adsb.lol is receiving this machine's feed" if feeding else FEED_WHY[why])
         _feed["feeding"], _feed["why"], _feed["at"] = feeding, why, now
+        mlat = _own_client(clients.get("mlat"), mine) if mine else None
+        peers = mlat.get("peer_count") if mlat else None
+        if (mlat is not None) != _feed["mlat"]:
+            log("[OK] MLAT is on: adsb.lol has this machine's MLAT client" if mlat is not None
+                else "[INFO] MLAT is off: adsb.lol has no MLAT client from this machine")
+        _feed["mlat"] = mlat is not None
+        _feed["mlat_peers"] = peers if isinstance(peers, int) and not isinstance(peers, bool) and peers >= 0 else None
     except Exception as e:
         if _feed["feeding"] is not None and now - _feed["at"] > FEED_ANSWER_KEPT_S:
             log(f"[WARN] Could not ask adsb.lol about the feed for {FEED_ANSWER_KEPT_S // 3600} hours ({e})")
             _feed["feeding"], _feed["why"] = None, None
+            _feed["mlat"], _feed["mlat_peers"] = None, None
     return _feed["feeding"]
 
 
@@ -264,6 +275,8 @@ def heartbeat_stats(now, aircraft_count):
         "aircraft_count": aircraft_count,
         "feeding": _feed["feeding"],
         "feed_why": _feed["why"],
+        "mlat": _feed["mlat"],
+        "mlat_peers": _feed["mlat_peers"],
         # Which receiver this is, so one receiver earns the free plan for one
         # account. Both are hashes: neither the serial nor the feeder id is sent.
         "hw": hardware()[0],

@@ -217,4 +217,11 @@ def clean_gs_stats(body) -> Optional[dict]:
         out["hw_model"] = model
     if body.get("feed_why") in ("no_feed_client", "not_connected", "no_data"):
         out["feed_why"] = body["feed_why"]
+    # 4.1+: whether adsb.lol has the receiver's MLAT client, and how many
+    # other receivers that client is in sync with.
+    if isinstance(body.get("mlat"), bool):
+        out["mlat"] = body["mlat"]
+    peers = body.get("mlat_peers")
+    if isinstance(peers, int) and not isinstance(peers, bool) and 0 <= peers <= 10**5:
+        out["mlat_peers"] = peers
     return out or None

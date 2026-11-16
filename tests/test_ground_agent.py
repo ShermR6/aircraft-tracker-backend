@@ -68,7 +68,7 @@ SHOWN = "abcd1234-ef56-..."          # adsb.lol shows only the start of an id
 
 
 def _feed_reset(monkeypatch=None, mine=MINE):
-    g._feed.update(feeding=None, at=0.0, checked=0.0, why=None, traffic_at=None)
+    g._feed.update(feeding=None, at=0.0, checked=0.0, why=None, traffic_at=None, mlat=None, mlat_peers=None)
     if monkeypatch is not None:
         monkeypatch.setattr(g, "feeder_id", lambda: mine)
 
@@ -90,6 +90,26 @@ def test_feeding_is_this_machines_own_feed_carrying_data(monkeypatch):
     monkeypatch.setattr(g.requests, "get", _me())
     assert g.check_feed(2000.0) is False
     assert g.heartbeat_stats(g.START_TIME + 5, 0)["feed_why"] == "not_connected"
+
+
+def test_mlat_is_this_machines_own_mlat_client(monkeypatch):
+    _feed_reset(monkeypatch)
+    reply = {"clients": {"beast": [_client()], "mlat": [{"uuid": SHOWN, "peer_count": 7, "user": "x"}]}}
+    monkeypatch.setattr(g.requests, "get", lambda *a, **k: _Reply(reply))
+    g.check_feed(1000.0)
+    stats = g.heartbeat_stats(g.START_TIME + 5, 0)
+    assert stats["mlat"] is True and stats["mlat_peers"] == 7
+    # someone else's MLAT client on the same network is not this machine's
+    reply["clients"]["mlat"] = [{"uuid": "99999999-0000-...", "peer_count": 3}]
+    g.check_feed(2000.0)
+    stats = g.heartbeat_stats(g.START_TIME + 5, 0)
+    assert stats["feeding"] is True and stats["mlat"] is False and stats["mlat_peers"] is None
+    # adsb.lol not answering for hours: unknown, not "off"
+    def down(*a, **k):
+        raise OSError("no route")
+    monkeypatch.setattr(g.requests, "get", down)
+    g.check_feed(2000.0 + g.FEED_ANSWER_KEPT_S + 60)
+    assert g.heartbeat_stats(g.START_TIME + 5, 0)["mlat"] is None
 
 
 def test_another_feeder_on_the_same_network_does_not_count(monkeypatch):

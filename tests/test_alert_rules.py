@@ -163,3 +163,10 @@ def test_stats_drop_bad_values_individually():
         "version": "x" * 50, "uptime_s": -1, "msg_rate": None, "aircraft_count": True,
     }) is None
     assert r.clean_gs_stats({"uptime_s": 5, "msg_rate": float("nan")}) == {"uptime_s": 5}
+
+
+def test_mlat_state_is_kept_only_when_it_is_what_it_should_be():
+    assert r.clean_gs_stats({"mlat": True, "mlat_peers": 12}) == {"mlat": True, "mlat_peers": 12}
+    assert r.clean_gs_stats({"mlat": False, "mlat_peers": None}) == {"mlat": False}
+    assert r.clean_gs_stats({"mlat": "yes", "mlat_peers": True}) is None
+    assert r.clean_gs_stats({"mlat": None, "mlat_peers": -1}) is None
