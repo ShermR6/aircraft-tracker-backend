@@ -161,6 +161,7 @@ from feeder import (  # noqa: E402
 )
 
 import ground_state as _gs
+import flight_trails
 
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
@@ -1092,6 +1093,14 @@ async def ground_positions_post(
         _gs.ground_positions[str(current_user.id)] = positions
         _gs.ground_positions_at[str(current_user.id)] = now
         _gs.remember_fixes(str(current_user.id), positions, now)
+        # The flight so far, for the Live Map's trail: tracked aircraft only.
+        tracked = getattr(tracker.user_trackers.get(str(current_user.id)), "aircraft_to_track", {})
+        for icao, fix in positions.items():
+            if isinstance(fix, dict) and isinstance(icao, str) and (icao in tracked or icao.lower() in tracked):
+                flight_trails.record(
+                    str(current_user.id), icao, fix.get("lat"), fix.get("lon"), fix.get("on_ground"),
+                    _gs.fix_time(fix, now),
+                )
     return {"ok": True}
 
 
@@ -1672,6 +1681,29 @@ async def delete_aircraft(
     await tracker.update_user_aircraft(str(current_user.id), db)
     
     return {"message": "Aircraft deleted"}
+
+
+@app.get("/api/aircraft/trail")
+async def get_aircraft_trail(
+    tail: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Where one of the account's aircraft has flown on its current flight,
+    oldest position first: points are [latitude, longitude, unix seconds].
+    Empty when it has not been heard on this flight (or since a restart)."""
+    row = db.query(Aircraft).filter(
+        Aircraft.user_id == current_user.id,
+        Aircraft.tail_number == tail.strip().upper(),
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Aircraft not found")
+    trail = flight_trails.get(str(current_user.id), row.icao24 or "") if row.icao24 else None
+    return {
+        "tail": row.tail_number,
+        "started_at": trail["started_at"].isoformat() if trail else None,
+        "points": trail["points"] if trail else [],
+    }
 
 
 @app.get("/api/aircraft/live", response_model=List[LiveAircraftResponse])

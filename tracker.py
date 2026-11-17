@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from models import User, Aircraft, AirportConfig, AlertSetting, Integration, NotificationLog, Team, TeamChannel, TeamAlertSetting, TeamMember, TeamAirportConfig, AircraftClaim, EscalationConfig, AlertEscalation, TeamShift, TeamShiftMember, TeamDutyOverride, ExpectedArrival
 from database import SessionLocal
 import ground_state as _gs
+import flight_trails
 from alert_rules import send_channels_for_tier, routed_integrations, approach_headings, heading_allowed
 from models import read_optional_column
 from plans import live_license, plan_tier, sms_over_limit
@@ -735,6 +736,13 @@ class CloudAircraftTracker:
                     seen_icao24.add(icao24)
 
                     from_adsb = _aircraft_from_adsb(icao24, tail, adsb, tracker.config['airspace']) if adsb is not None else None
+                    # The flight so far, for the Live Map's trail. The
+                    # receiver's own fixes are added as they arrive.
+                    if from_adsb is not None and isinstance(adsb.get('seen_pos'), (int, float)) and adsb['seen_pos'] <= 60:
+                        flight_trails.record(
+                            str(user_id), icao24, from_adsb['latitude'], from_adsb['longitude'], from_adsb['on_ground'],
+                            datetime.utcnow() - timedelta(seconds=float(adsb['seen_pos'])),
+                        )
                     if ground_fix is None:
                         aircraft_dict = from_adsb
                     else:
