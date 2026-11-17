@@ -2,9 +2,10 @@
 Where each tracked aircraft has flown on its current flight, for the trail the
 Live Map draws when an aircraft is picked.
 
-Kept in memory only: a restart starts every trail again. Positions come from
-both sources the tracker uses (the account's own receiver and adsb.lol), in
-the order they were heard.
+Worked on in memory and saved to the database every tracker cycle (save),
+then read back at startup (load), so a restart or a deploy loses at most the
+last half minute. Positions come from both sources the tracker uses (the
+account's own receiver and adsb.lol), in the order they were heard.
 
 A flight is everything since the aircraft last sat on the ground for a while,
 so pattern work with touch-and-goes is one flight, and so is a taxi-back. Its
@@ -24,6 +25,8 @@ MAX_AIRCRAFT_PER_OWNER = 60
 # { owner: { icao24: trail } }. A trail: points [(epoch_seconds, lat, lon)],
 # last_at (when it was last heard), ground_since (None while airborne).
 _trails: dict = {}
+# (owner, icao24) of every trail changed since the last save.
+_dirty: set = set()
 
 
 def _number(x) -> Optional[float]:
@@ -70,6 +73,7 @@ def record(owner: str, icao24: str, lat, lon, on_ground, at: datetime) -> None:
         mine[icao24] = trail
 
     trail["last_at"] = at
+    _dirty.add((owner, icao24))
     if grounded:
         if trail["ground_since"] is None:
             trail["ground_since"] = at
@@ -115,8 +119,61 @@ def get(owner: str, icao24: str, now: datetime = None) -> Optional[dict]:
 
 
 def forget(owner: str = None) -> None:
-    """Drop one owner's trails, or all of them."""
+    """Drop one owner's trails from memory, or all of them."""
     if owner is None:
         _trails.clear()
+        _dirty.clear()
     else:
         _trails.pop(owner, None)
+        _dirty.difference_update({k for k in _dirty if k[0] == owner})
+
+
+def save(db, now: datetime = None) -> int:
+    """Write the trails changed since the last save, and delete the saved
+    ones nobody would be shown any more. Returns how many were written."""
+    from models import FlightTrailRow
+    now = now or datetime.utcnow()
+    keys = list(_dirty)
+    _dirty.clear()
+    written = 0
+    try:
+        for owner, icao24 in keys:
+            trail = _trails.get(owner, {}).get(icao24)
+            if trail is None or not trail["points"]:
+                continue
+            db.merge(FlightTrailRow(
+                owner=owner, icao24=icao24, started=trail["started"], last_at=trail["last_at"],
+                ground_since=trail["ground_since"],
+                points=[[round(t, 1), round(lat, 5), round(lon, 5)] for t, lat, lon in list(trail["points"])],
+            ))
+            written += 1
+        db.query(FlightTrailRow).filter(FlightTrailRow.last_at < now - FORGET_AFTER).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        _dirty.update(keys)
+        raise
+    return written
+
+
+def load(db, now: datetime = None) -> int:
+    """Read the saved trails back, at startup. One already in memory is left
+    alone. Returns how many were loaded."""
+    from models import FlightTrailRow
+    now = now or datetime.utcnow()
+    loaded = 0
+    for row in db.query(FlightTrailRow).filter(FlightTrailRow.last_at >= now - FORGET_AFTER).all():
+        mine = _trails.setdefault(row.owner, {})
+        if row.icao24 in mine:
+            continue
+        points = []
+        for p in row.points or []:
+            if isinstance(p, (list, tuple)) and len(p) == 3 and all(_number(x) is not None for x in p):
+                points.append((float(p[0]), float(p[1]), float(p[2])))
+        if not points:
+            continue
+        mine[row.icao24] = {"points": points, "last_at": row.last_at, "ground_since": row.ground_since, "started": row.started}
+        loaded += 1
+    for owner in [o for o, mine in _trails.items() if not mine]:
+        del _trails[owner]
+    return loaded

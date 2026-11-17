@@ -110,6 +110,19 @@ def _fresh_ground_fix(fix) -> Optional[dict]:
     return fix
 
 
+def _save_flight_trails() -> None:
+    """Flight paths for the Live Map go to the database each cycle, so a
+    restart keeps them. A failure here never stops tracking."""
+    try:
+        db = SessionLocal()
+        try:
+            flight_trails.save(db)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"Flight trails not saved: {type(e).__name__}: {e}")
+
+
 def _aircraft_from_adsb(icao24: str, tail: str, ac: dict, airspace: dict) -> dict:
     """An adsb.lol aircraft in the shape check_and_notify takes, with the
     ground detection the tracker has always used for it."""
@@ -670,6 +683,7 @@ class CloudAircraftTracker:
         while self.running:
             try:
                 await self.track_all_users()
+                _save_flight_trails()
                 _tick += 1
                 # Every 2 ticks (~60s): run escalation check + expected arrival auto-link
                 if _tick % 2 == 0:

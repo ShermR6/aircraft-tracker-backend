@@ -3257,6 +3257,16 @@ async def startup_event():
     except Exception as e:
         logger.warning("SDR range migration skipped: %s", e)
 
+    # Flight paths for the Live Map, as they were before the restart.
+    try:
+        _trail_db = SessionLocal()
+        try:
+            logger.info("Loaded %d flight trails", flight_trails.load(_trail_db))
+        finally:
+            _trail_db.close()
+    except Exception as e:
+        logger.warning("Flight trails not loaded: %s", e)
+
     logger.info("Initializing global aircraft tracker...")
     await tracker.start()
 
@@ -4785,5 +4795,13 @@ async def ack_activity(log_id: str, current_user: User = Depends(get_current_use
 async def shutdown_event():
     """Cleanup on shutdown"""
     logger.info("Shutting down FinalPing Cloud Backend...")
+    try:
+        _trail_db = SessionLocal()
+        try:
+            flight_trails.save(_trail_db)
+        finally:
+            _trail_db.close()
+    except Exception as e:
+        logger.warning("Flight trails not saved at shutdown: %s", e)
     await tracker.stop()
     logger.info("Shutdown complete")

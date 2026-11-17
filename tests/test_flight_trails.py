@@ -124,6 +124,63 @@ def test_one_account_cannot_fill_memory_with_made_up_aircraft():
     assert len(ft._trails["u1"]) == ft.MAX_AIRCRAFT_PER_OWNER
 
 
+# ── across a restart ─────────────────────────────────────────────────────────
+
+def _restart(now):
+    """Save, lose everything in memory, read it back."""
+    ft.save(api._shared, now)
+    ft.forget()
+    return ft.load(api._shared, now)
+
+
+def test_a_flight_in_progress_survives_a_restart():
+    at = _fly("u1", "abc123", T0, 20)
+    before = ft.get("u1", "abc123", at)
+    assert _restart(at) == 1
+    assert ft.get("u1", "abc123", at) == before
+    # and carries on as the same flight
+    _fly("u1", "abc123", at + timedelta(seconds=30), 5, lat0=33.2)
+    pts = _points(now=at + timedelta(minutes=2))
+    assert len(pts) == 25 and pts[0][:2] == [33.0, -97.2]
+    assert ft.get("u1", "abc123", at + timedelta(minutes=2))["started_at"] == T0
+
+
+def test_a_parked_aircraft_still_starts_a_new_trail_after_a_restart():
+    at = _fly("u1", "abc123", T0, 10)
+    ft.record("u1", "abc123", 33.1, -97.2, True, at)
+    assert _restart(at) == 1
+    again = at + ft.GROUND_ENDS_FLIGHT + timedelta(minutes=1)
+    _fly("u1", "abc123", again, 3, lat0=33.11)
+    assert [p[0] for p in _points(now=again + timedelta(minutes=1))] == [33.1, 33.11, 33.113, 33.116]
+
+
+def test_only_changed_trails_are_written_and_old_ones_are_deleted():
+    from models import FlightTrailRow
+    at = _fly("u1", "abc123", T0, 5)
+    _fly("u1", "def456", T0, 5)
+    assert ft.save(api._shared, at) == 2
+    assert ft.save(api._shared, at) == 0
+    ft.record("u1", "abc123", 33.5, -97.2, False, at + timedelta(seconds=30))
+    assert ft.save(api._shared, at + timedelta(minutes=1)) == 1
+    assert api._shared.query(FlightTrailRow).count() == 2
+    # def456 goes quiet: its saved copy is dropped, and a restart does not bring it back
+    late = at + ft.FORGET_AFTER + timedelta(seconds=10)
+    ft.record("u1", "abc123", 33.6, -97.2, False, late)
+    ft.save(api._shared, late)
+    assert [r.icao24 for r in api._shared.query(FlightTrailRow).all()] == ["abc123"]
+    ft.forget()
+    assert ft.load(api._shared, late) == 1
+
+
+def test_a_trail_already_in_memory_is_not_replaced_by_the_saved_one():
+    at = _fly("u1", "abc123", T0, 5)
+    ft.save(api._shared, at)
+    ft.forget()
+    ft.record("u1", "abc123", 40.0, -97.2, False, at + timedelta(seconds=5))
+    assert ft.load(api._shared, at + timedelta(seconds=10)) == 0
+    assert [p[0] for p in _points(now=at + timedelta(minutes=1))] == [40.0]
+
+
 # ── through the tracker and the API ──────────────────────────────────────────
 
 def test_the_tracker_records_the_network_position_each_cycle(monkeypatch):

@@ -69,6 +69,19 @@ class FeederDevice(Base):
     refused_at = Column(DateTime, nullable=True)
 
 
+class FlightTrailRow(Base):
+    """One aircraft's flight path so far, saved so a restart does not lose
+    it. The working copy is in memory: see flight_trails.py."""
+    __tablename__ = "flight_trails"
+
+    owner = Column(String(64), primary_key=True)
+    icao24 = Column(String(12), primary_key=True)
+    started = Column(DateTime, nullable=False)
+    last_at = Column(DateTime, nullable=False, index=True)
+    ground_since = Column(DateTime, nullable=True)
+    points = Column(JSON, nullable=False)       # [[epoch_seconds, lat, lon], ...]
+
+
 class License(Base):
     """License keys"""
     __tablename__ = "licenses"
