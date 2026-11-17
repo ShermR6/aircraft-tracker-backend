@@ -112,6 +112,8 @@ class Aircraft(Base):
     friendly_name = Column(String(100), nullable=True)
     aircraft_type = Column(String(100), nullable=True)
     alert_distances = Column(JSON, nullable=True)
+    # The colour the web app paints this aircraft's model and marker, like "#3B82F6".
+    paint_color = Column(String(7), nullable=True)
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     

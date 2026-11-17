@@ -1556,6 +1556,7 @@ async def get_aircraft(
             friendly_name=a.friendly_name,
             aircraft_type=a.aircraft_type,
             alert_distances=a.alert_distances,
+            paint_color=a.paint_color,
             active=a.active,
             created_at=a.created_at
         )
@@ -1593,6 +1594,7 @@ async def add_aircraft(
         friendly_name=aircraft_data.friendly_name,
         aircraft_type=aircraft_data.aircraft_type,
         alert_distances=aircraft_data.alert_distances,
+        paint_color=aircraft_data.paint_color or None,
         active=True,
         created_at=datetime.utcnow()
     )
@@ -1610,6 +1612,7 @@ async def add_aircraft(
         friendly_name=aircraft.friendly_name,
         aircraft_type=aircraft.aircraft_type,
         alert_distances=aircraft.alert_distances,
+        paint_color=aircraft.paint_color,
         active=aircraft.active,
         created_at=aircraft.created_at
     )
@@ -1642,11 +1645,15 @@ async def update_aircraft(
         aircraft.aircraft_type = aircraft_data.aircraft_type
     if aircraft_data.alert_distances is not None:
         aircraft.alert_distances = aircraft_data.alert_distances
+    if aircraft_data.paint_color is not None:
+        aircraft.paint_color = aircraft_data.paint_color or None
 
     db.commit()
     db.refresh(aircraft)
 
-    await tracker.update_user_aircraft(str(current_user.id), db)
+    # A new colour alone changes nothing the tracker watches.
+    if set(aircraft_data.model_dump(exclude_unset=True)) - {"paint_color"}:
+        await tracker.update_user_aircraft(str(current_user.id), db)
 
     return AircraftResponse(
         id=str(aircraft.id),
@@ -1655,6 +1662,7 @@ async def update_aircraft(
         friendly_name=aircraft.friendly_name,
         aircraft_type=aircraft.aircraft_type,
         alert_distances=aircraft.alert_distances,
+        paint_color=aircraft.paint_color,
         active=aircraft.active,
         created_at=aircraft.created_at
     )
@@ -3318,6 +3326,8 @@ async def startup_event():
             "ALTER TABLE team_airport_configs ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT FALSE",
             # Web app — per-event routing, receiver stats, multi-runway approach filter
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS routing JSON",
+            # Web app: each aircraft's paint colour, the same on every device
+            "ALTER TABLE aircraft ADD COLUMN IF NOT EXISTS paint_color VARCHAR(7)",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_stats JSON",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_feed JSON",
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_runway_headings JSON",

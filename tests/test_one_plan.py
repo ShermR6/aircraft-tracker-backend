@@ -195,3 +195,27 @@ def test_sms_usage_counts_this_months_sent_texts():
     assert body["sent"] == 7 and body["limit"] == plans.SMS_MONTHLY_LIMIT
     resets = datetime.fromisoformat(body["resets_at"])
     assert resets.day == 1 and resets > datetime.utcnow() and (resets - datetime.utcnow()).days < 32
+
+
+def test_aircraft_paint_colour_is_saved_with_the_aircraft(monkeypatch):
+    made = client.post("/api/aircraft", json={"tail_number": "N7PNT", "icao24": "a7a7a7", "paint_color": "#3B82F6"})
+    assert made.status_code == 200 and made.json()["paint_color"] == "#3B82F6"
+    aid = made.json()["id"]
+    row = next(a for a in client.get("/api/aircraft").json() if a["id"] == aid)
+    assert row["paint_color"] == "#3B82F6"
+
+    reloads = []
+
+    async def fake_reload(user_id, session):
+        reloads.append(user_id)
+
+    monkeypatch.setattr(main.tracker, "update_user_aircraft", fake_reload)
+    res = client.put(f"/api/aircraft/{aid}", json={"paint_color": "#F43F5E"})
+    assert res.status_code == 200 and res.json()["paint_color"] == "#F43F5E"
+    assert res.json()["tail_number"] == "N7PNT" and res.json()["icao24"] == "a7a7a7"
+    assert reloads == [], "a colour alone does not reload the tracker"
+
+    assert client.put(f"/api/aircraft/{aid}", json={"paint_color": "red"}).status_code == 422
+    assert client.put(f"/api/aircraft/{aid}", json={"paint_color": ""}).json()["paint_color"] is None
+    client.put(f"/api/aircraft/{aid}", json={"alert_distances": [4.0]})
+    assert reloads, "other changes still reload it"

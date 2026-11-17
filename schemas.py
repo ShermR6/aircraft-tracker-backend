@@ -77,6 +77,8 @@ class AircraftCreate(BaseModel):
     friendly_name: Optional[str] = None
     aircraft_type: Optional[str] = None
     alert_distances: Optional[List[float]] = None
+    # "#RRGGBB", or "" to go back to the default colour.
+    paint_color: Optional[str] = Field(None, pattern=r"^(#[0-9a-fA-F]{6})?$")
 
 
 class AircraftUpdate(BaseModel):
@@ -86,6 +88,8 @@ class AircraftUpdate(BaseModel):
     friendly_name: Optional[str] = None
     aircraft_type: Optional[str] = None
     alert_distances: Optional[List[float]] = None
+    # "#RRGGBB", or "" to go back to the default colour.
+    paint_color: Optional[str] = Field(None, pattern=r"^(#[0-9a-fA-F]{6})?$")
 
 
 class AircraftResponse(BaseModel):
@@ -96,6 +100,7 @@ class AircraftResponse(BaseModel):
     friendly_name: Optional[str]
     aircraft_type: Optional[str] = None
     alert_distances: Optional[List[float]] = None
+    paint_color: Optional[str] = None
     active: bool
     created_at: datetime
 
