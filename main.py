@@ -154,7 +154,7 @@ LICENSE_DURATION_DAYS = 30
 
 # Grace period after expiry before blocking access — gives the Stripe renewal
 # webhook time to arrive and extend the license before users go dark.
-from plans import LICENSE_GRACE_PERIOD, live_license, plan_tier, sms_over_limit  # noqa: E402
+from plans import LICENSE_GRACE_PERIOD, SMS_MONTHLY_LIMIT, live_license, plan_tier, sms_over_limit, sms_sent_this_month  # noqa: E402
 from feeder import (  # noqa: E402
     claim_devices, device_status, feeder_summary, is_feeder_license, record_feed_minute,
     sync_feeder_license,
@@ -2019,6 +2019,22 @@ async def get_integrations(
         )
         for i in integrations
     ]
+
+
+@app.get("/api/integrations/sms-usage")
+async def get_sms_usage(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Text messages sent this calendar month (UTC) against the monthly limit."""
+    now = datetime.utcnow()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    resets = (month_start + timedelta(days=32)).replace(day=1)
+    return {
+        "sent": sms_sent_this_month(db, current_user.id, now),
+        "limit": SMS_MONTHLY_LIMIT,
+        "resets_at": resets.isoformat(),
+    }
 
 
 @app.post("/api/integrations", response_model=IntegrationResponse)

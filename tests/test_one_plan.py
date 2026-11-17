@@ -182,3 +182,16 @@ def test_last_months_texts_do_not_count():
     last_month = datetime.utcnow().replace(day=1) - timedelta(days=3)
     _sms_logs(plans.SMS_MONTHLY_LIMIT + 5, last_month)
     assert main.sms_over_limit(db, USER_ID) is False
+
+
+def test_sms_usage_counts_this_months_sent_texts():
+    last_month = datetime.utcnow().replace(day=1) - timedelta(days=3)
+    _sms_logs(4, last_month)
+    _sms_logs(7, datetime.utcnow())
+    db.add(api.NotificationLog(id=uuid.uuid4(), user_id=USER_ID, aircraft_tail="N101FP", alert_type="10nm",
+                               message="x", integration_type="sms", status="limit", sent_at=datetime.utcnow()))
+    db.commit()
+    body = client.get("/api/integrations/sms-usage").json()
+    assert body["sent"] == 7 and body["limit"] == plans.SMS_MONTHLY_LIMIT
+    resets = datetime.fromisoformat(body["resets_at"])
+    assert resets.day == 1 and resets > datetime.utcnow() and (resets - datetime.utcnow()).days < 32
