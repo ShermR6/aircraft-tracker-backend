@@ -397,6 +397,69 @@ def test_live_map_holds_the_runway_position_through_a_receiver_gap(monkeypatch):
     assert row["distance_nm"] < 0.5, "jumped back to the older network position"
 
 
+def _unheard_for(seconds):
+    state = main.tracker.user_trackers[UID].aircraft_state[ICAO]
+    state["last_update"] = datetime.now() - timedelta(seconds=seconds)
+
+
+def test_live_map_shows_an_aircraft_lost_low_on_final_as_landed(monkeypatch):
+    """N7231Q on 16 Nov: last heard 1.2 nm out, still drawn there 19 minutes
+    later as "signal lost"."""
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    for nm in (12, 4):
+        adsb_at(nm, alt=2000, gs=90); cycle()
+    adsb_at(1.2, alt=1500, gs=75); cycle()            # 858 ft above the field: too high for the alert rule
+    adsb_gone()
+    _unheard_for(120)
+    row = _live()
+    assert row["on_ground"] is False and row["latitude"] is not None, "two minutes is still a coverage gap"
+    _unheard_for(19 * 60)
+    row = _live()
+    assert row["on_ground"] is True and row["status"] == "on_ground"
+    assert row["latitude"] is None and row["longitude"] is None
+    assert row["velocity_kts"] == 0 and row["altitude_ft_agl"] == 0
+    # heard again (it was a long gap, or it has taken off): back on the map
+    adsb_at(1.0, alt=1300, gs=80); cycle()
+    row = _live()
+    assert row["on_ground"] is False and row["latitude"] is not None
+
+
+def test_live_map_keeps_an_aircraft_lost_far_out_or_high_where_it_was(monkeypatch):
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    adsb_at(8, alt=1400, gs=100); cycle()             # low, but 8 nm out
+    adsb_gone(); _unheard_for(19 * 60)
+    assert _live()["on_ground"] is False and _live()["latitude"] is not None
+    adsb_at(1.5, alt=4500, gs=140); cycle()           # overhead, well above the pattern
+    adsb_gone(); _unheard_for(19 * 60)
+    assert _live()["on_ground"] is False and _live()["latitude"] is not None
+
+
+def test_live_map_agrees_with_a_landing_the_alert_rule_called(monkeypatch):
+    sent = _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    for nm in (12, 4, 1.2):
+        adsb_at(nm, alt=1000 if nm < 2 else 2000, gs=75); cycle()
+    adsb_gone()
+    cycle(); cycle(); cycle()
+    assert sent.count("landing") == 1
+    _unheard_for(90)
+    row = _live()
+    assert row["on_ground"] is True and row["latitude"] is None
+
+
+def test_live_map_lost_airborne_receiver_fix_near_the_field_counts_too(monkeypatch):
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    adsb_at(4, alt=2000, gs=90); cycle()
+    _unheard_for(12 * 60)
+    _post_fix(0.8, on_ground=False, speed=70, age_s=600)   # the receiver last heard it on short final, 10 min ago
+    row = _live()
+    assert row["source"] == "ground_station"
+    assert row["on_ground"] is True and row["latitude"] is None
+
+
 def test_live_map_uses_the_network_when_it_is_newer(monkeypatch):
     _setup(monkeypatch, rings=(10, 2))
     _gs.ground_last_fix.pop(UID, None)

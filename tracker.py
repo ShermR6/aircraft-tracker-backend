@@ -89,6 +89,15 @@ REPEAT_WINDOW_MINUTES = 1
 LOST_LANDING_NM = 2.0
 LOST_LANDING_AGL_FT = 800
 LOST_LANDING_POLLS = 3
+# On the live map, an aircraft last heard this close and this low, and then
+# not heard for this long, is shown as on the ground with no position: it has
+# landed below coverage. Looser than the alert rule above, which has to be
+# sure within 90 seconds; this one only decides what the map shows.
+LANDED_UNSEEN_NM = 3.0
+LANDED_UNSEEN_AGL_FT = 1200
+LANDED_UNSEEN_SECONDS = 300
+# Once the alert rule above has called the landing, the map agrees this soon.
+LANDED_CALLED_SECONDS = 60
 # adsb.lol decides landings and takeoffs while its fix is at most this old.
 ADSB_FRESH_SECONDS = 20
 
@@ -1569,6 +1578,37 @@ class CloudAircraftTracker:
                     'heading': gp.get('heading', 0),
                     'is_approaching': False,
                     **fields,
+                })
+
+        # Lost from sight low and close to the airport: it has landed below
+        # coverage. Without this the map keeps it hanging on final, where it
+        # was last heard, for half an hour.
+        for entry in result:
+            if entry.get('on_ground'):
+                continue
+            seen = entry.get('last_seen')
+            if not isinstance(seen, datetime):
+                continue
+            # Receiver fixes are stamped in UTC, the tracker's in local time.
+            unheard = ((now if entry.get('source') == 'ground_station' else datetime.now()) - seen).total_seconds()
+            agl = entry.get('altitude_ft_agl')
+            distance = entry.get('distance_nm')
+            low_and_close = (
+                isinstance(agl, (int, float)) and agl <= LANDED_UNSEEN_AGL_FT
+                and isinstance(distance, (int, float)) and distance <= LANDED_UNSEEN_NM
+            )
+            called = bool(tracker.aircraft_state.get(entry['icao24'], {}).get('landed'))
+            if (low_and_close and unheard >= LANDED_UNSEEN_SECONDS) or (called and unheard >= LANDED_CALLED_SECONDS):
+                entry.update({
+                    'status': 'on_ground',
+                    'on_ground': True,
+                    'is_approaching': False,
+                    'velocity_kts': 0,
+                    'altitude_ft_agl': 0,
+                    'altitude_ft_msl': field_elev,
+                    # Where on the airport it is now is not known.
+                    'latitude': None,
+                    'longitude': None,
                 })
 
         return result
