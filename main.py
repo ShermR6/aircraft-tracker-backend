@@ -2994,6 +2994,52 @@ async def delete_user_account(
     return {"message": f"User {email} and all associated data deleted"}
 
 
+# Public view counters, drawn as an aircraft transponder. Each load counts one
+# view. Only these names are counted, so the table can't be filled by guessing.
+BADGE_COUNTERS = {"shermr6"}
+
+
+def transponder_svg(count: int) -> str:
+    """A transponder head with the count in its squawk window and a blinking reply light."""
+    code = f"{count:04d}"
+    w = 300 + max(0, len(code) - 4) * 30
+    win = w - 125
+    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="76" viewBox="0 0 {w} 76" role="img" aria-label="Profile views: {count}">
+<title>Profile views: {count}</title>
+<style>@keyframes reply{{0%,82%{{opacity:.18}}85%,95%{{opacity:1}}100%{{opacity:.18}}}}.r{{animation:reply 2.6s infinite}}@media (prefers-reduced-motion:reduce){{.r{{animation:none}}}}
+.m{{font-family:"Geist Mono","SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace}}</style>
+<rect x="1" y="1" width="{w - 2}" height="74" rx="12" fill="#141414" stroke="#2A2A2A"/>
+<text x="23" y="30" class="m" font-size="10" letter-spacing="1.5" fill="#8B949E">XPDR</text>
+<text x="23" y="47" class="m" font-size="10" letter-spacing="1.5" fill="#38BDF8">ALT</text>
+<text x="23" y="62" class="m" font-size="7.5" letter-spacing="1" fill="#4A4A4A">VIEWS</text>
+<rect x="72" y="14" width="{win}" height="48" rx="4" fill="#000" stroke="#222"/>
+<text x="{72 + win / 2}" y="51" text-anchor="middle" class="m" font-weight="500" font-size="32" letter-spacing="6" fill="#FAFAFA">{code}</text>
+<circle class="r" cx="{w - 29}" cy="38" r="7" fill="#38BDF8"/>
+<text x="{w - 29}" y="64" text-anchor="middle" class="m" font-size="7.5" fill="#8B949E">R</text>
+</svg>"""
+
+
+@app.get("/badge/{name}/xpdr.svg")
+async def badge_transponder(name: str, db: Session = Depends(get_db)):
+    """Count one view and return the transponder. Never cached, so every view counts."""
+    from models import BadgeCounter
+    key = name.lower()
+    if key not in BADGE_COUNTERS:
+        raise HTTPException(status_code=404, detail="Not found")
+    row = db.query(BadgeCounter).filter(BadgeCounter.name == key).with_for_update().first()
+    if row is None:
+        row = BadgeCounter(name=key, count=0)
+        db.add(row)
+    row.count = (row.count or 0) + 1
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    return Response(
+        content=transponder_svg(row.count),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "max-age=0, no-cache, no-store, must-revalidate", "Expires": "0"},
+    )
+
+
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     """Health check endpoint"""

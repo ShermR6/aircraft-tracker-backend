@@ -503,3 +503,13 @@ def read_optional_column(db, obj, name):
         except Exception:
             pass
         return None
+
+
+class BadgeCounter(Base):
+    """A public view counter, like the one on the owner's GitHub profile.
+    Only names listed in main.BADGE_COUNTERS are counted."""
+    __tablename__ = "badge_counters"
+
+    name = Column(String(32), primary_key=True)
+    count = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow)

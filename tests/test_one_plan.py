@@ -219,3 +219,13 @@ def test_aircraft_paint_colour_is_saved_with_the_aircraft(monkeypatch):
     assert client.put(f"/api/aircraft/{aid}", json={"paint_color": ""}).json()["paint_color"] is None
     client.put(f"/api/aircraft/{aid}", json={"alert_distances": [4.0]})
     assert reloads, "other changes still reload it"
+
+
+def test_profile_transponder_counts_each_view_and_is_never_cached():
+    first = client.get("/badge/ShermR6/xpdr.svg")
+    assert first.status_code == 200 and first.headers["content-type"].startswith("image/svg+xml")
+    assert "no-store" in first.headers["cache-control"]
+    assert ">0001<" in first.text and "Profile views: 1" in first.text
+    second = client.get("/badge/shermr6/xpdr.svg")
+    assert ">0002<" in second.text
+    assert client.get("/badge/someone-else/xpdr.svg").status_code == 404
