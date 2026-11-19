@@ -30,7 +30,7 @@ import requests
 from datetime import datetime, timedelta
 from math import radians, cos, sin, asin, sqrt, atan2, degrees
 
-VERSION    = "4.1"
+VERSION    = "4.2"
 API_BASE   = "https://aircraft-tracker-backend-production.up.railway.app"
 UPDATE_URL = "https://raw.githubusercontent.com/ShermR6/aircraft-tracker-backend/main"
 
@@ -82,6 +82,12 @@ REVALIDATE_AFTER_FAILURES = 5
 # A single bad decode can place an aircraft on the far side of the planet and
 # stretch one bearing of the outline forever, so ignore implausible hits.
 MAX_PLAUSIBLE_RANGE_NM = 300
+# Every aircraft heard, and how the decoder heard it (1090 ADS-B, a 978 UAT
+# aircraft rebroadcast on 1090, Mode S only, MLAT...), goes to FinalPing this
+# often, so the account can see what flies past its field on which frequency.
+# 4.2+. Never more than CENSUS_MAX aircraft between sends.
+CENSUS_INTERVAL = 300
+CENSUS_MAX = 2000
 RANGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "range_data.json")
 
 DUMP1090_HTTP_URLS = [
@@ -523,6 +529,64 @@ def fetch_dump1090():
     raise RuntimeError("dump1090 not reachable via HTTP, filesystem, or SBS stream")
 
 
+# ── Census: every aircraft heard ─────────────────────────────────────────────
+
+_census = {}
+
+
+def census_add(aircraft_list, recv_lat, recv_lon):
+    """Adds one read of the decoder to the census. Never raises."""
+    for ac in aircraft_list:
+        try:
+            icao = str(ac.get("hex") or "").strip().lower()
+            if not icao or len(icao) > 7:
+                continue
+            entry = _census.get(icao)
+            if entry is None:
+                if len(_census) >= CENSUS_MAX:
+                    continue
+                entry = _census[icao] = {"types": {}}
+            kind = str(ac.get("type") or "unknown")[:16]
+            entry["types"][kind] = entry["types"].get(kind, 0) + 1
+            flight = str(ac.get("flight") or "").strip()
+            if flight:
+                entry["flight"] = flight[:10]
+            reg = str(ac.get("r") or "").strip()
+            if reg:
+                entry["r"] = reg[:10]
+            alt = ac.get("alt_baro")
+            if isinstance(alt, (int, float)):
+                entry["min_alt"] = min(entry.get("min_alt", alt), alt)
+            elif alt == "ground":
+                entry["ground"] = True
+            lat, lon = ac.get("lat"), ac.get("lon")
+            if recv_lat is not None and lat is not None and lon is not None:
+                d = haversine_distance(recv_lat, recv_lon, float(lat), float(lon))
+                if d <= MAX_PLAUSIBLE_RANGE_NM:
+                    entry["min_nm"] = round(min(entry.get("min_nm", d), d), 1)
+        except Exception:
+            continue
+
+
+def send_census(token, seconds):
+    """Sends the census and starts a new one. A failed send is dropped, not
+    retried: the next one is five minutes away."""
+    if not _census:
+        return
+    body = {"aircraft": dict(_census), "seconds": int(seconds)}
+    _census.clear()
+    try:
+        api_post("/api/ground/census", token, body)
+        kinds = {}
+        for e in body["aircraft"].values():
+            k = max(e["types"], key=e["types"].get) if e["types"] else "unknown"
+            kinds[k] = kinds.get(k, 0) + 1
+        log(f"[OK] Heard {len(body['aircraft'])} aircraft in {int(seconds // 60)} min: "
+            + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items(), key=lambda x: -x[1])))
+    except Exception as e:
+        log(f"[WARN] Census send failed: {e}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def _feed_client_location():
@@ -764,6 +828,7 @@ def run():
     last_config_refresh = time.time()
     last_aircraft_count = None
     last_position_log = 0.0
+    last_census = time.time()
 
     while True:
         now = time.time()
@@ -846,6 +911,10 @@ def run():
         if recv_lat is not None:
             bin_range(range_nm, aircraft_list, recv_lat, recv_lon)
         last_aircraft_count = sum(1 for ac in aircraft_list if ac.get("lat") is not None and ac.get("lon") is not None)
+        census_add(aircraft_list, recv_lat, recv_lon)
+        if now - last_census >= CENSUS_INTERVAL:
+            send_census(token, now - last_census)
+            last_census = now
 
         positions = {}
         for ac in aircraft_list:
