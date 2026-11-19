@@ -101,3 +101,15 @@ def test_old_aircraft_are_left_out_of_the_report():
     heard.record(db, str(api.USER_ID), {"a00002": {"types": {"adsb_icao": 1}}}, now=datetime.utcnow() - timedelta(days=40))
     body = client.get("/api/internal/heard?days=30", headers=SECRET).json()
     assert body["groups"] == []
+
+
+def test_the_aircraft_list_says_what_each_aircraft_broadcasts_on():
+    for n, icao in enumerate(("a835af", "a00002", "a12345", "a00003")):
+        db.add(api.Aircraft(user_id=api.USER_ID, tail_number=f"N{n}T", icao24=icao))
+    db.commit()
+    # adsb.lol heard one as a UAT rebroadcast; another account's receiver
+    # heard the next one on 1090 and the third with no ADS-B out.
+    heard.record(db, heard.NETWORK, {"a835af": {"types": {"adsr_icao": 9}}})
+    heard.record(db, str(api.OTHER_ID), {"a00002": {"types": {"adsb_icao": 4, "mlat": 9}}, "a12345": {"types": {"mode_s": 3}}})
+    got = {a["icao24"]: a["link"] for a in client.get("/api/aircraft").json()}
+    assert got == {"a835af": "978", "a00002": "1090", "a12345": "none", "a00003": None}

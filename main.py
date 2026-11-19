@@ -1568,7 +1568,16 @@ async def get_aircraft(
         Aircraft.user_id == current_user.id,
         Aircraft.active == True
     ).all()
-    
+
+    # 1090 or 978: never allowed to break the list.
+    try:
+        import heard
+        links = heard.links_for(db, [a.icao24 for a in aircraft])
+    except Exception as e:
+        print(f"Aircraft links not read: {type(e).__name__}: {e}")
+        db.rollback()
+        links = {}
+
     return [
         AircraftResponse(
             id=str(a.id),
@@ -1578,6 +1587,7 @@ async def get_aircraft(
             aircraft_type=a.aircraft_type,
             alert_distances=a.alert_distances,
             paint_color=a.paint_color,
+            link=links.get((a.icao24 or "").lower()),
             active=a.active,
             created_at=a.created_at
         )

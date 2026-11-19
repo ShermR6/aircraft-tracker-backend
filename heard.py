@@ -47,6 +47,28 @@ def link_of(kinds: Dict[str, int]) -> str:
     return "unknown"
 
 
+def links_for(db, icaos) -> Dict[str, str]:
+    """What each of these aircraft broadcasts on, from everything that has
+    heard it (adsb.lol and every receiver), for the app's aircraft list.
+    Aircraft not heard yet, or heard with no telling label, are left out."""
+    from models import HeardAircraft
+    wanted = {str(i).lower() for i in icaos if i}
+    if not wanted:
+        return {}
+    merged: Dict[str, Dict[str, int]] = {}
+    for r in db.query(HeardAircraft).filter(HeardAircraft.icao24.in_(list(wanted))).all():
+        kinds = merged.setdefault(r.icao24, {})
+        for k, v in (r.kinds or {}).items():
+            if isinstance(v, (int, float)):
+                kinds[k] = kinds.get(k, 0) + int(v)
+    out = {}
+    for icao, kinds in merged.items():
+        link = link_of(kinds)
+        if link != "unknown":
+            out[icao] = link
+    return out
+
+
 # ── US registration from the ICAO address ────────────────────────────────────
 # US addresses A00001 to ADF7C7 are assigned to N-numbers in order, so the
 # N-number can be worked out from the address.

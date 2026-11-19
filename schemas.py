@@ -101,6 +101,9 @@ class AircraftResponse(BaseModel):
     aircraft_type: Optional[str] = None
     alert_distances: Optional[List[float]] = None
     paint_color: Optional[str] = None
+    # What it broadcasts on, once something has heard it: "1090", "978" or
+    # "none" (no ADS-B out). See heard.py. Only filled in by the list.
+    link: Optional[str] = None
     active: bool
     created_at: datetime
 
