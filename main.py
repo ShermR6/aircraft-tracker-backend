@@ -154,7 +154,7 @@ LICENSE_DURATION_DAYS = 30
 
 # Grace period after expiry before blocking access — gives the Stripe renewal
 # webhook time to arrive and extend the license before users go dark.
-from plans import LICENSE_GRACE_PERIOD, SMS_MONTHLY_LIMIT, live_license, plan_tier, sms_over_limit, sms_sent_this_month  # noqa: E402
+from plans import FEEDER_AIRCRAFT, LICENSE_GRACE_PERIOD, SMS_MONTHLY_LIMIT, tracked_aircraft_limit, live_license, plan_tier, sms_over_limit, sms_sent_this_month  # noqa: E402
 from feeder import (  # noqa: E402
     claim_devices, device_status, feeder_summary, is_feeder_license, record_feed_minute,
     sync_feeder_license,
@@ -178,6 +178,9 @@ TIER_LIMITS = {
     "starter":      {"aircraft": 15,   "zones": None, "locations": None, "integrations": None, "channels": PLAN_CHANNELS["starter"]},
     "premium":      {"aircraft": 15,   "zones": None, "locations": None, "integrations": None, "channels": PLAN_CHANNELS["premium"]},
     "pro":          {"aircraft": 15,   "zones": None, "locations": None, "integrations": None, "channels": PLAN_CHANNELS["pro"]},
+    # Free for feeding adsb.lol, capped for hobbyists (2026-11-19): 5 aircraft,
+    # Discord, email and Slack, no texts. See plans.FEEDER_AIRCRAFT.
+    "feeder":       {"aircraft": FEEDER_AIRCRAFT, "zones": None, "locations": None, "integrations": None, "channels": PLAN_CHANNELS["feeder"]},
     "team-starter": {"aircraft": 25,   "zones": 2,     "locations": 3,    "integrations": 3,    "channels": PLAN_CHANNELS["team-starter"]},
     "team-premium": {"aircraft": 75,   "zones": 5,     "locations": 10,   "integrations": 10,   "channels": PLAN_CHANNELS["team-premium"]},
     "team-pro":     {"aircraft": None, "zones": None,  "locations": None, "integrations": None, "channels": PLAN_CHANNELS["team-pro"]},
@@ -820,7 +823,10 @@ async def ground_config(
     aircraft = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
         Aircraft.active == True
-    ).all() if gs_allowed(current_user, db) else []
+    ).order_by(Aircraft.created_at, Aircraft.id).all() if gs_allowed(current_user, db) else []
+    cap = tracked_aircraft_limit(get_user_tier(current_user, db))
+    if cap is not None:
+        aircraft = aircraft[:cap]
 
     return {
         "lat": float(airport.latitude),
@@ -1567,7 +1573,9 @@ async def get_aircraft(
     aircraft = db.query(Aircraft).filter(
         Aircraft.user_id == current_user.id,
         Aircraft.active == True
-    ).all()
+    ).order_by(Aircraft.created_at, Aircraft.id).all()
+    # On the feeder plan, aircraft beyond its cap stay listed but are paused.
+    cap = tracked_aircraft_limit(get_user_tier(current_user, db))
 
     # 1090 or 978: never allowed to break the list.
     try:
@@ -1588,10 +1596,11 @@ async def get_aircraft(
             alert_distances=a.alert_distances,
             paint_color=a.paint_color,
             link=links.get((a.icao24 or "").lower()),
+            paused=cap is not None and i >= cap,
             active=a.active,
             created_at=a.created_at
         )
-        for a in aircraft
+        for i, a in enumerate(aircraft)
     ]
 
 
@@ -1607,6 +1616,8 @@ async def add_aircraft(
     if limit is not None:
         count = db.query(Aircraft).filter(Aircraft.user_id == current_user.id, Aircraft.active == True).count()
         if count >= limit:
+            if tier == "feeder":
+                raise plan_refusal(tier, f"The free feeder plan covers {limit} aircraft. Remove one to add another, or upgrade to the paid plan for 15.")
             raise plan_refusal(tier, f"Your plan covers up to {limit} aircraft. Remove one to add another.")
 
     existing = db.query(Aircraft).filter(
@@ -2092,6 +2103,8 @@ async def create_integration(
         tier = get_user_tier(current_user, db)
         allowed_channels = TIER_LIMITS.get(tier, TIER_LIMITS["starter"])["channels"]
         if integration_data.type not in allowed_channels:
+            if tier == "feeder":
+                raise plan_refusal(tier, "The free feeder plan sends alerts to Discord, email and Slack. Upgrade to the paid plan for every channel.")
             raise plan_refusal(tier, f"Your plan does not include {integration_data.type} notifications.")
         limit = get_tier_limit(tier, "integrations")
         if limit is not None:
@@ -3524,6 +3537,8 @@ async def startup_event():
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS routing JSON",
             # Web app: each aircraft's paint colour, the same on every device
             "ALTER TABLE aircraft ADD COLUMN IF NOT EXISTS paint_color VARCHAR(7)",
+            # The free plan for feeding became its own capped plan (2026-11-19).
+            "UPDATE licenses SET tier = 'feeder' WHERE license_key LIKE 'FP-FEEDER-%' AND tier <> 'feeder'",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_stats JSON",
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS gs_feed JSON",
             "ALTER TABLE airport_configs ADD COLUMN IF NOT EXISTS approach_runway_headings JSON",

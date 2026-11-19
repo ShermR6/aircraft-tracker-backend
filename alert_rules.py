@@ -21,6 +21,9 @@ PLAN_CHANNELS = {
     "starter":      ALL_CHANNELS,
     "premium":      ALL_CHANNELS,
     "pro":          ALL_CHANNELS,
+    # The free plan for feeding adsb.lol: no texts, and none of the channels a
+    # flight school's front desk runs on besides Slack.
+    "feeder":       ["discord", "email", "slack"],
     "team-starter": ["discord", "email"],
     "team-premium": ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"],
     "team-pro":     ["discord", "email", "slack", "teams", "google_chat", "sms", "telegram", "webhook"],

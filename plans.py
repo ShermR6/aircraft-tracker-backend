@@ -21,6 +21,19 @@ LICENSE_GRACE_PERIOD = timedelta(hours=48)
 # Text messages are the one channel that costs money per alert.
 SMS_MONTHLY_LIMIT = int(os.getenv("SMS_MONTHLY_LIMIT", "100"))
 
+# The free plan a receiver earns by feeding adsb.lol (tier "feeder", since
+# 2026-11-19): meant for hobbyists, so it is capped below what a flight school
+# needs. Channels are in alert_rules.PLAN_CHANNELS["feeder"].
+FEEDER_AIRCRAFT = 5
+
+
+def tracked_aircraft_limit(tier: str):
+    """How many of an account's aircraft the tracker follows (the oldest
+    first), or None for all of them. Only the feeder plan can have more
+    aircraft than it covers: an account that drops from the paid plan to it
+    keeps its aircraft list, and the ones beyond the cap are paused."""
+    return FEEDER_AIRCRAFT if tier == "feeder" else None
+
 
 def live_license(db, user, now: datetime = None):
     """The licence that entitles this account today, or None."""

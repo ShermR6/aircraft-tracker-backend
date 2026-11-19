@@ -40,7 +40,7 @@ from typing import Optional
 from models import FeederDevice, License
 
 FEEDER_KEY_PREFIX = "FP-FEEDER-"
-FEEDER_TIER = "starter"
+FEEDER_TIER = "feeder"     # capped plan since 2026-11-19: see plans.FEEDER_AIRCRAFT
 
 FEED_WINDOW_DAYS = int(os.getenv("FEED_WINDOW_DAYS", "7"))
 FEED_DAYS_NEEDED = int(os.getenv("FEED_DAYS_NEEDED", "5"))
@@ -253,7 +253,8 @@ def sync_feeder_license(db, user, feed, now: datetime = None) -> bool:
                       activations_max=-1, activated_at=now, expires_at=expires, created_at=now)
         db.add(lic)
         db.flush()
-    changed = lic.expires_at != expires or lic.status != "active" or lic.tier != FEEDER_TIER or user.license_id != lic.id
+    retiered = lic.tier != FEEDER_TIER
+    changed = lic.expires_at != expires or lic.status != "active" or retiered or user.license_id != lic.id
     if changed:
         lic.expires_at = expires
         lic.status = "active"
@@ -262,4 +263,5 @@ def sync_feeder_license(db, user, feed, now: datetime = None) -> bool:
             lic.activated_at = now
         user.license_id = lic.id
         db.commit()
-    return not had_plan
+    # A licence moved to the capped plan changes what is tracked too.
+    return not had_plan or retiered

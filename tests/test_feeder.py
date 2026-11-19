@@ -151,8 +151,8 @@ def test_feeding_without_a_plan_gives_the_plan(monkeypatch):
     assert _feeding_heartbeat().status_code == 200
     user = _user()
     lic = db.get(api.main.License, user.license_id)
-    assert feeder.is_feeder_license(lic) and lic.tier == "starter"
-    assert main.plan_tier(db, user) == "starter"
+    assert feeder.is_feeder_license(lic) and lic.tier == "feeder"
+    assert main.plan_tier(db, user) == "feeder"
     assert started == [str(USER_ID)]          # tracking starts at once
 
     status = client.get("/api/ground/status").json()["feeder"]
@@ -174,7 +174,7 @@ def test_user_me_reports_the_feeder_plan_without_an_end_date(monkeypatch):
     _feeding_heartbeat()
     me = client.get("/api/user/me").json()
     # the website knowing of no paid plan must not take the feeder plan away
-    assert me["license_tier"] == "starter"
+    assert me["license_tier"] == "feeder"
     assert me["plan_source"] == "feeder"
     assert me["expires_at"] is None
 
@@ -354,3 +354,75 @@ def test_without_a_plan_the_receiver_is_given_no_aircraft_and_its_positions_are_
     assert client.post("/api/ground/range", json={"range_nm": [1.0] * 36}).status_code == 200
     assert client.get("/api/ground/range").status_code == 200
     assert client.get("/api/ground/status").status_code == 200
+
+
+# ── the feeder plan's caps (2026-11-19): 5 aircraft; Discord, email, Slack ────
+
+def _on_feeder_plan(monkeypatch):
+    api._drop_plan()
+
+    async def nothing(*_a):
+        return None
+
+    monkeypatch.setattr(main.tracker, "update_user_aircraft", nothing)
+    _feeding_heartbeat()
+    monkeypatch.undo()
+    assert main.plan_tier(db, _user()) == "feeder"
+
+
+def _add(n):
+    return client.post("/api/aircraft", json={"tail_number": f"N{100 + n}FP", "icao24": f"a{n:05x}"})
+
+
+def test_feeder_plan_covers_five_aircraft(monkeypatch):
+    _on_feeder_plan(monkeypatch)
+    for n in range(5):
+        assert _add(n).status_code == 200, n
+    res = _add(5)
+    assert res.status_code == 403 and "covers 5 aircraft" in res.json()["detail"]
+    assert all(not a["paused"] for a in client.get("/api/aircraft").json())
+
+
+def test_feeder_plan_channels(monkeypatch):
+    _on_feeder_plan(monkeypatch)
+    for kind, config in (("discord", {"webhook_url": "https://discord.com/api/webhooks/1/x"}),
+                         ("slack", {"webhook_url": "https://hooks.slack.com/services/x"}),
+                         ("email", {"email": "pilot@example.com"})):
+        assert client.post("/api/integrations", json={"type": kind, "config": config}).status_code == 200, kind
+    for kind, config in (("sms", {"phone_number": "+15555550100"}), ("telegram", {"bot_token": "1:a", "chat_id": "1"})):
+        res = client.post("/api/integrations", json={"type": kind, "config": config})
+        assert res.status_code == 403 and "Discord, email and Slack" in res.json()["detail"], kind
+    assert set(main.send_channels_for_tier("feeder")) == {"discord", "email", "slack"}
+
+
+def test_aircraft_beyond_five_are_paused_not_lost(monkeypatch):
+    # Added on the paid plan, then the paid plan ends and feeding takes over.
+    for n in range(7):
+        assert _add(n).status_code == 200
+    _on_feeder_plan(monkeypatch)
+    listed = client.get("/api/aircraft").json()
+    assert len(listed) == 7
+    assert [a["paused"] for a in listed] == [False] * 5 + [True] * 2
+    assert [a["tail_number"] for a in listed if not a["paused"]] == [f"N{100 + n}FP" for n in range(5)]
+
+    assert client.post("/api/airport/config", json=api.AIRPORT).status_code == 200
+    asyncio.run(main.tracker.update_user_aircraft(str(USER_ID), db))
+    assert len(main.tracker.user_trackers[str(USER_ID)].aircraft_to_track) == 5
+    assert len(client.get("/api/ground/config").json()["aircraft"]) == 5
+
+
+def test_an_old_full_plan_feeder_licence_moves_to_the_capped_plan(monkeypatch):
+    _on_feeder_plan(monkeypatch)
+    user = _user()
+    lic = db.get(api.main.License, user.license_id)
+    lic.tier = "starter"                      # as feeder licences were before
+    db.commit()
+    reloaded = []
+
+    async def note(user_id, _db):
+        reloaded.append(user_id)
+
+    monkeypatch.setattr(main.tracker, "update_user_aircraft", note)
+    _feeding_heartbeat()
+    assert db.get(api.main.License, _user().license_id).tier == "feeder"
+    assert reloaded == [str(USER_ID)]         # the tracker picks up the cap

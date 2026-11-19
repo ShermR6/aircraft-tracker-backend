@@ -24,7 +24,7 @@ import coverage
 import heard
 from alert_rules import send_channels_for_tier, routed_integrations, approach_headings, heading_allowed
 from models import read_optional_column
-from plans import live_license, plan_tier, sms_over_limit
+from plans import live_license, plan_tier, sms_over_limit, tracked_aircraft_limit
 
 
 def _is_safe_public_url(url: str) -> bool:
@@ -605,7 +605,11 @@ class CloudAircraftTracker:
         aircraft = db.query(Aircraft).filter(
             Aircraft.user_id == user_id,
             Aircraft.active == True
-        ).all()
+        ).order_by(Aircraft.created_at, Aircraft.id).all()
+        # The free feeder plan follows its first 5; the rest are paused.
+        cap = tracked_aircraft_limit(plan_tier(db, user))
+        if cap is not None:
+            aircraft = aircraft[:cap]
 
         if not aircraft:
             # No aircraft to track, remove tracker

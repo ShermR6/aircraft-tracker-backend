@@ -104,6 +104,8 @@ class AircraftResponse(BaseModel):
     # What it broadcasts on, once something has heard it: "1090", "978" or
     # "none" (no ADS-B out). See heard.py. Only filled in by the list.
     link: Optional[str] = None
+    # Over the plan's aircraft cap (the free feeder plan's 5): listed, not tracked.
+    paused: bool = False
     active: bool
     created_at: datetime
 
