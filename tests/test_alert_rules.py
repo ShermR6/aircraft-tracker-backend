@@ -170,3 +170,14 @@ def test_mlat_state_is_kept_only_when_it_is_what_it_should_be():
     assert r.clean_gs_stats({"mlat": False, "mlat_peers": None}) == {"mlat": False}
     assert r.clean_gs_stats({"mlat": "yes", "mlat_peers": True}) is None
     assert r.clean_gs_stats({"mlat": None, "mlat_peers": -1}) is None
+
+
+def test_email_body_escapes_the_users_wording():
+    from tracker import CloudAircraftTracker
+    body = CloudAircraftTracker.email_html_body(
+        '**N123AB** <a href="https://evil.example">click</a>\n<script>alert(1)</script> & "x"')
+    assert "<a " not in body and "<script>" not in body
+    assert "&lt;a href=&quot;https://evil.example&quot;&gt;" in body
+    assert "&lt;script&gt;" in body and "&amp;" in body
+    assert body.startswith("<strong>N123AB</strong>") and "<br>" in body
+    assert "**" not in CloudAircraftTracker.email_html_body("a ** b")

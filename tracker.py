@@ -6,6 +6,8 @@ Adapted from your working KDTO tracker code
 
 import asyncio
 import aiohttp
+import html as _html
+import re
 import ipaddress
 import socket
 from urllib.parse import urlparse
@@ -1300,6 +1302,15 @@ class CloudAircraftTracker:
             ) as response:
                 return response.status == 200
 
+    @staticmethod
+    def email_html_body(message: str) -> str:
+        """The alert text as email HTML. The text is the user's own wording, so
+        it is escaped first: a template can't put links or markup into an
+        email sent from FinalPing's address. **bold** stays bold."""
+        safe = _html.escape(message)
+        safe = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', safe).replace('**', '')
+        return safe.replace('\n', '<br>')
+
     async def send_email(self, config: dict, message: str) -> bool:
         """Send email notification via Resend"""
         import os
@@ -1312,8 +1323,7 @@ class CloudAircraftTracker:
             print("RESEND_API_KEY not set")
             return False
 
-        # Convert plain message to simple HTML
-        html_body = message.replace('\n', '<br>').replace('**', '')
+        html_body = self.email_html_body(message)
         html = f"""
         <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto;">
             <div style="background: #0f1117; padding: 20px; border-radius: 8px;">
@@ -1340,7 +1350,7 @@ class CloudAircraftTracker:
                 json={
                     'from': 'FinalPing <noreply@finalpingapp.com>',
                     'to': [to_email],
-                    'subject': f'✈️ FinalPing: {message.split(chr(10))[0][:60].strip()}',
+                    'subject': f'✈️ FinalPing: {message.split(chr(10))[0].replace("**", "")[:60].strip()}',
                     'html': html,
                 },
                 timeout=aiohttp.ClientTimeout(total=10)
