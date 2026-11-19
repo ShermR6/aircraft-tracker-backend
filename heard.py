@@ -24,26 +24,40 @@ MAX_REPORT = 3000
 LINK_NAMES = {
     "1090": "1090 MHz ADS-B",
     "978": "978 MHz UAT",
+    "not1090": "Not on 1090 (likely 978)",
     "none": "No ADS-B out",
+    "uncaught": "No ADS-B caught",
     "unknown": "Unknown",
 }
+# What the aircraft list may show: a label that says something about the aircraft.
+TELLING = ("1090", "978", "not1090", "none")
 
 
 def link_of(kinds: Dict[str, int]) -> str:
-    """What the aircraft broadcasts, from the labels it was heard with.
+    """What the aircraft broadcasts, from the labels it was heard with,
+    strongest evidence first.
 
-    adsb_* is 1090 ADS-B (an aircraft with it is 1090 even if it was also
-    multilaterated). adsr_* is a 978 UAT aircraft rebroadcast on 1090.
-    tisb_* is a radar track the FAA rebroadcasts, mlat a position worked out
-    from timing, mode_s a transponder with no position: all three mean the
-    aircraft itself sent no ADS-B position."""
+    - adsb_*: 1090 ADS-B, whatever else it was heard as.
+    - adsr_*: a 978 UAT aircraft the FAA rebroadcast on 1090.
+    - tisb_*: an FAA radar track rebroadcast for an aircraft sending no ADS-B.
+    - mlat: its position had to be worked out from its 1090 transponder
+      replies by several receivers, which would have caught any 1090 ADS-B.
+      So it is not on 1090: inside a Mode C veil, where ADS-B Out is
+      required, that means 978 UAT; elsewhere it may have none.
+    - mode_s alone: a transponder reply was caught but no ADS-B message,
+      which is what a far-off or weak 1090 aircraft looks like too (seen
+      2026-11-19: airliners at 35,000 ft). Says nothing about the aircraft."""
     have = {k for k, v in (kinds or {}).items() if v}
     if any(k.startswith("adsb_") for k in have):
         return "1090"
     if any(k.startswith("adsr_") for k in have):
         return "978"
-    if any(k.startswith("tisb_") or k in ("mlat", "mode_s", "mode_ac") for k in have):
+    if any(k.startswith("tisb_") for k in have):
         return "none"
+    if "mlat" in have:
+        return "not1090"
+    if have & {"mode_s", "mode_ac"}:
+        return "uncaught"
     return "unknown"
 
 
@@ -64,7 +78,7 @@ def links_for(db, icaos) -> Dict[str, str]:
     out = {}
     for icao, kinds in merged.items():
         link = link_of(kinds)
-        if link != "unknown":
+        if link in TELLING:
             out[icao] = link
     return out
 

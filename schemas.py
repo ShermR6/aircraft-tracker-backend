@@ -101,8 +101,9 @@ class AircraftResponse(BaseModel):
     aircraft_type: Optional[str] = None
     alert_distances: Optional[List[float]] = None
     paint_color: Optional[str] = None
-    # What it broadcasts on, once something has heard it: "1090", "978" or
-    # "none" (no ADS-B out). See heard.py. Only filled in by the list.
+    # What it broadcasts on, once something has heard it: "1090", "978",
+    # "not1090" (heard only by MLAT: likely 978) or "none" (no ADS-B out).
+    # See heard.link_of. Only filled in by the list.
     link: Optional[str] = None
     # Over the plan's aircraft cap (the free feeder plan's 5): listed, not tracked.
     paused: bool = False

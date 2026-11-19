@@ -2939,10 +2939,11 @@ async def heard_report(request: Request, days: int = 30, db: Session = Depends(g
         g = groups.setdefault(r.owner, {
             "owner": "network" if r.owner == heard.NETWORK else "receiver",
             "name": "Tracked aircraft, from adsb.lol" if r.owner == heard.NETWORK else emails.get(r.owner, "(deleted account)"),
-            "counts": {"1090": 0, "978": 0, "none": 0, "unknown": 0},
+            "counts": {k: 0 for k in heard.LINK_NAMES},
             "aircraft": [],
         })
-        link = r.link or "unknown"
+        # Worked out again on read, so rows saved under an older rule follow the current one.
+        link = heard.link_of(r.kinds or {})
         g["counts"][link] = g["counts"].get(link, 0) + 1
         if len(g["aircraft"]) < 2000:
             g["aircraft"].append({

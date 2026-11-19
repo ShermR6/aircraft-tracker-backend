@@ -15,9 +15,12 @@ def test_link_from_decoder_labels():
     assert heard.link_of({"adsb_icao": 40}) == "1090"
     assert heard.link_of({"adsb_icao": 3, "mlat": 50}) == "1090"
     assert heard.link_of({"adsr_icao": 12}) == "978"
-    assert heard.link_of({"mode_s": 30}) == "none"
+    # Only a transponder reply caught: says nothing (far-off airliners look like this).
+    assert heard.link_of({"mode_s": 30}) == "uncaught"
     assert heard.link_of({"tisb_icao": 5, "mode_s": 2}) == "none"
-    assert heard.link_of({"mlat": 9}) == "none"
+    # Located by MLAT and never heard on 1090 ADS-B: likely 978 in a Mode C veil.
+    assert heard.link_of({"mlat": 9, "mode_s": 4}) == "not1090"
+    assert heard.link_of({"adsr_icao": 1, "mlat": 9}) == "978"
     assert heard.link_of({"unknown": 4}) == "unknown"
     assert heard.link_of({}) == "unknown"
 
@@ -50,7 +53,7 @@ def test_census_records_each_aircraft_and_adds_up_across_reports():
     assert set(rows) == {"a835af", "a00002", "a12345"}
     assert rows["a835af"].link == "1090" and rows["a835af"].registration == "N628TS" and rows["a835af"].callsign == "N628TS"
     assert rows["a00002"].link == "978"
-    assert rows["a12345"].link == "none"
+    assert rows["a12345"].link == "uncaught"
 
     second = {"a835af": {"types": {"adsb_icao": 10}, "min_alt": 2100, "min_nm": 6.0, "ground": True}}
     client.post("/api/ground/census", json={"aircraft": second})
@@ -92,7 +95,7 @@ def test_report_groups_by_receiver_and_marks_tracked_aircraft():
     assert body["link_names"]["978"] == "978 MHz UAT"
     g = next(g for g in body["groups"] if g["owner"] == "receiver")
     assert g["name"] == "pilot@example.com"
-    assert g["counts"] == {"1090": 1, "978": 1, "none": 0, "unknown": 0}
+    assert g["counts"] == {"1090": 1, "978": 1, "not1090": 0, "none": 0, "uncaught": 0, "unknown": 0}
     by = {a["icao24"]: a for a in g["aircraft"]}
     assert by["a835af"]["tracked_as"] == "N628TS" and by["a00002"]["registration"] == "N1A"
 
@@ -110,6 +113,17 @@ def test_the_aircraft_list_says_what_each_aircraft_broadcasts_on():
     # adsb.lol heard one as a UAT rebroadcast; another account's receiver
     # heard the next one on 1090 and the third with no ADS-B out.
     heard.record(db, heard.NETWORK, {"a835af": {"types": {"adsr_icao": 9}}})
-    heard.record(db, str(api.OTHER_ID), {"a00002": {"types": {"adsb_icao": 4, "mlat": 9}}, "a12345": {"types": {"mode_s": 3}}})
+    heard.record(db, str(api.OTHER_ID), {"a00002": {"types": {"adsb_icao": 4, "mlat": 9}}, "a12345": {"types": {"mode_s": 3}},
+                                         "a00003": {"types": {"mlat": 6}}})
     got = {a["icao24"]: a["link"] for a in client.get("/api/aircraft").json()}
-    assert got == {"a835af": "978", "a00002": "1090", "a12345": "none", "a00003": None}
+    assert got == {"a835af": "978", "a00002": "1090", "a12345": None, "a00003": "not1090"}
+
+
+def test_rows_saved_under_the_old_rule_are_read_with_the_new_one():
+    from models import HeardAircraft
+    db.add(HeardAircraft(owner=str(api.USER_ID), icao24="a09cfe", first_seen=datetime.utcnow(), last_seen=datetime.utcnow(),
+                         kinds={"mode_s": 40}, link="none", reports=1))
+    db.commit()
+    g = client.get("/api/internal/heard", headers=SECRET).json()["groups"][0]
+    assert g["counts"]["uncaught"] == 1 and g["counts"]["none"] == 0
+    assert g["aircraft"][0]["link"] == "uncaught"
