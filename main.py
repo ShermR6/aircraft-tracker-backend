@@ -1104,6 +1104,27 @@ async def ground_positions_post(
     return {"ok": True}
 
 
+@app.post("/api/ground/census")
+@limiter.limit("60/hour")
+async def ground_census(
+    request: Request,
+    current_user: User = Depends(get_ground_user),
+    db: Session = Depends(get_db),
+):
+    """Every aircraft the receiver heard in the last few minutes and how its
+    decoder labelled it (receiver 4.2+). Kept whatever the plan: it is a
+    record of local traffic, not tracking. See heard.py."""
+    import heard
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Expected JSON")
+    report = body.get("aircraft") if isinstance(body, dict) else None
+    if not isinstance(report, dict):
+        raise HTTPException(status_code=400, detail="Expected an aircraft object")
+    return {"ok": True, "aircraft": heard.record(db, str(current_user.id), report)}
+
+
 @app.post("/api/ground/claim")
 @limiter.limit("10/minute")
 async def ground_claim(request: Request):
@@ -2863,6 +2884,53 @@ async def list_ground_devices(request: Request, db: Session = Depends(get_db)):
         })
 
     return {"devices": result}
+
+
+@app.get("/api/internal/heard")
+async def heard_report(request: Request, days: int = 30, db: Session = Depends(get_db)):
+    """Every aircraft heard in the period and what it broadcasts on, per
+    receiver and for the tracked aircraft adsb.lol has. For the admin panel."""
+    if not _valid_internal_secret(request.headers.get("x-internal-secret")):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    import heard
+    from models import HeardAircraft
+
+    days = max(1, min(days, heard.KEEP_DAYS))
+    since = datetime.utcnow() - timedelta(days=days)
+    rows = (db.query(HeardAircraft).filter(HeardAircraft.last_seen >= since)
+            .order_by(HeardAircraft.last_seen.desc()).limit(20000).all())
+
+    ids = []
+    for o in {r.owner for r in rows}:
+        try:
+            ids.append(uuid.UUID(o))
+        except ValueError:
+            pass
+    emails = {str(u.id): u.email for u in db.query(User).filter(User.id.in_(ids)).all()} if ids else {}
+
+    # Tails tracked by any account, to mark them in the lists.
+    tracked = {a.icao24.lower(): a.tail_number for a in db.query(Aircraft).all() if a.icao24}
+
+    groups = {}
+    for r in rows:
+        g = groups.setdefault(r.owner, {
+            "owner": "network" if r.owner == heard.NETWORK else "receiver",
+            "name": "Tracked aircraft, from adsb.lol" if r.owner == heard.NETWORK else emails.get(r.owner, "(deleted account)"),
+            "counts": {"1090": 0, "978": 0, "none": 0, "unknown": 0},
+            "aircraft": [],
+        })
+        link = r.link or "unknown"
+        g["counts"][link] = g["counts"].get(link, 0) + 1
+        if len(g["aircraft"]) < 2000:
+            g["aircraft"].append({
+                "icao24": r.icao24, "registration": r.registration, "callsign": r.callsign,
+                "tracked_as": tracked.get(r.icao24), "link": link, "kinds": r.kinds or {},
+                "first_seen": r.first_seen.isoformat(), "last_seen": r.last_seen.isoformat(),
+                "reports": r.reports or 0, "min_alt": r.min_alt, "min_nm": r.min_nm, "ground": bool(r.ground),
+            })
+
+    order = sorted(groups.values(), key=lambda g: (g["owner"] != "network", g["name"]))
+    return {"days": days, "link_names": heard.LINK_NAMES, "groups": order}
 
 
 @app.get("/api/internal/coverage")

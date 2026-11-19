@@ -21,6 +21,7 @@ from database import SessionLocal
 import ground_state as _gs
 import flight_trails
 import coverage
+import heard
 from alert_rules import send_channels_for_tier, routed_integrations, approach_headings, heading_allowed
 from models import read_optional_column
 from plans import live_license, plan_tier, sms_over_limit
@@ -725,6 +726,7 @@ class CloudAircraftTracker:
                 await self.track_all_users()
                 _save_flight_trails()
                 coverage.flush(SessionLocal)
+                heard.flush(SessionLocal)
                 _tick += 1
                 # Every 2 ticks (~60s): run escalation check + expected arrival auto-link
                 if _tick % 2 == 0:
@@ -817,6 +819,8 @@ class CloudAircraftTracker:
                     adsb = icao_lookup.get(icao24)
                     _observe_coverage(str(user_id), icao24, tail, tracker.config['airspace'],
                                       adsb, ground_fix, adsb_ok, gs_at is not None, cycle_at)
+                    if adsb is not None:
+                        heard.note_network(icao24, adsb)
                     if ground_fix is None and adsb is None:
                         continue
                     seen_icao24.add(icao24)

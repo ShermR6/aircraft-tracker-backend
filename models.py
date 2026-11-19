@@ -69,6 +69,25 @@ class FeederDevice(Base):
     refused_at = Column(DateTime, nullable=True)
 
 
+class HeardAircraft(Base):
+    """An aircraft a receiver (or, for tracked aircraft, adsb.lol) has heard,
+    and what it broadcasts on. See heard.py."""
+    __tablename__ = "heard_aircraft"
+
+    owner = Column(String(64), primary_key=True)          # user id, or "network"
+    icao24 = Column(String(8), primary_key=True)
+    first_seen = Column(DateTime, nullable=False)
+    last_seen = Column(DateTime, nullable=False, index=True)
+    kinds = Column(JSON, nullable=True)                   # {decoder label: times seen}
+    link = Column(String(8), nullable=True)               # 1090 / 978 / none / unknown
+    registration = Column(String(10), nullable=True)
+    callsign = Column(String(10), nullable=True)
+    min_alt = Column(Integer, nullable=True)
+    min_nm = Column(Float, nullable=True)
+    ground = Column(Boolean, nullable=True)
+    reports = Column(Integer, default=0)
+
+
 class CoverageGap(Base):
     """A stretch when a tracked aircraft, airborne near its account's airport,
     was heard by no source the tracker uses. See coverage.py."""
