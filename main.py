@@ -2865,6 +2865,78 @@ async def list_ground_devices(request: Request, db: Session = Depends(get_db)):
     return {"devices": result}
 
 
+@app.get("/api/internal/coverage")
+async def coverage_report(request: Request, days: int = 7, db: Session = Depends(get_db)):
+    """Where tracked aircraft went unheard near their airports, and how the
+    adsb.lol requests went, for the admin panel. See coverage.py."""
+    if not _valid_internal_secret(request.headers.get("x-internal-secret")):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    import coverage
+    from models import CoverageGap
+
+    days = max(1, min(days, coverage.KEEP_DAYS))
+    since = datetime.utcnow() - timedelta(days=days)
+    gaps = (db.query(CoverageGap).filter(CoverageGap.started_at >= since)
+            .order_by(CoverageGap.started_at.desc()).limit(5000).all())
+
+    owners = {g.owner for g in gaps}
+    emails = {}
+    ids = []
+    for o in owners:
+        try:
+            ids.append(uuid.UUID(o))
+        except ValueError:
+            emails[o] = o                       # a team key
+    if ids:
+        for u in db.query(User).filter(User.id.in_(ids)).all():
+            emails[str(u.id)] = u.email
+
+    def tally(key):
+        out = {}
+        for g in gaps:
+            k = key(g)
+            row = out.setdefault(k, {"gaps": 0, "minutes": 0.0})
+            row["gaps"] += 1
+            row["minutes"] += g.seconds / 60
+        return {k: {"gaps": v["gaps"], "minutes": round(v["minutes"], 1)} for k, v in out.items()}
+
+    nm_edges, nm_labels = coverage.NM_BANDS
+    agl_edges, agl_labels = coverage.AGL_BANDS
+
+    def cause(g):
+        if g.fetch_failures and g.fetch_failures >= max(1, (g.missed_cycles or 0) // 2):
+            return "our adsb.lol request failed"
+        if g.outcome == "not_seen_again":
+            return "never heard again"
+        if g.end_on_ground:
+            return "landed unheard"
+        return "network lost it"
+
+    return {
+        "days": days,
+        "fetch": coverage.fetch_summary(24),
+        "total": {"gaps": len(gaps), "minutes": round(sum(g.seconds for g in gaps) / 60, 1)},
+        "by_cause": tally(cause),
+        "by_distance": tally(lambda g: coverage.band(g.start_nm, nm_edges, nm_labels)),
+        "by_height": tally(lambda g: coverage.band(g.start_agl, agl_edges, agl_labels)),
+        "by_receiver": tally(lambda g: {"up": "receiver online", "part": "receiver online part of it",
+                                         "down": "no receiver online"}.get(g.receiver or "", "unknown")),
+        "by_source_before": tally(lambda g: g.start_source or "unknown"),
+        "by_source_after": tally(lambda g: g.end_source or "not heard again"),
+        "by_tail": tally(lambda g: g.tail or g.icao24),
+        "by_account": tally(lambda g: emails.get(g.owner, "(deleted account)")),
+        "recent": [{
+            "account": emails.get(g.owner, "(deleted account)"), "tail": g.tail, "icao24": g.icao24,
+            "outcome": g.outcome, "cause": cause(g),
+            "started_at": g.started_at.isoformat(), "ended_at": g.ended_at.isoformat() if g.ended_at else None,
+            "seconds": g.seconds, "start_nm": g.start_nm, "start_agl": g.start_agl, "start_source": g.start_source,
+            "start_lat": g.start_lat, "start_lon": g.start_lon,
+            "end_nm": g.end_nm, "end_agl": g.end_agl, "end_on_ground": g.end_on_ground, "end_source": g.end_source,
+            "receiver": g.receiver, "fetch_failures": g.fetch_failures, "missed_cycles": g.missed_cycles,
+        } for g in gaps[:300]],
+    }
+
+
 @app.get("/api/internal/feeders")
 async def list_feeders(request: Request, db: Session = Depends(get_db)):
     """Every account with a receiver that has fed adsb.lol, for the admin

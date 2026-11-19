@@ -1,0 +1,190 @@
+"""The coverage-gap log and the retried adsb.lol request.
+
+Unit tests drive coverage.observe with explicit times; the cycle tests drive
+the real tracker with the fake adsb.lol from test_gs_and_adsb_together.
+"""
+import asyncio
+from datetime import datetime, timedelta
+
+import coverage
+import test_gs_and_adsb_together as t
+import tracker as tracker_mod
+from test_api_integration import _fresh_db  # noqa: F401  (autouse: clean database per test)
+
+api = t.api
+AIRSPACE = {"center_lat": t.LAT0, "center_lon": t.LON0, "field_elevation_ft_msl": 642}
+T0 = datetime(2026, 11, 18, 12, 0, 0)
+
+
+def _reset():
+    coverage._last.clear()
+    coverage._pending.clear()
+    coverage.fetches.clear()
+
+
+def _pos(nm, s, alt=2500, on_ground=False, source="adsb", kind=None):
+    return coverage.position(source, t.LAT0 + nm / 60.0, t.LON0, T0 + timedelta(seconds=s),
+                             alt_ft=alt, on_ground=on_ground, kind=kind)
+
+
+def _see(nm, s, **k):
+    coverage.observe("u1", "abc123", "N172AK", AIRSPACE, [_pos(nm, s, **k)], True, False, T0 + timedelta(seconds=s))
+
+
+def _miss(s, adsb_ok=True, receiver_up=False):
+    coverage.observe("u1", "abc123", "N172AK", AIRSPACE, [None], adsb_ok, receiver_up, T0 + timedelta(seconds=s))
+
+
+# ── what counts as a gap ─────────────────────────────────────────────────────
+
+def test_a_quiet_stretch_near_the_field_is_logged_with_where_and_how_low():
+    _reset()
+    _see(6, 0, alt=2142)
+    _miss(30); _miss(60); _miss(90)
+    _see(3, 120, alt=1442, kind="mlat")
+    assert len(coverage._pending) == 1
+    g = coverage._pending[0]
+    assert g["outcome"] == "back" and g["seconds"] == 120
+    assert round(g["start_nm"]) == 6 and g["start_agl"] == 1500
+    assert round(g["end_nm"]) == 3 and g["end_agl"] == 800 and g["end_source"] == "mlat"
+    assert g["missed_cycles"] == 3 and g["fetch_failures"] == 0 and g["receiver"] == "down"
+
+
+def test_normal_polling_and_one_missed_poll_are_not_gaps():
+    _reset()
+    for i in range(6):
+        _see(10 - i, i * 30)
+    _miss(180)
+    _see(3, 210)                       # 30 s since the last fix
+    assert coverage._pending == []
+
+
+def test_far_away_or_parked_aircraft_are_not_counted():
+    _reset()
+    _see(40, 0)                        # outside 25 nm
+    _miss(30); _miss(60)
+    _see(39, 300)
+    _see(0.1, 330, on_ground=True)     # parked
+    _miss(360); _miss(390)
+    _see(0.1, 900, on_ground=True)
+    assert coverage._pending == []
+
+
+def test_a_stale_fix_repeated_by_adsb_is_not_news():
+    _reset()
+    _see(4, 0)
+    # adsb.lol keeps handing back the same old fix, a fraction of a second apart.
+    for s in (30, 60, 90):
+        coverage.observe("u1", "abc123", "N172AK", AIRSPACE, [_pos(4, 0.4)], True, False, T0 + timedelta(seconds=s))
+    _see(2, 120)
+    assert len(coverage._pending) == 1 and coverage._pending[0]["missed_cycles"] == 3
+
+
+def test_never_heard_again_is_logged_once_after_thirty_minutes():
+    _reset()
+    _see(1.2, 0, alt=942)              # 300 ft on short final, then nothing
+    for s in range(30, 40 * 60, 30):
+        _miss(s)
+    assert len(coverage._pending) == 1
+    g = coverage._pending[0]
+    assert g["outcome"] == "not_seen_again" and g["ended_at"] is None and g["start_agl"] == 300
+    _see(1, 50 * 60, on_ground=True)   # seen again much later: not logged twice
+    assert len(coverage._pending) == 1
+
+
+def test_failed_requests_and_the_receiver_are_counted():
+    _reset()
+    _see(5, 0)
+    _miss(30, adsb_ok=False, receiver_up=True)
+    _miss(60, adsb_ok=False, receiver_up=True)
+    _miss(90, receiver_up=False)
+    _see(4, 120)
+    g = coverage._pending[0]
+    assert g["fetch_failures"] == 2 and g["receiver"] == "part"
+
+
+def test_the_newest_source_wins():
+    _reset()
+    _see(5, 0)
+    coverage.observe("u1", "abc123", "N172AK", AIRSPACE,
+                     [_pos(4, 100), _pos(3.5, 115, source="receiver", kind="receiver")], True, True, T0 + timedelta(seconds=120))
+    g = coverage._pending[0]
+    assert g["seconds"] == 115 and g["end_source"] == "receiver"
+
+
+# ── through the real tracker cycle ───────────────────────────────────────────
+
+def test_cycle_logs_a_gap_and_saves_it(monkeypatch):
+    _reset()
+    t._setup(monkeypatch, rings=(10, 2))
+    t.adsb_at(6); t.cycle()
+    key = (t.UID, t.ICAO)
+    assert key in coverage._last
+    t.adsb_gone(); t.cycle(); t.cycle()
+    coverage._last[key]["at"] -= timedelta(seconds=90)    # pretend the polls were 30 s apart
+    t.adsb_at(3); t.cycle()
+    assert len(coverage._pending) == 1
+    coverage.flush(lambda: t.db)
+    from models import CoverageGap
+    row = t.db.query(CoverageGap).one()
+    assert row.tail == t.TAIL and row.outcome == "back" and row.missed_cycles == 2
+
+    res = api.client.get("/api/internal/coverage", headers={"x-internal-secret": api.main.WEBHOOK_INTERNAL_SECRET})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"]["gaps"] == 1
+    assert body["by_cause"] == {"network lost it": {"gaps": 1, "minutes": round(row.seconds / 60, 1)}}
+    assert body["recent"][0]["tail"] == t.TAIL
+    assert body["fetch"]["requests"] == 4 and body["fetch"]["failed"] == 0
+
+
+def test_coverage_report_needs_the_secret():
+    assert api.client.get("/api/internal/coverage").status_code == 403
+
+
+# ── retrying adsb.lol ────────────────────────────────────────────────────────
+
+class _Flaky(t._Session):
+    """Times out (or errors) the first `bad` tries, then answers."""
+    def __init__(self, *a, **k):
+        pass
+
+    def get(self, url, timeout=None):
+        RETRY["tries"] += 1
+        RETRY["timeouts"].append(timeout.total if timeout else None)
+        if RETRY["tries"] <= RETRY["bad"]:
+            if RETRY["status"]:
+                return t._Resp(RETRY["status"], {})
+            raise asyncio.TimeoutError()
+        return t._Resp(200, {"ac": [{"hex": "ABC123", "lat": 1, "lon": 2, "seen_pos": 1}]})
+
+
+RETRY = {}
+
+
+def _flaky(monkeypatch, bad, status=None):
+    _reset()
+    RETRY.update(tries=0, bad=bad, status=status, timeouts=[])
+    monkeypatch.setattr(tracker_mod.aiohttp, "ClientSession", _Flaky)
+    monkeypatch.setattr(tracker_mod, "ADSB_RETRY_PAUSE_SECONDS", 0)
+    return asyncio.run(api.main.tracker.fetch_adsb(["abc123"]))
+
+
+def test_a_timeout_is_retried_and_answers(monkeypatch):
+    lookup, ok = _flaky(monkeypatch, bad=1)
+    assert ok and "abc123" in lookup and RETRY["tries"] == 2
+    assert all(x <= tracker_mod.ADSB_TRY_SECONDS for x in RETRY["timeouts"])
+    f = coverage.fetches[-1]
+    assert f["ok"] and f["attempts"] == 2 and f["error"] == "timeout"
+    assert coverage.fetch_summary()["ok_after_retry"] == 1
+
+
+def test_three_failures_give_up(monkeypatch):
+    lookup, ok = _flaky(monkeypatch, bad=5, status=503)
+    assert not ok and lookup == {} and RETRY["tries"] == tracker_mod.ADSB_MAX_TRIES
+    assert coverage.fetch_summary()["errors"] == {"HTTP 503": 1}
+
+
+def test_a_4xx_is_not_retried(monkeypatch):
+    lookup, ok = _flaky(monkeypatch, bad=5, status=403)
+    assert not ok and RETRY["tries"] == 1

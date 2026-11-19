@@ -69,6 +69,35 @@ class FeederDevice(Base):
     refused_at = Column(DateTime, nullable=True)
 
 
+class CoverageGap(Base):
+    """A stretch when a tracked aircraft, airborne near its account's airport,
+    was heard by no source the tracker uses. See coverage.py."""
+    __tablename__ = "coverage_gaps"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner = Column(String(64), nullable=False, index=True)
+    icao24 = Column(String(12), nullable=False)
+    tail = Column(String(16), nullable=True)
+    outcome = Column(String(16), nullable=False)          # back / not_seen_again
+    started_at = Column(DateTime, nullable=False, index=True)
+    ended_at = Column(DateTime, nullable=True)
+    seconds = Column(Integer, nullable=False)
+    start_lat = Column(Float, nullable=True)
+    start_lon = Column(Float, nullable=True)
+    start_nm = Column(Float, nullable=True)
+    start_agl = Column(Integer, nullable=True)
+    start_source = Column(String(16), nullable=True)
+    end_lat = Column(Float, nullable=True)
+    end_lon = Column(Float, nullable=True)
+    end_nm = Column(Float, nullable=True)
+    end_agl = Column(Integer, nullable=True)
+    end_on_ground = Column(Boolean, nullable=True)
+    end_source = Column(String(16), nullable=True)
+    missed_cycles = Column(Integer, default=0)
+    fetch_failures = Column(Integer, default=0)
+    receiver = Column(String(8), nullable=True)            # up / part / down
+
+
 class FlightTrailRow(Base):
     """One aircraft's flight path so far, saved so a restart does not lose
     it. The working copy is in memory: see flight_trails.py."""

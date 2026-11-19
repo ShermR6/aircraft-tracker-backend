@@ -20,6 +20,7 @@ from models import User, Aircraft, AirportConfig, AlertSetting, Integration, Not
 from database import SessionLocal
 import ground_state as _gs
 import flight_trails
+import coverage
 from alert_rules import send_channels_for_tier, routed_integrations, approach_headings, heading_allowed
 from models import read_optional_column
 from plans import live_license, plan_tier, sms_over_limit
@@ -102,6 +103,34 @@ LANDED_UNSEEN_SECONDS = 300
 LANDED_CALLED_SECONDS = 60
 # adsb.lol decides landings and takeoffs while its fix is at most this old.
 ADSB_FRESH_SECONDS = 20
+# How each adsb.lol request is tried: see fetch_adsb.
+ADSB_TRY_SECONDS = 9
+ADSB_BUDGET_SECONDS = 24
+ADSB_MAX_TRIES = 3
+ADSB_RETRY_PAUSE_SECONDS = 1
+
+
+def _observe_coverage(owner, icao24, tail, airspace, adsb, ground_fix, adsb_ok, receiver_up, now):
+    """Hands this cycle's positions to the coverage-gap log. Never raises."""
+    try:
+        positions = []
+        if adsb is not None and isinstance(adsb.get('seen_pos'), (int, float)):
+            alt = adsb.get('alt_baro')
+            positions.append(coverage.position(
+                'adsb', adsb.get('lat'), adsb.get('lon'), now - timedelta(seconds=float(adsb['seen_pos'])),
+                alt_ft=alt if isinstance(alt, (int, float)) else None, on_ground=alt == 'ground',
+                kind=str(adsb.get('type') or 'adsb')[:16]))
+        if ground_fix is not None:
+            try:
+                at = datetime.fromisoformat(str(ground_fix.get('updated_at')).replace('Z', '')) if ground_fix.get('updated_at') else now
+            except ValueError:
+                at = now
+            positions.append(coverage.position(
+                'receiver', ground_fix.get('lat'), ground_fix.get('lon'), at,
+                alt_ft=ground_fix.get('altitude'), on_ground=bool(ground_fix.get('on_ground')), kind='receiver'))
+        coverage.observe(owner, icao24, tail, airspace, positions, adsb_ok, receiver_up, now)
+    except Exception as e:
+        print(f"Coverage check skipped for {tail}: {type(e).__name__}: {e}")
 
 
 def _fresh_ground_fix(fix) -> Optional[dict]:
@@ -695,6 +724,7 @@ class CloudAircraftTracker:
             try:
                 await self.track_all_users()
                 _save_flight_trails()
+                coverage.flush(SessionLocal)
                 _tick += 1
                 # Every 2 ticks (~60s): run escalation check + expected arrival auto-link
                 if _tick % 2 == 0:
@@ -704,6 +734,51 @@ class CloudAircraftTracker:
             except Exception as e:
                 print(f"Error in tracking loop: {type(e).__name__}: {e}")
                 await asyncio.sleep(30)
+
+    async def fetch_adsb(self, icaos: List[str]):
+        """adsb.lol's latest for these aircraft: ({icao24: aircraft}, ok).
+
+        Each try gets ADSB_TRY_SECONDS and a failed one is tried again, all
+        inside ADSB_BUDGET_SECONDS. One 30 s try used to be the only one, and
+        about 1 request in 11 timed out: a whole cycle with no network data
+        for anybody. HTTP 4xx is not retried (asking again will not help, and
+        hammering after a 403 or 429 is how a host gets blocked)."""
+        url = f"https://api.adsb.lol/v2/icao/{','.join(icaos)}"
+        clock = asyncio.get_running_loop().time
+        started = clock()
+        attempts, error = 0, None
+        async with aiohttp.ClientSession() as session:
+            while attempts < ADSB_MAX_TRIES:
+                left = ADSB_BUDGET_SECONDS - (clock() - started)
+                if left < 3:
+                    break
+                attempts += 1
+                try:
+                    timeout = aiohttp.ClientTimeout(total=min(ADSB_TRY_SECONDS, left), sock_connect=5)
+                    async with session.get(url, timeout=timeout) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            lookup = {}
+                            for ac in data.get('ac') or []:
+                                icao = (ac.get('hex') or '').lower()
+                                if icao:
+                                    lookup[icao] = ac
+                            coverage.record_fetch(True, attempts, clock() - started, error, len(icaos))
+                            if attempts > 1:
+                                print(f"adsb.lol answered on try {attempts} after {error}")
+                            return lookup, True
+                        error = f"HTTP {response.status}"
+                        if 400 <= response.status < 500:
+                            break
+                except asyncio.TimeoutError:
+                    error = "timeout"
+                except Exception as e:
+                    error = type(e).__name__
+                if attempts < ADSB_MAX_TRIES:
+                    await asyncio.sleep(ADSB_RETRY_PAUSE_SECONDS)
+        coverage.record_fetch(False, attempts, clock() - started, error, len(icaos))
+        print(f"adsb.lol failed ({error}, {attempts} tries) for {len(icaos)} aircraft; using ground stations only this cycle")
+        return {}, False
 
     async def track_all_users(self):
         """Track aircraft for all active users using a single ICAO-based API call"""
@@ -721,24 +796,8 @@ class CloudAircraftTracker:
         # One API call for all aircraft anywhere on the globe. A failure no
         # longer ends the cycle: ground stations can still cover their own
         # aircraft without it.
-        icao_lookup: dict = {}
-        adsb_ok = False
-        icao_str = ",".join(all_icaos)
-        url = f"https://api.adsb.lol/v2/icao/{icao_str}"
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        for ac in data.get('ac', []):
-                            icao = ac.get('hex', '').lower()
-                            if icao:
-                                icao_lookup[icao] = ac
-                        adsb_ok = True
-                    else:
-                        print(f"adsb.lol answered HTTP {response.status} for {len(all_icaos)} aircraft; using ground stations only this cycle")
-            except Exception as e:
-                print(f"Error fetching ICAO batch: {type(e).__name__}: {e}; using ground stations only this cycle")
+        icao_lookup, adsb_ok = await self.fetch_adsb(sorted(all_icaos))
+        cycle_at = datetime.utcnow()
 
         # Iterate a snapshot — request handlers mutate user_trackers across the
         # awaits below, which would otherwise raise "dictionary changed size
@@ -749,13 +808,15 @@ class CloudAircraftTracker:
                 # the last 30 seconds, is preferred: it hears the aircraft down
                 # to the runway, where public coverage often drops out. Out of
                 # its range, adsb.lol covers the aircraft.
-                gs_positions, _ = _gs.fresh_ground_positions(str(user_id))
+                gs_positions, gs_at = _gs.fresh_ground_positions(str(user_id))
 
                 seen_icao24 = set()
                 for icao24 in list(tracker.aircraft_to_track):
                     tail = tracker.aircraft_to_track[icao24]
                     ground_fix = _fresh_ground_fix(gs_positions.get(icao24))
                     adsb = icao_lookup.get(icao24)
+                    _observe_coverage(str(user_id), icao24, tail, tracker.config['airspace'],
+                                      adsb, ground_fix, adsb_ok, gs_at is not None, cycle_at)
                     if ground_fix is None and adsb is None:
                         continue
                     seen_icao24.add(icao24)
