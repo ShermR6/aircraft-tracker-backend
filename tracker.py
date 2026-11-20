@@ -111,6 +111,28 @@ ADSB_MAX_TRIES = 3
 ADSB_RETRY_PAUSE_SECONDS = 1
 
 
+_last_refusal_log = 0.0
+
+
+async def _log_refusal(response) -> None:
+    """What adsb.lol says when it refuses (429, 403...), at most every 10
+    minutes: its message and any rate-limit headers. Never raises."""
+    global _last_refusal_log
+    import time as _time
+    if _time.time() - _last_refusal_log < 600:
+        return
+    _last_refusal_log = _time.time()
+    try:
+        headers = {k: v for k, v in response.headers.items()
+                   if k.lower() in ("retry-after", "server", "cf-ray", "via", "date")
+                   or "ratelimit" in k.lower() or "rate-limit" in k.lower()}
+        body = (await response.text())[:300].replace("
+", " ")
+        print(f"adsb.lol refused HTTP {response.status}: headers {headers} body {body!r}")
+    except Exception as e:
+        print(f"adsb.lol refused HTTP {response.status} (could not read why: {type(e).__name__})")
+
+
 def _observe_coverage(owner, icao24, tail, airspace, adsb, ground_fix, adsb_ok, receiver_up, now):
     """Hands this cycle's positions to the coverage-gap log. Never raises."""
     try:
@@ -775,6 +797,7 @@ class CloudAircraftTracker:
                             return lookup, True
                         error = f"HTTP {response.status}"
                         if 400 <= response.status < 500:
+                            await _log_refusal(response)
                             break
                 except asyncio.TimeoutError:
                     error = "timeout"
