@@ -126,8 +126,7 @@ async def _log_refusal(response) -> None:
         headers = {k: v for k, v in response.headers.items()
                    if k.lower() in ("retry-after", "server", "cf-ray", "via", "date")
                    or "ratelimit" in k.lower() or "rate-limit" in k.lower()}
-        body = (await response.text())[:300].replace("
-", " ")
+        body = " ".join((await response.text())[:300].split())
         print(f"adsb.lol refused HTTP {response.status}: headers {headers} body {body!r}")
     except Exception as e:
         print(f"adsb.lol refused HTTP {response.status} (could not read why: {type(e).__name__})")
