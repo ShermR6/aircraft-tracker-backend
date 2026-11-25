@@ -104,6 +104,10 @@ LANDED_UNSEEN_AGL_FT = 1200
 LANDED_UNSEEN_SECONDS = 300
 # Once the alert rule above has called the landing, the map agrees this soon.
 LANDED_CALLED_SECONDS = 60
+# An aircraft called on the ground this far from the field's centre, still
+# this fast, was called from a fix on final (see get_live_aircraft).
+OFF_FIELD_NM = 1.0
+ON_FINAL_KT = 40
 # adsb.lol decides landings and takeoffs while its fix is at most this old.
 ADSB_FRESH_SECONDS = 20
 # How each adsb.lol request is tried: see fetch_adsb.
@@ -1782,8 +1786,6 @@ class CloudAircraftTracker:
         # coverage. Without this the map keeps it hanging on final, where it
         # was last heard, for half an hour.
         for entry in result:
-            if entry.get('on_ground'):
-                continue
             seen = entry.get('last_seen')
             if not isinstance(seen, datetime):
                 continue
@@ -1791,6 +1793,28 @@ class CloudAircraftTracker:
             unheard = ((now if entry.get('source') == 'ground_station' else datetime.now()) - seen).total_seconds()
             agl = entry.get('altitude_ft_agl')
             distance = entry.get('distance_nm')
+            if entry.get('on_ground'):
+                # Called on the ground from a fix out on final (low, stale and
+                # still at approach speed), then not heard again: it landed
+                # below coverage, not where that fix put it. N584SF on 25 Nov
+                # sat 1.4 nm south of the field at 71 kt for 18 minutes.
+                speed = entry.get('velocity_kts')
+                # From the fix itself: the stored distance stops updating once
+                # an aircraft is called on the ground.
+                lat, lon = entry.get('latitude'), entry.get('longitude')
+                fix_nm = tracker.haversine_distance(center_lat, center_lon, lat, lon)                     if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) else None
+                on_final = (
+                    fix_nm is not None and OFF_FIELD_NM < fix_nm <= LANDED_UNSEEN_NM
+                    and isinstance(speed, (int, float)) and speed >= ON_FINAL_KT
+                )
+                if not (on_final and unheard >= LANDED_CALLED_SECONDS):
+                    continue
+                entry.update({
+                    'status': 'on_ground', 'is_approaching': False, 'velocity_kts': 0,
+                    'altitude_ft_agl': 0, 'altitude_ft_msl': field_elev,
+                    'latitude': None, 'longitude': None,
+                })
+                continue
             low_and_close = (
                 isinstance(agl, (int, float)) and agl <= LANDED_UNSEEN_AGL_FT
                 and isinstance(distance, (int, float)) and distance <= LANDED_UNSEEN_NM

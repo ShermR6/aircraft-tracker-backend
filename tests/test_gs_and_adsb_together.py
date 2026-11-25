@@ -467,3 +467,31 @@ def test_live_map_uses_the_network_when_it_is_newer(monkeypatch):
     adsb_at(8); cycle()                       # network has it now, 8 nm out
     row = _live()
     assert row["source"] == "cloud" and row["distance_nm"] > 7
+
+
+def test_live_map_does_not_leave_a_stale_fix_on_final_on_the_ground_there(monkeypatch):
+    """N584SF on 25 Nov: its last network fix, 1.4 nm out at 71 kt and just
+    above the field, went stale and was called "on the ground". The map then
+    showed it sitting there, 1.4 nm short of the runway, for 18 minutes."""
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    for nm in (12, 4):
+        adsb_at(nm, alt=2000, gs=90); cycle()
+    ADSB["ac"] = [{"hex": ICAO, "lat": _north(1.4), "lon": LON0, "alt_baro": 643, "gs": 71, "track": 180, "seen_pos": 40}]
+    cycle()
+    adsb_gone()
+    row = _live()
+    assert row["on_ground"] is True and row["latitude"] is not None, "just heard: not cleared yet"
+    _unheard_for(90)
+    row = _live()
+    assert row["on_ground"] is True and row["latitude"] is None and row["velocity_kts"] == 0
+
+
+def test_live_map_keeps_an_aircraft_on_the_runway_where_it_is(monkeypatch):
+    _setup(monkeypatch, rings=(10, 2))
+    _gs.ground_last_fix.pop(UID, None)
+    ADSB["ac"] = [{"hex": ICAO, "lat": _north(0.3), "lon": LON0, "alt_baro": "ground", "gs": 45, "track": 180, "seen_pos": 1}]
+    cycle()
+    adsb_gone(); _unheard_for(10 * 60)
+    row = _live()
+    assert row["on_ground"] is True and row["latitude"] is not None
