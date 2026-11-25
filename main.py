@@ -1757,10 +1757,26 @@ async def get_aircraft_trail(
     if not row:
         raise HTTPException(status_code=404, detail="Aircraft not found")
     trail = flight_trails.get(str(current_user.id), row.icao24 or "") if row.icao24 else None
+    points = trail["points"] if trail else []
+    filled = False
+    if len(points) > 1:
+        # Away from the receiver we only have a position every poll (30 s, about
+        # a mile at pattern speed), which draws turns as corners. FlyItalyADSB's
+        # track has one every few seconds: fill it in between, as replay does.
+        start = datetime.utcfromtimestamp(points[0][2])
+        end = datetime.utcfromtimestamp(points[-1][2])
+        days = sorted({start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")})
+        traces = [t for t in [await _flyitaly_trace(row.icao24.lower(), d, max_age_s=60, timeout_s=4.0) for d in days] if t]
+        if traces:
+            as_history = [[p[2], p[0], p[1]] for p in points]
+            merged = flight_history.fill_from_history(as_history, traces, pad_s=0.0)
+            filled = len(merged) > len(as_history)
+            points = [[round(p[1], 5), round(p[2], 5), int(p[0])] for p in merged]
     return {
         "tail": row.tail_number,
         "started_at": trail["started_at"].isoformat() if trail else None,
-        "points": trail["points"] if trail else [],
+        "points": points,
+        "filled_from_history": filled,
     }
 
 
@@ -1771,10 +1787,13 @@ async def get_aircraft_trail(
 _history_cache: dict = {}          # (icao24, "YYYY-MM-DD") -> (fetched_at, trace or None)
 
 
-async def _flyitaly_trace(icao24: str, day: str):
-    """FlyItalyADSB's track for one aircraft and UTC day, cached 5 minutes
-    (a day that has ended for an hour, until it is evicted). None when there
-    is no key, no track, or the request fails."""
+async def _flyitaly_trace(icao24: str, day: str, max_age_s: float = 300.0, timeout_s: float = 10.0):
+    """FlyItalyADSB's track for one aircraft and UTC day, cached `max_age_s`
+    (5 minutes for replay, 1 for the live line; a day that has ended for an
+    hour, until it is evicted). The cache is shared, so everyone watching one
+    aircraft costs one request. None when there is no key, no track, the
+    request fails, or FlyItalyADSB has asked us to wait (429)."""
+    import asyncio
     import tracker as _tr
     if not _tr.FLYITALY_API_KEY:
         return None
@@ -1782,11 +1801,13 @@ async def _flyitaly_trace(icao24: str, day: str):
     hit = _history_cache.get(key)
     now = datetime.utcnow()
     ended = day < (now - timedelta(hours=1)).strftime("%Y-%m-%d")
-    if hit and (ended or (now - hit[0]).total_seconds() < 300):
+    if hit and (ended or (now - hit[0]).total_seconds() < max_age_s):
         return hit[1]
+    if asyncio.get_running_loop().time() < getattr(tracker, "_flyitaly_pause_until", 0.0):
+        return hit[1] if hit else None
     trace = None
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
             r = await client.get(f"https://api.flyitalyadsb.com/v2/history/{icao24}/{day}",
                                  headers={"X-Api-Key": _tr.FLYITALY_API_KEY})
         if r.status_code == 200:

@@ -214,5 +214,26 @@ def test_the_receivers_positions_are_recorded_as_they_arrive(monkeypatch):
 
 def test_an_aircraft_with_no_trail_answers_empty_and_an_unknown_one_404(monkeypatch):
     both._setup(monkeypatch)
-    assert client.get(f"/api/aircraft/trail?tail={TAIL}").json() == {"tail": TAIL, "started_at": None, "points": []}
+    assert client.get(f"/api/aircraft/trail?tail={TAIL}").json() == {"tail": TAIL, "started_at": None, "points": [], "filled_from_history": False}
     assert client.get("/api/aircraft/trail?tail=N00000").status_code == 404
+
+
+def test_the_live_line_is_filled_in_with_flyitalyadsbs_track(monkeypatch):
+    both._setup(monkeypatch)
+    start = datetime.utcnow() - timedelta(minutes=5)
+    ft.record(UID, ICAO, 33.0, -97.2, False, start)
+    ft.record(UID, ICAO, 33.03, -97.2, False, start + timedelta(seconds=30))
+    base = (start - datetime(1970, 1, 1)).total_seconds()
+    asked = []
+
+    async def trace(icao24, day, max_age_s=300.0, timeout_s=10.0):
+        asked.append((icao24, max_age_s))
+        # every 5 s between the two polls, plus one before the flight that must stay out
+        return {"timestamp": base, "trace": [[s, 33.0 + s * 0.001, -97.21, 2500, 110, 0] for s in range(-60, 35, 5)]}
+
+    monkeypatch.setattr(api.main, "_flyitaly_trace", trace)
+    body = client.get(f"/api/aircraft/trail?tail={TAIL}").json()
+    times = [p[2] for p in body["points"]]
+    assert body["filled_from_history"] is True and asked[0] == (ICAO.lower(), 60)
+    assert times == sorted(times) and times[0] == int(base) and times[-1] == int(base) + 30
+    assert len(body["points"]) == 2 + 5          # 5, 10, 15, 20, 25 s filled in; 0 and 30 are ours
