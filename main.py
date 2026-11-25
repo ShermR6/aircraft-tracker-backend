@@ -10,7 +10,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.exc import OperationalError
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
@@ -2483,6 +2483,24 @@ async def get_notifications_for_website(
 # SAVED LOCATIONS
 # ============================================================================
 
+def _is_home(loc, config) -> bool:
+    """Whether a saved location is the account's current home airport: the
+    same airport code, or (for a custom spot) the same place to ~100 m. The
+    stored is_active flag used to be trusted and drifted: the first location
+    saved was marked active even when the home airport was another one, and
+    changing the home airport never cleared it (2026-11-25)."""
+    if config is None:
+        return False
+    a, b = (loc.airport_code or "").strip().upper(), (config.airport_code or "").strip().upper()
+    if a and b:
+        return a == b
+    try:
+        return (abs(float(loc.latitude) - float(config.latitude)) < 0.001
+                and abs(float(loc.longitude) - float(config.longitude)) < 0.001)
+    except (TypeError, ValueError):
+        return False
+
+
 @app.get("/api/locations")
 async def get_locations(
     current_user: User = Depends(get_current_user),
@@ -2491,6 +2509,7 @@ async def get_locations(
     locations = db.query(SavedLocation).filter(
         SavedLocation.user_id == current_user.id
     ).order_by(SavedLocation.created_at).all()
+    config = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
     return [
         {
             "id": str(loc.id),
@@ -2499,7 +2518,7 @@ async def get_locations(
             "latitude": loc.latitude,
             "longitude": loc.longitude,
             "elevation_ft_msl": loc.elevation_ft_msl,
-            "is_active": loc.is_active,
+            "is_active": _is_home(loc, config),
             "created_at": loc.created_at.isoformat(),
         }
         for loc in locations
@@ -2520,9 +2539,17 @@ async def create_location(
         if count >= limit:
             raise plan_refusal(tier, f"Your plan covers up to {limit} saved location(s).")
 
-    # If this is the first location, make it active
-    existing_count = db.query(SavedLocation).filter(SavedLocation.user_id == current_user.id).count()
-    is_active = existing_count == 0
+    # The same airport saved twice would list it twice: hand back the one there is.
+    code = (data.get("airport_code") or "").strip().upper()
+    if code:
+        same = db.query(SavedLocation).filter(
+            SavedLocation.user_id == current_user.id,
+            func.upper(SavedLocation.airport_code) == code,
+        ).first()
+        if same:
+            return {"id": str(same.id), "name": same.name, "is_active": same.is_active}
+    # Active means "is the home airport" (see _is_home); the flag is kept in step.
+    config = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
 
     loc = SavedLocation(
         user_id=current_user.id,
@@ -2531,8 +2558,9 @@ async def create_location(
         latitude=str(data["latitude"]),
         longitude=str(data["longitude"]),
         elevation_ft_msl=data.get("elevation_ft_msl", 0),
-        is_active=is_active,
+        is_active=False,
     )
+    loc.is_active = _is_home(loc, config)
     db.add(loc)
     db.commit()
     db.refresh(loc)
@@ -2582,6 +2610,7 @@ async def activate_location(
     # Also sync to AirportConfig so tracker uses it
     config = db.query(AirportConfig).filter(AirportConfig.user_id == current_user.id).first()
     if config:
+        config.airport_name = loc.name
         config.airport_code = loc.airport_code
         config.latitude = loc.latitude
         config.longitude = loc.longitude
