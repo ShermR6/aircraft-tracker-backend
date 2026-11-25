@@ -135,6 +135,9 @@ def test_cycle_logs_a_gap_and_saves_it(monkeypatch):
     assert body["total"]["gaps"] == 1
     assert body["by_cause"] == {"network lost it": {"gaps": 1, "minutes": round(row.seconds / 60, 1)}}
     assert body["recent"][0]["tail"] == t.TAIL
+    (pt,) = body["points"]
+    assert pt["tail"] == t.TAIL and pt["cause"] == "network lost it" and pt["end_lat"] is not None
+    assert round(pt["lat"], 2) == round(t._north(6), 2)
     assert body["fetch"]["requests"] == 4 and body["fetch"]["failed"] == 0
 
 

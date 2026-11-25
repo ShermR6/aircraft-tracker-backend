@@ -3169,6 +3169,13 @@ async def coverage_report(request: Request, days: int = 7, db: Session = Depends
         "by_source_after": tally(lambda g: g.end_source or "not heard again"),
         "by_tail": tally(lambda g: g.tail or g.icao24),
         "by_account": tally(lambda g: emails.get(g.owner, "(deleted account)")),
+        # Every gap in the period with a position, for the map: where it went
+        # quiet and where it was heard again.
+        "points": [{
+            "lat": g.start_lat, "lon": g.start_lon, "end_lat": g.end_lat, "end_lon": g.end_lon,
+            "seconds": g.seconds, "agl": g.start_agl, "nm": g.start_nm, "cause": cause(g),
+            "tail": g.tail or g.icao24, "at": g.started_at.isoformat(), "outcome": g.outcome,
+        } for g in gaps if g.start_lat is not None and g.start_lon is not None],
         "recent": [{
             "account": emails.get(g.owner, "(deleted account)"), "tail": g.tail, "icao24": g.icao24,
             "outcome": g.outcome, "cause": cause(g),
