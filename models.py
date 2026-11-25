@@ -88,6 +88,23 @@ class HeardAircraft(Base):
     reports = Column(Integer, default=0)
 
 
+class FlightHistory(Base):
+    """One recorded flight of a tracked aircraft, for replay. Kept 48 hours.
+    points: [[unix s, lat, lon, alt ft or null, speed kt or null, track or
+    null, on ground 0/1, source a/f/r/h]], oldest first. See flight_history.py."""
+    __tablename__ = "flight_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner = Column(String(64), nullable=False, index=True)
+    icao24 = Column(String(12), nullable=False)
+    tail = Column(String(16), nullable=True)
+    started_at = Column(DateTime, nullable=False)
+    last_at = Column(DateTime, nullable=False, index=True)
+    ended = Column(Boolean, default=False)
+    n_points = Column(Integer, default=0)
+    points = Column(JSON, nullable=True)
+
+
 class CoverageGap(Base):
     """A stretch when a tracked aircraft, airborne near its account's airport,
     was heard by no source the tracker uses. See coverage.py."""

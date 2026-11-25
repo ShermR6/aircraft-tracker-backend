@@ -162,6 +162,7 @@ from feeder import (  # noqa: E402
 
 import ground_state as _gs
 import flight_trails
+import flight_history
 
 # Website URL for syncing license status
 WEBSITE_URL = os.getenv("WEBSITE_URL", "https://finalpingapp.com")
@@ -1103,10 +1104,17 @@ async def ground_positions_post(
         tracked = getattr(tracker.user_trackers.get(str(current_user.id)), "aircraft_to_track", {})
         for icao, fix in positions.items():
             if isinstance(fix, dict) and isinstance(icao, str) and (icao in tracked or icao.lower() in tracked):
+                heard_at = _gs.fix_time(fix, now)
                 flight_trails.record(
                     str(current_user.id), icao, fix.get("lat"), fix.get("lon"), fix.get("on_ground"),
-                    _gs.fix_time(fix, now),
+                    heard_at,
                 )
+                # Receiver 3.8+ sends the altitude as reported; older ones only the field-elevation guess.
+                flight_history.record(
+                    str(current_user.id), icao, tracked.get(icao) or tracked.get(icao.lower()), heard_at,
+                    fix.get("lat"), fix.get("lon"),
+                    fix.get("alt_baro") if fix.get("alt_baro") is not None else fix.get("altitude"),
+                    fix.get("speed"), fix.get("heading") or None, fix.get("on_ground"), "receiver")
     return {"ok": True}
 
 
@@ -1754,6 +1762,116 @@ async def get_aircraft_trail(
         "started_at": trail["started_at"].isoformat() if trail else None,
         "points": trail["points"] if trail else [],
     }
+
+
+# ============================================================================
+# FLIGHT REPLAY: recorded flights of the last 48 hours (flight_history.py)
+# ============================================================================
+
+_history_cache: dict = {}          # (icao24, "YYYY-MM-DD") -> (fetched_at, trace or None)
+
+
+async def _flyitaly_trace(icao24: str, day: str):
+    """FlyItalyADSB's track for one aircraft and UTC day, cached 5 minutes
+    (a day that has ended for an hour, until it is evicted). None when there
+    is no key, no track, or the request fails."""
+    import tracker as _tr
+    if not _tr.FLYITALY_API_KEY:
+        return None
+    key = (icao24, day)
+    hit = _history_cache.get(key)
+    now = datetime.utcnow()
+    ended = day < (now - timedelta(hours=1)).strftime("%Y-%m-%d")
+    if hit and (ended or (now - hit[0]).total_seconds() < 300):
+        return hit[1]
+    trace = None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(f"https://api.flyitalyadsb.com/v2/history/{icao24}/{day}",
+                                 headers={"X-Api-Key": _tr.FLYITALY_API_KEY})
+        if r.status_code == 200:
+            trace = r.json()
+    except Exception as e:
+        logger.warning("FlyItalyADSB history %s %s failed: %s", icao24, day, type(e).__name__)
+    if len(_history_cache) > 500:
+        _history_cache.clear()
+    _history_cache[key] = (now, trace)
+    return trace
+
+
+def _flight_summary(r) -> dict:
+    pts = r.points or []
+    alts = [p[3] for p in pts if p[3] is not None]
+    return {
+        "id": r.id, "tail": r.tail, "icao24": r.icao24,
+        "started_at": r.started_at.isoformat(), "last_at": r.last_at.isoformat(),
+        "in_progress": not r.ended,
+        "minutes": round((r.last_at - r.started_at).total_seconds() / 60),
+        "max_alt_ft": max(alts) if alts else None,
+        "points": r.n_points or len(pts),
+    }
+
+
+@app.get("/api/aircraft/flights")
+async def list_recorded_flights(
+    tail: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One aircraft's recorded flights of the last 48 hours, newest first."""
+    from models import FlightHistory
+    row = db.query(Aircraft).filter(
+        Aircraft.user_id == current_user.id,
+        Aircraft.tail_number == tail.strip().upper(),
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Aircraft not found")
+    if not row.icao24:
+        return {"tail": row.tail_number, "keep_hours": flight_history.KEEP_HOURS, "flights": []}
+    since = datetime.utcnow() - timedelta(hours=flight_history.KEEP_HOURS)
+    rows = (db.query(FlightHistory)
+            .filter(FlightHistory.owner == str(current_user.id),
+                    FlightHistory.icao24 == row.icao24.lower(),
+                    FlightHistory.last_at >= since)
+            .order_by(FlightHistory.started_at.desc()).limit(50).all())
+    return {"tail": row.tail_number, "keep_hours": flight_history.KEEP_HOURS,
+            "flights": [_flight_summary(r) for r in rows]}
+
+
+@app.get("/api/aircraft/flights/{flight_id}")
+async def get_recorded_flight(
+    flight_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """One recorded flight, every point, for replay: our own positions with
+    FlyItalyADSB's track filled in between, and the alerts sent during it."""
+    from models import FlightHistory, NotificationLog
+    r = db.get(FlightHistory, flight_id)
+    if r is None or r.owner != str(current_user.id):
+        raise HTTPException(status_code=404, detail="Flight not found")
+    points = list(r.points or [])
+    days = sorted({r.started_at.strftime("%Y-%m-%d"), r.last_at.strftime("%Y-%m-%d")})
+    traces = [t for t in [await _flyitaly_trace(r.icao24, d) for d in days] if t]
+    if traces:
+        points = flight_history.fill_from_history(points, traces)
+
+    logs = (db.query(NotificationLog)
+            .filter(NotificationLog.user_id == current_user.id,
+                    NotificationLog.aircraft_tail == r.tail,
+                    NotificationLog.sent_at >= r.started_at - timedelta(minutes=2),
+                    NotificationLog.sent_at <= r.last_at + timedelta(minutes=2))
+            .order_by(NotificationLog.sent_at).all())
+    alerts, seen = [], set()
+    for n in logs:
+        # One alert fans out to every channel: one entry per alert.
+        k = (n.alert_type, int(n.sent_at.timestamp() // 120))
+        if k in seen:
+            continue
+        seen.add(k)
+        alerts.append({"type": n.alert_type, "at": n.sent_at.isoformat()})
+    return dict(_flight_summary(r), points=points, alerts=alerts,
+                filled_from_history=bool(traces))
 
 
 @app.get("/api/aircraft/live", response_model=List[LiveAircraftResponse])
@@ -3491,6 +3609,16 @@ async def startup_event():
             conn.commit()
     except Exception as e:
         logger.warning("SDR range migration skipped: %s", e)
+
+    # Recorded flights still in progress, for replay.
+    try:
+        _hist_db = SessionLocal()
+        try:
+            logger.info("Loaded %d open recorded flights", flight_history.load(_hist_db))
+        finally:
+            _hist_db.close()
+    except Exception as e:
+        logger.warning("Recorded flights not loaded: %s", e)
 
     # Flight paths for the Live Map, as they were before the restart.
     try:

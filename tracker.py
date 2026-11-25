@@ -21,6 +21,7 @@ from models import User, Aircraft, AirportConfig, AlertSetting, Integration, Not
 from database import SessionLocal
 import ground_state as _gs
 import flight_trails
+import flight_history
 import coverage
 import heard
 from alert_rules import send_channels_for_tier, routed_integrations, approach_headings, heading_allowed
@@ -213,6 +214,14 @@ def _save_flight_trails() -> None:
             db.close()
     except Exception as e:
         print(f"Flight trails not saved: {type(e).__name__}: {e}")
+    try:
+        db = SessionLocal()
+        try:
+            flight_history.save(db)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"Flight history not saved: {type(e).__name__}: {e}")
 
 
 def _aircraft_from_adsb(icao24: str, tail: str, ac: dict, airspace: dict) -> dict:
@@ -937,10 +946,16 @@ class CloudAircraftTracker:
                     # The flight so far, for the Live Map's trail. The
                     # receiver's own fixes are added as they arrive.
                     if from_adsb is not None and isinstance(adsb.get('seen_pos'), (int, float)) and adsb['seen_pos'] <= 60:
+                        heard_at = datetime.utcnow() - timedelta(seconds=float(adsb['seen_pos']))
                         flight_trails.record(
                             str(user_id), icao24, from_adsb['latitude'], from_adsb['longitude'], from_adsb['on_ground'],
-                            datetime.utcnow() - timedelta(seconds=float(adsb['seen_pos'])),
+                            heard_at,
                         )
+                        alt = adsb.get('alt_baro')
+                        flight_history.record(
+                            str(user_id), icao24, tail, heard_at, from_adsb['latitude'], from_adsb['longitude'],
+                            alt if isinstance(alt, (int, float)) else None, adsb.get('gs'), adsb.get('track'),
+                            from_adsb['on_ground'], adsb.get('_src', 'adsb.lol'))
                     if ground_fix is None:
                         aircraft_dict = from_adsb
                     else:
