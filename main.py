@@ -2413,12 +2413,16 @@ async def get_notification_logs(
         NotificationLog.user_id == current_user.id
     )
 
-    if aircraft:
-        query = query.filter(NotificationLog.aircraft_tail == aircraft)
-    if alert_type:
-        query = query.filter(NotificationLog.alert_type == alert_type)
-    if integration:
-        query = query.filter(NotificationLog.integration_type == integration)
+    # Each filter takes one value or several, comma-separated (the Logs page's
+    # multi-select, 2026-11-25): any of them matches.
+    def _many(v):
+        return [x.strip() for x in (v or "").split(",") if x.strip()][:50]
+    if _many(aircraft):
+        query = query.filter(NotificationLog.aircraft_tail.in_(_many(aircraft)))
+    if _many(alert_type):
+        query = query.filter(NotificationLog.alert_type.in_(_many(alert_type)))
+    if _many(integration):
+        query = query.filter(NotificationLog.integration_type.in_(_many(integration)))
 
     total = query.count()
     pages = max(1, (total + limit - 1) // limit)
