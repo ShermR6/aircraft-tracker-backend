@@ -135,14 +135,16 @@ def forget(owner: str) -> None:
 
 
 def record_fetch(ok: bool, attempts: int, seconds: float, error: Optional[str], aircraft: int,
-                 at: Optional[datetime] = None) -> None:
+                 at: Optional[datetime] = None, source: str = "adsb.lol") -> None:
     fetches.append({'at': at or datetime.utcnow(), 'ok': ok, 'attempts': attempts,
-                    'seconds': round(seconds, 2), 'error': error, 'aircraft': aircraft})
+                    'seconds': round(seconds, 2), 'error': error, 'aircraft': aircraft,
+                    'source': source})
 
 
-def fetch_summary(hours: float = 24, now: Optional[datetime] = None) -> dict:
+def fetch_summary(hours: float = 24, now: Optional[datetime] = None, source: str = "adsb.lol") -> dict:
     now = now or datetime.utcnow()
-    rows = [f for f in fetches if f['at'] >= now - timedelta(hours=hours)]
+    rows = [f for f in fetches if f['at'] >= now - timedelta(hours=hours)
+            and f.get('source', 'adsb.lol') == source]
     times = sorted(f['seconds'] for f in rows if f['ok'])
     errors: Dict[str, int] = {}
     for f in rows:

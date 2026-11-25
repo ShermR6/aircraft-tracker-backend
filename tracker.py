@@ -5,6 +5,7 @@ Adapted from your working KDTO tracker code
 """
 
 import asyncio
+import os
 import aiohttp
 import html as _html
 import re
@@ -110,26 +111,55 @@ ADSB_BUDGET_SECONDS = 24
 ADSB_MAX_TRIES = 3
 ADSB_RETRY_PAUSE_SECONDS = 1
 
+# FlyItalyADSB, the second network source (2026-11-24). Commercial use is
+# allowed on every plan, Free included, with credit "FlyItalyADSB
+# (flyitalyadsb.com), CC BY-SA 4.0" wherever the data is shown; not for
+# safety of life, ATC or navigation. Up to 50 addresses per request, and a
+# multi-address request counts as one. Free: 30 requests a minute, 300,000 a
+# month. No key, no requests. Never tick the feeder perk for this key: it is
+# for non-commercial use only.
+FLYITALY_URL = "https://api.flyitalyadsb.com/v2/icao/"
+FLYITALY_API_KEY = os.getenv("FLYITALY_API_KEY", "").strip()
+FLYITALY_BATCH = 50
+FLYITALY_TRY_SECONDS = 8
 
-_last_refusal_log = 0.0
+
+_last_refusal_log: Dict[str, float] = {}
 
 
-async def _log_refusal(response) -> None:
-    """What adsb.lol says when it refuses (429, 403...), at most every 10
-    minutes: its message and any rate-limit headers. Never raises."""
-    global _last_refusal_log
+def _seen_pos(ac: dict) -> float:
+    v = ac.get('seen_pos') if isinstance(ac, dict) else None
+    return float(v) if isinstance(v, (int, float)) else float('inf')
+
+
+def _merge_sources(adsb: dict, fia: dict) -> dict:
+    """One record per aircraft: whichever source heard its position most
+    recently. Each record is marked with where it came from."""
+    merged = {}
+    for icao in set(adsb) | set(fia):
+        a, f = adsb.get(icao), fia.get(icao)
+        if a is not None and (f is None or _seen_pos(a) <= _seen_pos(f)):
+            merged[icao] = dict(a, _src='adsb.lol')
+        else:
+            merged[icao] = dict(f, _src='FlyItalyADSB')
+    return merged
+
+
+async def _log_refusal(response, source: str = "adsb.lol") -> None:
+    """What a source says when it refuses (429, 403...), at most every 10
+    minutes per source: its message and any rate-limit headers. Never raises."""
     import time as _time
-    if _time.time() - _last_refusal_log < 600:
+    if _time.time() - _last_refusal_log.get(source, 0.0) < 600:
         return
-    _last_refusal_log = _time.time()
+    _last_refusal_log[source] = _time.time()
     try:
         headers = {k: v for k, v in response.headers.items()
                    if k.lower() in ("retry-after", "server", "cf-ray", "via", "date")
                    or "ratelimit" in k.lower() or "rate-limit" in k.lower()}
         body = " ".join((await response.text())[:300].split())
-        print(f"adsb.lol refused HTTP {response.status}: headers {headers} body {body!r}")
+        print(f"{source} refused HTTP {response.status}: headers {headers} body {body!r}")
     except Exception as e:
-        print(f"adsb.lol refused HTTP {response.status} (could not read why: {type(e).__name__})")
+        print(f"{source} refused HTTP {response.status} (could not read why: {type(e).__name__})")
 
 
 def _observe_coverage(owner, icao24, tail, airspace, adsb, ground_fix, adsb_ok, receiver_up, now):
@@ -808,6 +838,58 @@ class CloudAircraftTracker:
         print(f"adsb.lol failed ({error}, {attempts} tries) for {len(icaos)} aircraft; using ground stations only this cycle")
         return {}, False
 
+    async def fetch_flyitaly(self, icaos: List[str]):
+        """FlyItalyADSB's latest for these aircraft: ({icao24: aircraft}, ok).
+        Same readsb format as adsb.lol. One try per batch of 50; after a 429
+        it waits as long as Retry-After says before asking again."""
+        if not FLYITALY_API_KEY or not icaos:
+            return {}, False
+        clock = asyncio.get_running_loop().time
+        if clock() < getattr(self, "_flyitaly_pause_until", 0.0):
+            return {}, False
+        started = clock()
+        lookup, error, ok = {}, None, True
+        async with aiohttp.ClientSession(headers={"X-Api-Key": FLYITALY_API_KEY}) as session:
+            for i in range(0, len(icaos), FLYITALY_BATCH):
+                url = FLYITALY_URL + ",".join(icaos[i:i + FLYITALY_BATCH])
+                try:
+                    timeout = aiohttp.ClientTimeout(total=FLYITALY_TRY_SECONDS, sock_connect=5)
+                    async with session.get(url, timeout=timeout) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            for ac in data.get('ac') or []:
+                                icao = (ac.get('hex') or '').lower()
+                                if icao:
+                                    lookup[icao] = ac
+                            continue
+                        error, ok = f"HTTP {response.status}", False
+                        if response.status == 429:
+                            # Pause first, so a header that cannot be read still pauses.
+                            self._flyitaly_pause_until = clock() + 60.0
+                            try:
+                                wait = float(response.headers.get("Retry-After", "60"))
+                                self._flyitaly_pause_until = clock() + min(max(wait, 30.0), 3600.0)
+                            except (AttributeError, TypeError, ValueError):
+                                pass
+                        if 400 <= response.status < 500:
+                            await _log_refusal(response, "FlyItalyADSB")
+                            break
+                except asyncio.TimeoutError:
+                    error, ok = "timeout", False
+                except Exception as e:
+                    error, ok = type(e).__name__, False
+        coverage.record_fetch(ok, 1, clock() - started, error, len(icaos), source="FlyItalyADSB")
+        if not ok:
+            print(f"FlyItalyADSB failed ({error}) for {len(icaos)} aircraft")
+        return lookup, ok
+
+    async def fetch_network(self, icaos: List[str]):
+        """Both network sources at once, merged: for each aircraft, the one
+        with the fresher position. Returns (lookup, any source answered)."""
+        (adsb, adsb_ok), (fia, fia_ok) = await asyncio.gather(
+            self.fetch_adsb(icaos), self.fetch_flyitaly(icaos))
+        return _merge_sources(adsb, fia), adsb_ok or fia_ok
+
     async def track_all_users(self):
         """Track aircraft for all active users using a single ICAO-based API call"""
         if not self.user_trackers:
@@ -821,10 +903,10 @@ class CloudAircraftTracker:
         if not all_icaos:
             return
 
-        # One API call for all aircraft anywhere on the globe. A failure no
-        # longer ends the cycle: ground stations can still cover their own
-        # aircraft without it.
-        icao_lookup, adsb_ok = await self.fetch_adsb(sorted(all_icaos))
+        # adsb.lol and FlyItalyADSB together, merged by freshness. A failure
+        # of both no longer ends the cycle: ground stations can still cover
+        # their own aircraft without them.
+        icao_lookup, adsb_ok = await self.fetch_network(sorted(all_icaos))
         cycle_at = datetime.utcnow()
 
         # Iterate a snapshot — request handlers mutate user_trackers across the

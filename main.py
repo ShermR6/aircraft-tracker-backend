@@ -3007,6 +3007,7 @@ async def coverage_report(request: Request, days: int = 7, db: Session = Depends
     return {
         "days": days,
         "fetch": coverage.fetch_summary(24),
+        "fetch_sources": {name: coverage.fetch_summary(24, source=name) for name in ("adsb.lol", "FlyItalyADSB")},
         "total": {"gaps": len(gaps), "minutes": round(sum(g.seconds for g in gaps) / 60, 1)},
         "by_cause": tally(cause),
         "by_distance": tally(lambda g: coverage.band(g.start_nm, nm_edges, nm_labels)),

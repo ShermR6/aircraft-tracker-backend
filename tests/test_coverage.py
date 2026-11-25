@@ -188,3 +188,81 @@ def test_three_failures_give_up(monkeypatch):
 def test_a_4xx_is_not_retried(monkeypatch):
     lookup, ok = _flaky(monkeypatch, bad=5, status=403)
     assert not ok and RETRY["tries"] == 1
+
+
+# ── FlyItalyADSB as a second source ──────────────────────────────────────────
+
+def test_sources_merge_by_the_fresher_position():
+    adsb = {"a1": {"hex": "a1", "seen_pos": 12.0}, "a2": {"hex": "a2", "seen_pos": 1.0}, "a3": {"hex": "a3"}}
+    fia = {"a1": {"hex": "a1", "seen_pos": 2.0}, "a2": {"hex": "a2", "seen_pos": 5.0}, "a4": {"hex": "a4", "seen_pos": 3.0}}
+    m = tracker_mod._merge_sources(adsb, fia)
+    assert {k: v["_src"] for k, v in m.items()} == {
+        "a1": "FlyItalyADSB", "a2": "adsb.lol", "a3": "adsb.lol", "a4": "FlyItalyADSB"}
+
+
+class _Fia(t._Session):
+    """FlyItalyADSB stand-in: answers per batch, notes each URL."""
+    def __init__(self, *a, **k):
+        FIA["headers"] = k.get("headers")
+
+    def get(self, url, timeout=None):
+        FIA["urls"].append(url)
+        if FIA["status"] != 200:
+            return t._Resp(FIA["status"], {})
+        hexes = url.rsplit("/", 1)[1].split(",")
+        return t._Resp(200, {"ac": [{"hex": h, "lat": 1, "lon": 2, "seen_pos": 1} for h in hexes]})
+
+
+FIA = {}
+
+
+def _fia(monkeypatch, n, status=200, key="fia_test"):
+    _reset()
+    FIA.update(urls=[], status=status, headers=None)
+    monkeypatch.setattr(tracker_mod, "FLYITALY_API_KEY", key)
+    monkeypatch.setattr(tracker_mod.aiohttp, "ClientSession", _Fia)
+    api.main.tracker._flyitaly_pause_until = 0.0
+    return asyncio.run(api.main.tracker.fetch_flyitaly([f"a{i:05x}" for i in range(n)]))
+
+
+def test_flyitaly_asks_in_batches_of_fifty_with_the_key(monkeypatch):
+    lookup, ok = _fia(monkeypatch, 120)
+    assert ok and len(lookup) == 120 and len(FIA["urls"]) == 3
+    assert FIA["headers"] == {"X-Api-Key": "fia_test"}
+    assert coverage.fetch_summary(source="FlyItalyADSB")["requests"] == 1
+    assert coverage.fetch_summary(source="adsb.lol")["requests"] == 0
+
+
+def test_flyitaly_without_a_key_asks_nothing(monkeypatch):
+    lookup, ok = _fia(monkeypatch, 5, key="")
+    assert (lookup, ok) == ({}, False) and FIA["urls"] == []
+
+
+def test_flyitaly_backs_off_after_429(monkeypatch):
+    lookup, ok = _fia(monkeypatch, 5, status=429)
+    assert not ok and len(FIA["urls"]) == 1
+    asyncio.run(api.main.tracker.fetch_flyitaly(["a00001"]))     # still paused
+    assert len(FIA["urls"]) == 1
+
+
+def test_cycle_uses_flyitaly_when_adsb_lol_refuses(monkeypatch):
+    t._setup(monkeypatch, rings=(10, 2))
+    sent = []
+
+    async def fake_send(user_id, notifications):
+        sent.extend(n["type"] for n in notifications)
+
+    monkeypatch.setattr(api.main.tracker, "send_notifications", fake_send)
+    t.ADSB["fail"] = True                      # adsb.lol answers 503
+
+    where = {"nm": 12}
+
+    async def fia(icaos):
+        return {t.ICAO: {"hex": t.ICAO, "lat": t._north(where["nm"]), "lon": t.LON0, "alt_baro": 2500,
+                         "gs": 110, "track": 180, "seen_pos": 1}}, True
+
+    monkeypatch.setattr(api.main.tracker, "fetch_flyitaly", fia)
+    t.cycle()                                  # first seen outside the ring
+    where["nm"] = 9
+    t.cycle()                                  # crosses 10 nm, on FlyItalyADSB alone
+    assert sent == ["10nm"]
