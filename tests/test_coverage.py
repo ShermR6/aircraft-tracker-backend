@@ -269,3 +269,47 @@ def test_cycle_uses_flyitaly_when_adsb_lol_refuses(monkeypatch):
     where["nm"] = 9
     t.cycle()                                  # crosses 10 nm, on FlyItalyADSB alone
     assert sent == ["10nm"]
+
+
+# ── adsb.lol's daily allowance ───────────────────────────────────────────────
+
+def test_adsb_spacing_spreads_the_daily_allowance():
+    assert round(tracker_mod.adsb_spacing({"x-ratelimit-limit": "500, 500;w=86400"})) == 181
+    assert tracker_mod.adsb_spacing({}) == 0 and tracker_mod.adsb_spacing({"x-ratelimit-limit": "100;w=60"}) == 0
+    assert tracker_mod.adsb_refused_for({"x-ratelimit-reset": "20810"}) == 20810
+    assert tracker_mod.adsb_refused_for({"x-ratelimit-reset": "5"}) == 60
+    assert tracker_mod.adsb_refused_for({}) == 300
+
+
+class _Limited(t._Session):
+    """adsb.lol with a daily allowance: answers once, then refuses."""
+    def __init__(self, *a, **k):
+        pass
+
+    def get(self, url, timeout=None):
+        LIM["tries"] += 1
+        r = t._Resp(LIM["status"], {"ac": []})
+        r.headers = {"x-ratelimit-limit": "500, 500;w=86400", "x-ratelimit-reset": "3600"}
+        return r
+
+
+LIM = {}
+
+
+def test_adsb_is_not_asked_again_until_its_allowance_allows(monkeypatch):
+    _reset()
+    monkeypatch.setattr(tracker_mod.aiohttp, "ClientSession", _Limited)
+    trk = api.main.tracker
+    try:
+        trk._adsb_next_ok = 0.0
+        LIM.update(tries=0, status=200)
+        assert asyncio.run(trk.fetch_adsb(["abc123"]))[1] is True
+        assert asyncio.run(trk.fetch_adsb(["abc123"])) == ({}, False)      # paced: not asked
+        assert LIM["tries"] == 1
+        trk._adsb_next_ok = 0.0
+        LIM["status"] = 429
+        assert asyncio.run(trk.fetch_adsb(["abc123"]))[1] is False
+        asyncio.run(trk.fetch_adsb(["abc123"]))                              # refused: wait for the reset
+        assert LIM["tries"] == 2
+    finally:
+        trk._adsb_next_ok = 0.0

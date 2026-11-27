@@ -150,6 +150,32 @@ def _merge_sources(adsb: dict, fia: dict) -> dict:
     return merged
 
 
+def adsb_spacing(headers) -> float:
+    """Seconds to leave between adsb.lol requests so its daily allowance
+    lasts the day. Since 27 Nov 2026 it answers with x-ratelimit-limit
+    "500, 500;w=86400": 500 requests a day, where polling every cycle asked
+    about 2,880 and had ~2,300 refused. 0 when there is no such limit."""
+    import re as _re
+    try:
+        m = _re.search(r"(\d+)\s*;\s*w=(\d+)", str((headers or {}).get("x-ratelimit-limit", "")))
+        if not m or int(m.group(1)) <= 0:
+            return 0.0
+        spacing = int(m.group(2)) / int(m.group(1)) * 1.05
+        return spacing if spacing > 30 else 0.0
+    except Exception:
+        return 0.0
+
+
+def adsb_refused_for(headers) -> float:
+    """After a 429, how long to leave adsb.lol alone: until its allowance
+    resets (x-ratelimit-reset, seconds), at least a minute and at most a day."""
+    try:
+        reset = float((headers or {}).get("x-ratelimit-reset") or (headers or {}).get("Retry-After") or 300)
+    except (TypeError, ValueError):
+        reset = 300.0
+    return min(max(reset, 60.0), 86400.0)
+
+
 async def _log_refusal(response, source: str = "adsb.lol") -> None:
     """What a source says when it refuses (429, 403...), at most every 10
     minutes per source: its message and any rate-limit headers. Never raises."""
@@ -815,6 +841,11 @@ class CloudAircraftTracker:
         hammering after a 403 or 429 is how a host gets blocked)."""
         url = f"https://api.adsb.lol/v2/icao/{','.join(icaos)}"
         clock = asyncio.get_running_loop().time
+        # Asked again only once its allowance allows (adsb_spacing) or it has
+        # reset after a refusal: a skipped cycle is not a failed request, and
+        # FlyItalyADSB answers for it.
+        if clock() < getattr(self, "_adsb_next_ok", 0.0):
+            return {}, False
         started = clock()
         attempts, error = 0, None
         async with aiohttp.ClientSession() as session:
@@ -826,7 +857,11 @@ class CloudAircraftTracker:
                 try:
                     timeout = aiohttp.ClientTimeout(total=min(ADSB_TRY_SECONDS, left), sock_connect=5)
                     async with session.get(url, timeout=timeout) as response:
+                        headers = getattr(response, "headers", None) or {}
+                        if response.status == 429:
+                            self._adsb_next_ok = clock() + adsb_refused_for(headers)
                         if response.status == 200:
+                            self._adsb_next_ok = clock() + adsb_spacing(headers)
                             data = await response.json()
                             lookup = {}
                             for ac in data.get('ac') or []:
