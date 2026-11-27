@@ -265,6 +265,7 @@ def test_cycle_uses_flyitaly_when_adsb_lol_refuses(monkeypatch):
                          "gs": 110, "track": 180, "seen_pos": 1}}, True
 
     monkeypatch.setattr(api.main.tracker, "fetch_flyitaly", fia)
+    monkeypatch.setattr(tracker_mod, "FLYITALY_API_KEY", "fia_test")
     t.cycle()                                  # first seen outside the ring
     where["nm"] = 9
     t.cycle()                                  # crosses 10 nm, on FlyItalyADSB alone
@@ -273,9 +274,7 @@ def test_cycle_uses_flyitaly_when_adsb_lol_refuses(monkeypatch):
 
 # ── adsb.lol's daily allowance ───────────────────────────────────────────────
 
-def test_adsb_spacing_spreads_the_daily_allowance():
-    assert round(tracker_mod.adsb_spacing({"x-ratelimit-limit": "500, 500;w=86400"})) == 181
-    assert tracker_mod.adsb_spacing({}) == 0 and tracker_mod.adsb_spacing({"x-ratelimit-limit": "100;w=60"}) == 0
+def test_a_refusal_waits_for_the_allowance_to_reset():
     assert tracker_mod.adsb_refused_for({"x-ratelimit-reset": "20810"}) == 20810
     assert tracker_mod.adsb_refused_for({"x-ratelimit-reset": "5"}) == 60
     assert tracker_mod.adsb_refused_for({}) == 300
@@ -302,14 +301,75 @@ def test_adsb_is_not_asked_again_until_its_allowance_allows(monkeypatch):
     trk = api.main.tracker
     try:
         trk._adsb_next_ok = 0.0
-        LIM.update(tries=0, status=200)
-        assert asyncio.run(trk.fetch_adsb(["abc123"]))[1] is True
-        assert asyncio.run(trk.fetch_adsb(["abc123"])) == ({}, False)      # paced: not asked
-        assert LIM["tries"] == 1
-        trk._adsb_next_ok = 0.0
-        LIM["status"] = 429
+        LIM.update(tries=0, status=429)
         assert asyncio.run(trk.fetch_adsb(["abc123"]))[1] is False
         asyncio.run(trk.fetch_adsb(["abc123"]))                              # refused: wait for the reset
-        assert LIM["tries"] == 2
+        assert LIM["tries"] == 1
     finally:
         trk._adsb_next_ok = 0.0
+
+
+# ── FlyItalyADSB first, adsb.lol as the backup ───────────────────────────────
+
+def _network(monkeypatch, fia_answer, fia_ok=True):
+    """Drives fetch_network with stand-ins; returns the adsb.lol asks."""
+    t._setup(monkeypatch, rings=(10, 2))
+    trk = api.main.tracker
+    trk._adsb_sent = []
+    asked = []
+
+    async def fia(icaos):
+        return fia_answer, fia_ok
+
+    async def adsb(icaos):
+        asked.append(list(icaos))
+        return {i: {"hex": i, "seen_pos": 1} for i in icaos}, True
+
+    monkeypatch.setattr(tracker_mod, "FLYITALY_API_KEY", "fia_test")
+    monkeypatch.setattr(trk, "fetch_flyitaly", fia)
+    monkeypatch.setattr(trk, "fetch_adsb", adsb)
+    return trk, asked
+
+
+def _state(trk, **st):
+    from datetime import datetime as _dt
+    trk.user_trackers[t.UID].aircraft_state[t.ICAO] = dict(
+        {"last_update": _dt.now(), "last_distance": 4.0, "on_ground": False, "landed": False}, **st)
+
+
+def test_adsb_lol_is_not_asked_while_flyitaly_has_the_aircraft(monkeypatch):
+    trk, asked = _network(monkeypatch, {t.ICAO: {"hex": t.ICAO, "seen_pos": 2}})
+    _state(trk)
+    lookup, ok = asyncio.run(trk.fetch_network([t.ICAO]))
+    assert ok and asked == [] and lookup[t.ICAO]["_src"] == "FlyItalyADSB"
+
+
+def test_adsb_lol_backs_up_an_aircraft_flyitaly_lost_near_the_field(monkeypatch):
+    trk, asked = _network(monkeypatch, {"other1": {"hex": "other1", "seen_pos": 1}})
+    _state(trk, last_distance=1.5)
+    lookup, ok = asyncio.run(trk.fetch_network([t.ICAO, "other1"]))
+    assert asked == [[t.ICAO]] and lookup[t.ICAO]["_src"] == "adsb.lol"
+
+
+def test_a_parked_or_far_aircraft_is_not_worth_a_backup_request(monkeypatch):
+    trk, asked = _network(monkeypatch, {})
+    _state(trk, on_ground=True)
+    asyncio.run(trk.fetch_network([t.ICAO]))
+    _state(trk, last_distance=40.0)
+    asyncio.run(trk.fetch_network([t.ICAO]))
+    assert asked == []
+
+
+def test_when_flyitaly_fails_adsb_lol_is_asked_once_a_minute(monkeypatch):
+    trk, asked = _network(monkeypatch, {}, fia_ok=False)
+    assert asyncio.run(trk.fetch_network([t.ICAO]))[1] is True
+    asyncio.run(trk.fetch_network([t.ICAO]))
+    assert asked == [[t.ICAO]]
+
+
+def test_adsb_lol_stays_within_its_daily_budget(monkeypatch):
+    trk, asked = _network(monkeypatch, {}, fia_ok=False)
+    import time as _time
+    trk._adsb_sent = [_time.monotonic() - 3600] * tracker_mod.ADSB_DAILY_BUDGET
+    asyncio.run(trk.fetch_network([t.ICAO]))
+    assert asked == []

@@ -110,6 +110,17 @@ OFF_FIELD_NM = 1.0
 ON_FINAL_KT = 40
 # adsb.lol decides landings and takeoffs while its fix is at most this old.
 ADSB_FRESH_SECONDS = 20
+# adsb.lol allows the backend 500 requests a day (x-ratelimit-limit
+# "500, 500;w=86400", since 27 Nov 2026). FlyItalyADSB is asked every cycle;
+# adsb.lol only as the backup (see CloudAircraftTracker.fetch_network), at
+# most this many times in any 24 hours and once a minute.
+ADSB_DAILY_BUDGET = 450
+ADSB_BACKUP_EVERY_SECONDS = 60
+# An aircraft is worth a backup request while it was heard airborne within
+# this distance of its field this recently, and FlyItalyADSB has nothing
+# newer than ADSB_FRESH_SECONDS for it.
+BACKUP_NEAR_NM = 15
+BACKUP_RECENT_SECONDS = 10 * 60
 # How each adsb.lol request is tried: see fetch_adsb.
 ADSB_TRY_SECONDS = 9
 ADSB_BUDGET_SECONDS = 24
@@ -148,22 +159,6 @@ def _merge_sources(adsb: dict, fia: dict) -> dict:
         else:
             merged[icao] = dict(f, _src='FlyItalyADSB')
     return merged
-
-
-def adsb_spacing(headers) -> float:
-    """Seconds to leave between adsb.lol requests so its daily allowance
-    lasts the day. Since 27 Nov 2026 it answers with x-ratelimit-limit
-    "500, 500;w=86400": 500 requests a day, where polling every cycle asked
-    about 2,880 and had ~2,300 refused. 0 when there is no such limit."""
-    import re as _re
-    try:
-        m = _re.search(r"(\d+)\s*;\s*w=(\d+)", str((headers or {}).get("x-ratelimit-limit", "")))
-        if not m or int(m.group(1)) <= 0:
-            return 0.0
-        spacing = int(m.group(2)) / int(m.group(1)) * 1.05
-        return spacing if spacing > 30 else 0.0
-    except Exception:
-        return 0.0
 
 
 def adsb_refused_for(headers) -> float:
@@ -841,9 +836,7 @@ class CloudAircraftTracker:
         hammering after a 403 or 429 is how a host gets blocked)."""
         url = f"https://api.adsb.lol/v2/icao/{','.join(icaos)}"
         clock = asyncio.get_running_loop().time
-        # Asked again only once its allowance allows (adsb_spacing) or it has
-        # reset after a refusal: a skipped cycle is not a failed request, and
-        # FlyItalyADSB answers for it.
+        # After a refusal, not asked again until its allowance resets.
         if clock() < getattr(self, "_adsb_next_ok", 0.0):
             return {}, False
         started = clock()
@@ -861,7 +854,6 @@ class CloudAircraftTracker:
                         if response.status == 429:
                             self._adsb_next_ok = clock() + adsb_refused_for(headers)
                         if response.status == 200:
-                            self._adsb_next_ok = clock() + adsb_spacing(headers)
                             data = await response.json()
                             lookup = {}
                             for ac in data.get('ac') or []:
@@ -932,11 +924,59 @@ class CloudAircraftTracker:
         return lookup, ok
 
     async def fetch_network(self, icaos: List[str]):
-        """Both network sources at once, merged: for each aircraft, the one
-        with the fresher position. Returns (lookup, any source answered)."""
-        (adsb, adsb_ok), (fia, fia_ok) = await asyncio.gather(
-            self.fetch_adsb(icaos), self.fetch_flyitaly(icaos))
+        """The network's positions, merged per aircraft by the fresher one.
+        Returns (lookup, any source answered).
+
+        FlyItalyADSB is asked every cycle. adsb.lol, which allows us 500
+        requests a day, is the backup: asked for every aircraft when
+        FlyItalyADSB fails, and otherwise only for aircraft that were just
+        airborne near their field and that FlyItalyADSB has lost (the ones a
+        landing or an approach alert depends on). Without a FlyItalyADSB key,
+        adsb.lol is the only source and is asked every cycle as before."""
+        if not FLYITALY_API_KEY:
+            return await self.fetch_adsb(icaos)
+        fia, fia_ok = await self.fetch_flyitaly(icaos)
+        if not fia_ok:
+            want = list(icaos)
+        else:
+            want = [i for i in icaos if self._needs_backup(i, fia.get(i))]
+        adsb, adsb_ok = {}, False
+        if want and self._adsb_backup_allowed():
+            adsb, adsb_ok = await self.fetch_adsb(want)
         return _merge_sources(adsb, fia), adsb_ok or fia_ok
+
+    def _needs_backup(self, icao24: str, fia_ac: Optional[dict]) -> bool:
+        """FlyItalyADSB has no fresh position for an aircraft that some
+        account heard airborne near its field in the last few minutes."""
+        seen = (fia_ac or {}).get('seen_pos')
+        if isinstance(seen, (int, float)) and seen <= ADSB_FRESH_SECONDS:
+            return False
+        now = datetime.now()
+        for t in list(self.user_trackers.values()):
+            st = t.aircraft_state.get(icao24)
+            if not st or st.get('on_ground') or st.get('landed'):
+                continue
+            last = st.get('last_update')
+            if not isinstance(last, datetime) or (now - last).total_seconds() > BACKUP_RECENT_SECONDS:
+                continue
+            if (st.get('last_distance') if st.get('last_distance') is not None else 999) <= BACKUP_NEAR_NM:
+                return True
+        return False
+
+    def _adsb_backup_allowed(self) -> bool:
+        """Within adsb.lol's daily budget and at most once a minute. Counts
+        the request it allows."""
+        import time as _time
+        now = _time.monotonic()
+        sent = getattr(self, "_adsb_sent", None)
+        if sent is None:
+            sent = self._adsb_sent = []
+        while sent and now - sent[0] > 86400:
+            sent.pop(0)
+        if len(sent) >= ADSB_DAILY_BUDGET or (sent and now - sent[-1] < ADSB_BACKUP_EVERY_SECONDS):
+            return False
+        sent.append(now)
+        return True
 
     async def track_all_users(self):
         """Track aircraft for all active users using a single ICAO-based API call"""
