@@ -378,11 +378,30 @@ async def refresh_token(
 
 # ─── Entitlement ──────────────────────────────────────────────────────────────
 
+# The website's answer per email, for a minute: /api/user/me asks on every
+# app load, and every change the web app makes checks it first.
+ENTITLEMENT_CACHE_SECONDS = 60
+# After a failed lookup, nobody asks again for this long: a slow website
+# costs one wait a minute, not one per request.
+ENTITLEMENT_BACKOFF_SECONDS = 60
+ENTITLEMENT_TIMEOUT_SECONDS = 4
+_entitlement_cache: dict = {}        # email -> (monotonic time, entitlement)
+_entitlement_down_until = 0.0
+
+
 async def fetch_entitlement(email: str):
     """Ask the website what this account is entitled to. None on any failure,
     which callers treat as 'leave the current state alone'."""
     import aiohttp
     import os
+    import time as _time
+    global _entitlement_down_until
+    now = _time.monotonic()
+    hit = _entitlement_cache.get(email)
+    if hit and now - hit[0] < ENTITLEMENT_CACHE_SECONDS:
+        return hit[1]
+    if now < _entitlement_down_until:
+        return None
     website_url = os.environ.get("WEBSITE_URL", "https://finalpingapp.com")
     try:
         async with aiohttp.ClientSession() as session:
@@ -390,14 +409,40 @@ async def fetch_entitlement(email: str):
                 f"{website_url}/api/internal/entitlement",
                 json={"email": email, "product": "personal"},
                 headers={"x-internal-secret": WEBHOOK_INTERNAL_SECRET},
-                timeout=aiohttp.ClientTimeout(total=8),
+                timeout=aiohttp.ClientTimeout(total=ENTITLEMENT_TIMEOUT_SECONDS),
             ) as resp:
                 if resp.status != 200:
+                    if resp.status >= 500:
+                        _entitlement_down_until = _time.monotonic() + ENTITLEMENT_BACKOFF_SECONDS
                     return None
-                return (await resp.json()).get("entitlement")
+                ent = (await resp.json()).get("entitlement")
     except Exception as e:
-        logger.warning("entitlement lookup failed for %s: %s", email, e)
+        _entitlement_down_until = _time.monotonic() + ENTITLEMENT_BACKOFF_SECONDS
+        logger.warning("entitlement lookup failed (%s); not asking again for %d s",
+                       type(e).__name__, ENTITLEMENT_BACKOFF_SECONDS)
         return None
+    if len(_entitlement_cache) > 5000:
+        _entitlement_cache.clear()
+    _entitlement_cache[email] = (_time.monotonic(), ent)
+    return ent
+
+
+def forget_entitlement(email: str = None) -> None:
+    """Drop the remembered answer (one email, or all), so the next lookup asks."""
+    global _entitlement_down_until
+    if email is None:
+        _entitlement_cache.clear()
+        _entitlement_down_until = 0.0
+    else:
+        _entitlement_cache.pop(email, None)
+
+
+async def entitlement_without_holding_db(db, email: str):
+    """fetch_entitlement, with this request's database connection handed back
+    to the pool while it waits. Holding it through an 8 s website timeout is
+    how 15 slow /api/user/me calls emptied the pool on 27 Nov."""
+    db.commit()
+    return await fetch_entitlement(email)
 
 
 async def refresh_entitlement(db, user, ent):
@@ -654,7 +699,7 @@ async def google_desktop_login(
 
     # Google sign-in has no password to verify, so ask the website directly.
     # Without this, signing in with Google never picked up a plan at all.
-    await refresh_entitlement(db, user, await fetch_entitlement(email))
+    await refresh_entitlement(db, user, await entitlement_without_holding_db(db, email))
 
     license = db.query(License).filter(License.id == user.license_id).first() if user.license_id else None
     tier = "free"
@@ -1381,7 +1426,7 @@ async def get_current_user_info(
     # who upgraded, cancelled or signed in with Google kept seeing whatever was
     # last written to their row. A failed lookup returns None and changes
     # nothing, so a website blip never revokes anyone.
-    await refresh_entitlement(db, current_user, await fetch_entitlement(current_user.email))
+    await refresh_entitlement(db, current_user, await entitlement_without_holding_db(db, current_user.email))
 
     # Find the most recently activated personal (non-team) license for this user.
     # Team licenses are excluded here — team access is via TeamMember, and the personal

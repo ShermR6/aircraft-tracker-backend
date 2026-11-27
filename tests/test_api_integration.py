@@ -94,6 +94,7 @@ def _fresh_db():
     _shared.commit()
     _give_plan("starter")   # the paid plan; tests about having no plan call _drop_plan()
     main.tracker.user_trackers.clear()
+    main.forget_entitlement()
     yield
 
 
@@ -406,3 +407,75 @@ def test_send_notifications_without_routing_reaches_every_channel(monkeypatch):
     note = {"type": "10nm", "tail": "N172AK", "distance": 10.2, "altitude": 2500, "eta": 6, "speed": 95, "time": datetime.now()}
     asyncio.run(main.tracker.send_notifications(str(USER_ID), [note]))
     assert sorted(sent) == ["discord", "email"]
+
+
+# ── the website's entitlement answer ─────────────────────────────────────────
+
+class _EntSession:
+    """aiohttp stand-in for the website's /api/internal/entitlement."""
+    calls = 0
+    mode = "ok"
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        _EntSession.calls += 1
+        outer = self
+
+        class _Ctx:
+            async def __aenter__(self_inner):
+                if _EntSession.mode == "timeout":
+                    raise asyncio.TimeoutError()
+                return outer
+
+            async def __aexit__(self_inner, *a):
+                return False
+        return _Ctx()
+
+    status = 200
+
+    async def json(self):
+        return {"entitlement": {"tier": "starter"}}
+
+
+def test_entitlement_is_remembered_and_a_slow_website_is_not_asked_every_request(monkeypatch):
+    import aiohttp
+    monkeypatch.setattr(aiohttp, "ClientSession", _EntSession)
+    main.forget_entitlement()
+    _EntSession.calls, _EntSession.mode = 0, "ok"
+    assert asyncio.run(main.fetch_entitlement("a@example.com")) == {"tier": "starter"}
+    assert asyncio.run(main.fetch_entitlement("a@example.com")) == {"tier": "starter"}
+    assert _EntSession.calls == 1, "second lookup within a minute is remembered"
+
+    _EntSession.mode = "timeout"
+    assert asyncio.run(main.fetch_entitlement("b@example.com")) is None
+    assert asyncio.run(main.fetch_entitlement("c@example.com")) is None
+    assert _EntSession.calls == 2, "after a timeout nobody asks again for a minute"
+    main.forget_entitlement()
+
+
+def test_user_me_hands_its_connection_back_while_asking_the_website(monkeypatch):
+    seen = {}
+
+    async def fake_fetch(email):
+        seen["in_transaction"] = main_db_session["db"].in_transaction()
+        return None
+
+    main_db_session = {}
+    real = main.entitlement_without_holding_db
+
+    async def spy(db, email):
+        main_db_session["db"] = db
+        return await real(db, email)
+
+    monkeypatch.setattr(main, "fetch_entitlement", fake_fetch)
+    monkeypatch.setattr(main, "entitlement_without_holding_db", spy)
+    assert client.get("/api/user/me").status_code == 200
+    assert seen["in_transaction"] is False
